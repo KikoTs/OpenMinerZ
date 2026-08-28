@@ -1,0 +1,21 @@
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+
+*.cpp text eol=lf
+*.cs text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+*.bmp binary
+*.dll binary
+*.exe binary
+*.omavatar binary
+*.png binary
+*.xnb binary

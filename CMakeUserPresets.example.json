@@ -1,0 +1,60 @@
+{
+  "version": 6,
+  "include": [
+    "CMakePresets.json"
+  ],
+  "configurePresets": [
+    {
+      "name": "native-dev-owned",
+      "displayName": "Native Development with locally owned content",
+      "inherits": "native-dev",
+      "cacheVariables": {
+        "OPENMINERZ_IMPORT_OWNED_CONTENT": "ON",
+        "OPENMINERZ_CLASSIC_GAME_DIR": "C:/path/to/owned/classic/CastleMiner Z",
+        "OPENMINERZ_MODERN_GAME_DIR": "C:/Program Files (x86)/Steam/steamapps/common/CastleMiner Z",
+        "OPENMINERZ_STEAM_API_DLL": "C:/Program Files (x86)/Steam/steamapps/common/CastleMiner Z/steam_api.dll"
+      }
+    },
+    {
+      "name": "native-release-owned",
+      "displayName": "Native Release with locally owned content",
+      "inherits": "native-release",
+      "cacheVariables": {
+        "OPENMINERZ_IMPORT_OWNED_CONTENT": "ON",
+        "OPENMINERZ_CLASSIC_GAME_DIR": "C:/path/to/owned/classic/CastleMiner Z",
+        "OPENMINERZ_MODERN_GAME_DIR": "C:/Program Files (x86)/Steam/steamapps/common/CastleMiner Z",
+        "OPENMINERZ_STEAM_API_DLL": "C:/Program Files (x86)/Steam/steamapps/common/CastleMiner Z/steam_api.dll"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "native-dev-owned",
+      "configurePreset": "native-dev-owned",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "native-release-owned",
+      "configurePreset": "native-release-owned",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "native-dev-owned",
+      "configurePreset": "native-dev-owned",
+      "configuration": "RelWithDebInfo",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "native-release-owned",
+      "configurePreset": "native-release-owned",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

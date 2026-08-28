@@ -1,0 +1,67 @@
+# Build systems and package managers
+/out/
+/build/
+/cmake-build-*/
+/CMakeUserPresets.json
+/vcpkg_installed/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# Compiler and linker output
+*.dll
+*.exe
+*.exp
+*.iobj
+*.ipdb
+*.ilk
+*.lib
+*.obj
+*.pdb
+
+# Imported/proprietary runtime content. These files must be supplied locally.
+*.xnb
+*.xgs
+*.xsb
+*.xwb
+steam_api.dll
+steam_appid.txt
+/Content/
+/DerivedData/
+/content-packs/
+/SteamBridge/
+
+# Local captures, protocol evidence, and work logs
+/artifacts/
+/screenshots/
+/captures/
+/traces/
+/Handoff.md
+*.log
+*.pcap
+*.pcapng
+*.tmp
+
+# Local tools and editor state
+/.claude/
+/.idea/
+/.vs/
+/.vscode/
+/tools/**/bin/
+/tools/**/obj/
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+
+# Secrets and local environment overrides
+.env
+.env.*
+!.env.example
+
+# Operating-system noise
+.DS_Store
+Desktop.ini
+Thumbs.db

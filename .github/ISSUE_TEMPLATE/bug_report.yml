@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible OpenMinerZ defect without private or proprietary data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach proprietary game files, raw packet captures, saves, Steam IDs, lobby IDs, usernames, IP addresses, or secrets. Report security issues through a private Security Advisory.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The tested commit SHA or branch.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Gameplay
+        - Multiplayer / Steam
+        - Renderer / UI
+        - Saves / worlds
+        - Content import / audio
+        - Build / tooling
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Give a minimal, sanitized sequence.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Additional validation
+      description: Build preset, presentation/content profile, protocol generation, and sanitized diagnostics.
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Data hygiene
+      options:
+        - label: I removed private identifiers, secrets, saves, captures, and proprietary content.
+          required: true

@@ -1,0 +1,62 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "native-base",
+      "hidden": true,
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_INSTALLED_DIR": "${sourceDir}/out/vcpkg_installed",
+        "OPENMINERZ_BUILD_TESTS": "ON",
+        "OPENMINERZ_IMPORT_OWNED_CONTENT": "OFF"
+      }
+    },
+    {
+      "name": "native-dev",
+      "displayName": "Native Development",
+      "inherits": "native-base"
+    },
+    {
+      "name": "native-release",
+      "displayName": "Native Release",
+      "inherits": "native-base"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "native-dev",
+      "configurePreset": "native-dev",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "native-release",
+      "configurePreset": "native-release",
+      "configuration": "Release"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "native-dev",
+      "configurePreset": "native-dev",
+      "configuration": "RelWithDebInfo",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "native-release",
+      "configurePreset": "native-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

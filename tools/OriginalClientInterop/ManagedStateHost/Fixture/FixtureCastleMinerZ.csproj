@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <PlatformTarget>x86</PlatformTarget>
+    <Prefer32Bit>true</Prefer32Bit>
+    <Platforms>x86</Platforms>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>FixtureCastleMinerZ</AssemblyName>
+    <RootNamespace>FixtureCastleMinerZ</RootNamespace>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+</Project>
