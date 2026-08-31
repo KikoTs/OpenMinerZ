@@ -8588,13 +8588,7 @@ class Application::Impl final
         const float dy = dig.location.y -
                          (remote->second.state.position.y + world::PlayerSimulation::eye_height);
         const float dz = dig.location.z - remote->second.state.position.z;
-        const auto axis = [](float value) { return std::abs(std::abs(value) - 1.0F) <= 0.001F; };
-        const auto zero = [](float value) { return std::abs(value) <= 0.001F; };
-        const bool face_normal =
-            (axis(dig.direction.x) && zero(dig.direction.y) && zero(dig.direction.z)) ||
-            (zero(dig.direction.x) && axis(dig.direction.y) && zero(dig.direction.z)) ||
-            (zero(dig.direction.x) && zero(dig.direction.y) && axis(dig.direction.z));
-        if (!face_normal)
+        if (!net::valid_network_surface_normal(dig.direction))
             return false;
         if (dx * dx + dy * dy + dz * dz > 49.0F)
             return !enforce_spatial_authority;
@@ -9991,9 +9985,13 @@ class Application::Impl final
     {
         PlayerInventory::Slot slot;
         if (!net::inventory_slot_to_stack(crate.item, protocol, slot) || crate.index < 0 ||
-            crate.index >= static_cast<std::int32_t>(world_save_crate_slot_count))
+            crate.index >= static_cast<std::int32_t>(world_save_crate_slot_count) ||
+            !net::valid_network_block_location(crate.location))
             return false;
         const CrateKey location{crate.location.x, crate.location.y, crate.location.z};
+        if (!crate_inventories_.contains(location) &&
+            crate_inventories_.size() >= net::maximum_world_crates)
+            return false;
         crate_inventories_[location][static_cast<std::size_t>(crate.index)] = std::move(slot);
         dirty_ = true;
         return true;
@@ -10138,6 +10136,8 @@ class Application::Impl final
 
     void apply_online_destroy_crate(net::IntVector3 location)
     {
+        if (!net::valid_network_block_location(location))
+            return;
         const CrateKey key{location.x, location.y, location.z};
         crate_inventories_.erase(key);
         if (active_crate_.has_value() && *active_crate_ == key)
@@ -10708,14 +10708,18 @@ class Application::Impl final
     {
         if (world_preview_ == nullptr || removal.blocks.empty())
             return false;
+        for (const net::IntVector3 location : removal.blocks)
+        {
+            std::int32_t ignored{};
+            if (!net::valid_network_block_location(location) ||
+                !net::encode_delta_entry(location, 0U, protocol, ignored))
+                return false;
+        }
         std::vector<std::array<int, 3>> changed;
         changed.reserve(removal.blocks.size());
         auto &region = world_preview_->region();
         for (const net::IntVector3 location : removal.blocks)
         {
-            std::int32_t ignored{};
-            if (!net::encode_delta_entry(location, 0U, protocol, ignored))
-                return false;
             if (region.contains(location.x, location.y, location.z))
             {
                 const world::BlockType block = region.block(location.x, location.y, location.z);
@@ -11115,6 +11119,18 @@ class Application::Impl final
         return send_online_bootstrap_packets({*request}, local_gid, error);
     }
 
+    [[nodiscard]] static bool drop_online_gameplay_packet(std::uint8_t sender_gid,
+                                                          std::string_view message,
+                                                          std::string_view reason,
+                                                          std::string &error)
+    {
+        std::cerr << "network.client.gameplay.dropped sender_gid="
+                  << static_cast<int>(sender_gid) << " message=" << message
+                  << " reason=" << reason << '\n';
+        error.clear();
+        return true;
+    }
+
     void install_online_world(WorldSaveData save)
     {
         reset_world_session_state();
@@ -11353,48 +11369,36 @@ class Application::Impl final
         }
         if (decoded.message->name == "PlayerUpdateMessage" &&
             !apply_online_player_update(event.gid, online_client_protocol_, decoded.payload))
-        {
-            error = "A validated remote player update failed application decoding";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "stale-or-out-of-bounds-player-update", error);
         if (!apply_online_auxiliary_player_state(event.gid, decoded))
-        {
-            error = "A validated remote auxiliary player state failed application decoding";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "stale-auxiliary-player-state", error);
         if (decoded.message->name == "DigMessage" &&
             !apply_online_dig_effect(event.gid, online_client_protocol_, decoded.payload, false))
-        {
-            error = "A validated DigMessage failed spatial or face-normal constraints";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "invalid-dig-presentation", error);
         if ((decoded.message->name == "AddExplosionEffectsMessage" ||
              decoded.message->name == "AddExplosiveFlashMessage" ||
              decoded.message->name == "DoorOpenCloseMessage") &&
             !apply_online_environment_effect(online_client_protocol_, decoded))
-        {
-            error = "A validated environment-effect packet failed application constraints";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "invalid-environment-presentation", error);
         if (decoded.message->name == "MeleePlayerMessage")
         {
             net::MeleePlayerPayload melee;
             net::PayloadError payload_error{};
             if (!net::decode_melee_player_payload(decoded.payload, online_client_protocol_, melee,
-                                                  payload_error) ||
+                                                   payload_error) ||
                 !melee_source_near_player(melee.damage_source, player_.state().position))
-            {
-                error = "A validated player-melee packet failed application constraints";
-                return false;
-            }
+                return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                   "stale-or-out-of-range-melee", error);
             if (melee_pvp_allows(online_client_pvp_, false, online_lobby_host_is_friend_))
             {
                 InventoryItemId item{};
                 if (!net::inventory_item_from_wire(melee.item_id, online_client_protocol_, item))
-                {
-                    error = "A validated player-melee packet used an unsupported item";
-                    return false;
-                }
+                    return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                       "unsupported-melee-item", error);
                 apply_player_damage(
                     item_player_melee_damage(item) * 100.0F,
                     {melee.damage_source.x, melee.damage_source.y, melee.damage_source.z});
@@ -11420,47 +11424,35 @@ class Application::Impl final
         }
         if (decoded.message->name == "CreatePickupMessage" &&
             !apply_online_create_pickup(event.gid, online_client_protocol_, decoded.payload))
-        {
-            error = "A validated pickup creation failed application decoding";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "invalid-or-capacity-limited-pickup", error);
         if (decoded.message->name == "ConsumePickupMessage" &&
             !apply_online_consume_pickup(event.gid, online_client_protocol_, decoded.payload))
-        {
-            error = "A validated authoritative pickup consumption failed application decoding";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "stale-pickup-consumption", error);
         if ((decoded.message->name == "GunshotMessage" ||
              decoded.message->name == "ShotgunShotMessage" ||
              decoded.message->name == "GrenadeMessage" ||
              decoded.message->name == "FireRocketMessage") &&
             !apply_online_combat_launch(event.gid, online_client_protocol_, decoded, false))
-        {
-            error = "A validated remote combat launch failed application constraints";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "stale-or-invalid-combat-launch", error);
         if ((decoded.message->name == "DetonateGrenadeMessage" ||
              decoded.message->name == "DetonateRocketMessage" ||
              decoded.message->name == "DetonateExplosiveMessage") &&
             !apply_online_combat_detonation(event.gid, online_client_protocol_, decoded, false))
-        {
-            error = "A validated remote combat detonation failed application constraints";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "stale-or-invalid-combat-detonation", error);
         if (decoded.message->name == "SpawnEnemyMessage" &&
             !apply_online_spawn_enemy(event.gid, online_client_protocol_, decoded.payload, false))
-        {
-            error = "A validated enemy spawn failed application constraints";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "stale-or-invalid-enemy-spawn", error);
         if ((decoded.message->name == "KillEnemyMessage" ||
              decoded.message->name == "SpeedUpEnemyMessage" ||
              decoded.message->name == "EnemyGiveUpMessage") &&
             !apply_online_enemy_event(event.gid, online_client_protocol_, decoded, false))
-        {
-            error = "A validated enemy event failed application constraints";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "stale-or-invalid-enemy-event", error);
         if ((decoded.message->name == "SpawnDragonMessage" ||
              decoded.message->name == "ExistingDragonMessage" ||
              decoded.message->name == "UpdateDragonMessage" ||
@@ -11470,28 +11462,23 @@ class Application::Impl final
              decoded.message->name == "MigrateDragonMessage" ||
              decoded.message->name == "RemoveDragonMessage") &&
             !apply_online_dragon_message(event.gid, online_client_protocol_, decoded, false))
-        {
-            error = "A validated dragon message failed ownership or application constraints";
-            return false;
-        }
+            return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                               "stale-or-invalid-dragon-state", error);
         if (decoded.message->name == "AlterBlockMessage" && world_preview_ != nullptr)
         {
             net::AlterBlockPayload edit;
             net::PayloadError payload_error{};
             if (!net::decode_alter_block_payload(decoded.payload, online_client_protocol_, edit,
-                                                 payload_error))
-            {
-                error = "A validated block edit failed application decoding";
-                return false;
-            }
+                                                 payload_error) ||
+                !net::valid_network_block_location(edit.block_location))
+                return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                   "out-of-bounds-block-edit", error);
             const auto block = static_cast<world::BlockType>(edit.block_type);
             const auto previous = online_block_at(edit.block_location);
             if (!remember_online_door_placement(event.gid, online_client_protocol_, edit, previous,
                                                 false))
-            {
-                error = "A validated door placement had no matching carried door identity";
-                return false;
-            }
+                return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                   "stale-door-identity", error);
             world_preview_->remember_edit(edit.block_location.x, edit.block_location.y,
                                           edit.block_location.z, block);
             if (world_preview_->region().contains(edit.block_location.x, edit.block_location.y,
@@ -11510,22 +11497,19 @@ class Application::Impl final
             net::ItemCratePayload crate;
             net::PayloadError payload_error{};
             if (!net::decode_item_crate_payload(decoded.payload, online_client_protocol_, crate,
-                                                payload_error) ||
+                                                 payload_error) ||
                 !apply_online_crate_item(online_client_protocol_, crate))
-            {
-                error = "A validated crate item failed application decoding";
-                return false;
-            }
+                return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                   "invalid-or-capacity-limited-crate-item", error);
         }
         if (decoded.message->name == "DestroyCrateMessage")
         {
             net::IntVector3 location;
             net::PayloadError payload_error{};
-            if (!net::decode_int_vector_payload(decoded.payload, location, payload_error))
-            {
-                error = "A validated crate destruction failed application decoding";
-                return false;
-            }
+            if (!net::decode_int_vector_payload(decoded.payload, location, payload_error) ||
+                !net::valid_network_block_location(location))
+                return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                   "out-of-bounds-crate-destruction", error);
             apply_online_destroy_crate(location);
         }
         if (decoded.message->name == "DestroyCustomBlockMessage")
@@ -11534,10 +11518,8 @@ class Application::Impl final
             net::PayloadError payload_error{};
             if (!net::decode_destroy_custom_block_payload(decoded.payload, custom, payload_error) ||
                 !apply_online_destroy_custom_block(custom))
-            {
-                error = "A validated custom-block destruction failed application decoding";
-                return false;
-            }
+                return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                   "invalid-custom-block-destruction", error);
         }
         if (decoded.message->name == "UpdateSpawnerMessage")
         {
@@ -11546,10 +11528,8 @@ class Application::Impl final
             if (event.gid != 0U ||
                 !net::decode_update_spawner_payload(decoded.payload, update, payload_error) ||
                 !apply_online_spawner_update(update))
-            {
-                error = "A validated spawner update failed host authority or application bounds";
-                return false;
-            }
+                return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                   "invalid-spawner-update", error);
         }
         if (decoded.message->name == "RemoveBlocksMessage")
         {
@@ -11557,10 +11537,8 @@ class Application::Impl final
             net::PayloadError payload_error{};
             if (!net::decode_remove_blocks_payload(decoded.payload, removal, payload_error) ||
                 !apply_online_block_removals(online_client_protocol_, removal))
-            {
-                error = "A validated batch block removal failed application decoding";
-                return false;
-            }
+                return drop_online_gameplay_packet(event.gid, decoded.message->name,
+                                                   "invalid-batch-block-removal", error);
             for (const net::IntVector3 location : removal.blocks)
                 schedule_authoritative_chunk_check(location);
         }

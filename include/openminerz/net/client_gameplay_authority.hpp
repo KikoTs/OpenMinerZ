@@ -1,6 +1,7 @@
 #pragma once
 
 #include "openminerz/net/legacy_steam_host_session.hpp"
+#include "openminerz/net/payload_codec.hpp"
 
 #include <cstdint>
 #include <string_view>
@@ -58,6 +59,12 @@ struct ClientGameplayDecision final
 // domain, and host/terrain-server output is never accepted from a remote GID.
 [[nodiscard]] ClientGameplayDecision assess_client_gameplay_authority(
     ProtocolVersion protocol, const LegacySteamHostInbound &inbound) noexcept;
+
+// Shared semantic bounds for both the host authority gate and the receiving
+// client's application layer. Original DigMessage surface normals are not
+// restricted to voxel axes; model/custom-block collision planes may be sloped.
+[[nodiscard]] bool valid_network_block_location(IntVector3 location) noexcept;
+[[nodiscard]] bool valid_network_surface_normal(Vector3 direction) noexcept;
 
 [[nodiscard]] std::string_view client_gameplay_authority_error_label(
     ClientGameplayAuthorityError error) noexcept;

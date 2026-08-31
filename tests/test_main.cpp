@@ -2560,13 +2560,25 @@ void client_gameplay_authority_is_route_strict_and_identity_bound()
                    protocol, inbound(packet("DigMessage", *dig_effect_payload), 1U))
                        .action == ClientGameplayAction::relay,
            "a bounded source-authored DigMessage face effect must retain its broadcast route");
-    dig_effect.direction = {0.5F, 0.5F, 0.0F};
+    dig_effect.direction = {0.70710677F, 0.70710677F, 0.0F};
     const auto diagonal_dig_payload = encode_dig_payload(dig_effect, protocol, payload_error);
     expect(diagonal_dig_payload.has_value() &&
                assess_client_gameplay_authority(
                    protocol, inbound(packet("DigMessage", *diagonal_dig_payload), 1U))
+                       .action == ClientGameplayAction::relay,
+            "an original normalized collision-plane DigMessage normal must retain its route");
+    dig_effect.direction = {0.5F, 0.5F, 0.0F};
+    const auto scaled_dig_payload = encode_dig_payload(dig_effect, protocol, payload_error);
+    dig_effect.direction = {};
+    const auto zero_dig_payload = encode_dig_payload(dig_effect, protocol, payload_error);
+    expect(scaled_dig_payload.has_value() && zero_dig_payload.has_value() &&
+               assess_client_gameplay_authority(
+                   protocol, inbound(packet("DigMessage", *scaled_dig_payload), 1U))
+                       .error == ClientGameplayAuthorityError::invalid_packet &&
+               assess_client_gameplay_authority(
+                   protocol, inbound(packet("DigMessage", *zero_dig_payload), 1U))
                        .error == ClientGameplayAuthorityError::invalid_packet,
-           "a hostile diagonal DigMessage normal must fail before effect relay");
+           "zero or materially scaled DigMessage normals must fail before effect relay");
 
     const auto observed_dragon_kill_payload =
         encode_kill_dragon_payload({{4.0F, 80.0F, 9.0F}, 50, 6U}, protocol, payload_error);
@@ -6368,6 +6380,40 @@ void legacy_steam_client_session_completes_admission_and_rejects_spoofed_routes(
            "pre-admission Steam reordering must stay bounded and invisible until status and the "
            "host roster atomically admit the client");
 
+    // Stock Steam maps SendDataOptions.Chat to NetDeliveryMethod.Unknown (zero),
+    // then the host wraps the voice payload in the normal direct-data frame.
+    // Exercise the full route with a capture-sized A-law buffer, not only the
+    // standalone payload codec.
+    PayloadError voice_payload_error{};
+    const std::vector<std::uint8_t> voice_audio(400U, 0xD5U);
+    const auto voice_payload = encode_voice_chat_payload(voice_audio, voice_payload_error);
+    const MessageDescriptor *voice_descriptor =
+        message_by_name(ProtocolVersion::modern_v4, "VoiceChatMessage");
+    PacketError voice_packet_error{};
+    const auto voice_packet =
+        voice_payload.has_value() && voice_descriptor != nullptr
+            ? encode_packet(ProtocolVersion::modern_v4, voice_descriptor->id, *voice_payload,
+                            voice_packet_error)
+            : std::nullopt;
+    LegacySteamOutbound voice_outbound;
+    voice_outbound.recipient = 905U;
+    if (voice_packet.has_value())
+        voice_outbound.application_packet = *voice_packet;
+    voice_outbound.delivery = MessageDeliveryPolicy::chat;
+    const auto voice_send = reordered_host.create_outbound(voice_outbound, reordered_error);
+    const LegacySteamClientSessionResult voice_receive =
+        voice_send.has_value()
+            ? reordered_client.process_native_packet(host_peer, voice_send->front().p2p_channel,
+                                                     voice_send->front().payload)
+            : LegacySteamClientSessionResult{};
+    expect(voice_send.has_value() && voice_send->size() == 1U &&
+               voice_send->front().delivery == SteamDeliveryMethod::unknown &&
+               voice_receive.inbound.size() == 1U && !voice_receive.audit.has_value() &&
+               voice_receive.inbound.front().kind == LegacySteamClientInboundKind::gameplay &&
+               voice_receive.inbound.front().delivery == MessageDeliveryPolicy::chat &&
+               voice_receive.inbound.front().payload == *voice_packet,
+           "capture-sized stock voice chat must survive Unknown delivery and the host-direct route");
+
     // Gamer.PlayerID and Gamertag are not routing keys. Live Modern servers can
     // expose repeated opaque PlayerIDs, and the stock client locates the host by
     // GID zero rather than by roster order or stale lobby display metadata.
@@ -6506,6 +6552,37 @@ void legacy_steam_client_session_completes_admission_and_rejects_spoofed_routes(
                transient_flood_client.connected() && transient_status.inbound.size() == 2U &&
                !transient_status.audit.has_value(),
            "lossy pre-admission state must never exhaust the bounded reliable quarantine");
+
+    LegacySteamClientSession reliable_flood_client{alice_options};
+    std::string reliable_flood_error;
+    expect(reliable_flood_client.begin(reliable_flood_error).has_value(),
+           "the reliable-flood fixture must enter the admission wait");
+    bool reliable_quarantine_clean = true;
+    for (std::size_t index{}; index < 64U; ++index)
+    {
+        const LegacySteamClientSessionResult queued = reliable_flood_client.process_native_packet(
+            host_peer, reordered_send->front().p2p_channel, reordered_send->front().payload);
+        reliable_quarantine_clean = reliable_quarantine_clean && queued.inbound.empty() &&
+                                    !queued.audit.has_value() &&
+                                    !queued.rejection_reason.has_value();
+    }
+    const LegacySteamClientSessionResult reliable_overflow =
+        reliable_flood_client.process_native_packet(host_peer, reordered_send->front().p2p_channel,
+                                                    reordered_send->front().payload);
+    const LegacySteamClientSessionResult reliable_roster =
+        reliable_flood_client.process_native_packet(
+            host_peer, reordered_admission.sends[1].p2p_channel,
+            reordered_admission.sends[1].payload);
+    const LegacySteamClientSessionResult reliable_status =
+        reliable_flood_client.process_native_packet(
+            host_peer, reordered_admission.sends[0].p2p_channel,
+            reordered_admission.sends[0].payload);
+    expect(reliable_quarantine_clean && reliable_overflow.audit.has_value() &&
+               reliable_overflow.audit->reason == "PreAdmissionQuarantineOverflowDropped" &&
+               !reliable_overflow.rejection_reason.has_value() && reliable_roster.inbound.empty() &&
+               reliable_flood_client.connected() && reliable_status.inbound.size() == 66U,
+           "reliable pre-admission overflow must drop excess traffic without denying the valid "
+           "status/roster admission");
 
     LegacySteamClientSession one_byte_status_client{alice_options};
     std::string one_byte_error;

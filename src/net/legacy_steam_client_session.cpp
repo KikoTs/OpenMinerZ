@@ -334,8 +334,12 @@ LegacySteamClientSessionResult LegacySteamClientSession::queue_before_admission(
     constexpr std::size_t maximum_pending_bytes = 256U * 1024U;
     if (pending_application_.size() >= maximum_pending_packets ||
         packet.payload.size() > maximum_pending_bytes - pending_application_bytes_)
-        return reject_admission(LegacySteamRejectionStage::session,
-                                "PreAdmissionQuarantineCapacityExceeded", input_length);
+        // A busy stock lobby can legitimately relay reliable gameplay before its
+        // status/roster pair reaches a joining peer. Keep the quarantine bounded,
+        // but do not let unrelated pre-admission traffic deny the admission itself.
+        // The authoritative bootstrap reconciles any dropped world state afterward.
+        return reject(LegacySteamRejectionStage::session,
+                      "PreAdmissionQuarantineOverflowDropped", input_length);
     pending_application_bytes_ += packet.payload.size();
     pending_application_.push_back({packet, input_length});
     return {};

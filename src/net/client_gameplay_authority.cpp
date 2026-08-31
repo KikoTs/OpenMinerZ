@@ -97,28 +97,28 @@ bool broadcast_route(const LegacySteamHostInbound &inbound) noexcept
     return inbound.channel == 1U && inbound.recipient_gid == 0U;
 }
 
-bool bounded_block_location(IntVector3 location) noexcept
-{
-    return location.x >= -1'000'000 && location.x <= 1'000'000 && location.y >= -64 &&
-           location.y < 64 && location.z >= -1'000'000 && location.z <= 1'000'000;
-}
-
 bool bounded_world_point(Vector3 location) noexcept
 {
     return location.x >= -1'000'000.0F && location.x <= 1'000'000.0F && location.y >= -128.0F &&
            location.y <= 128.0F && location.z >= -1'000'000.0F && location.z <= 1'000'000.0F;
 }
 
-bool face_normal(Vector3 direction) noexcept
+} // namespace
+
+bool valid_network_block_location(IntVector3 location) noexcept
 {
-    const auto axis = [](float value) { return std::abs(std::abs(value) - 1.0F) <= 0.001F; };
-    const auto zero = [](float value) { return std::abs(value) <= 0.001F; };
-    return (axis(direction.x) && zero(direction.y) && zero(direction.z)) ||
-           (zero(direction.x) && axis(direction.y) && zero(direction.z)) ||
-           (zero(direction.x) && zero(direction.y) && axis(direction.z));
+    return location.x >= -1'000'000 && location.x <= 1'000'000 && location.y >= -64 &&
+           location.y < 64 && location.z >= -1'000'000 && location.z <= 1'000'000;
 }
 
-} // namespace
+bool valid_network_surface_normal(Vector3 direction) noexcept
+{
+    const float length_squared = direction.x * direction.x + direction.y * direction.y +
+                                 direction.z * direction.z;
+    // XNA Plane.Intersects produces a normalized plane normal. Allow modest
+    // float/collision-shape tolerance while rejecting zero and scaled vectors.
+    return length_squared >= 0.81F && length_squared <= 1.21F;
+}
 
 ClientGameplayDecision assess_client_gameplay_authority(
     ProtocolVersion protocol, const LegacySteamHostInbound &inbound) noexcept
@@ -195,28 +195,28 @@ ClientGameplayDecision assess_client_gameplay_authority(
     {
         AlterBlockPayload edit;
         if (!decode_alter_block_payload(decoded.payload, protocol, edit, payload_error) ||
-            !bounded_block_location(edit.block_location))
+            !valid_network_block_location(edit.block_location))
             return reject(message, ClientGameplayAuthorityError::invalid_packet);
     }
     else if (message == "ItemCrateMessage")
     {
         ItemCratePayload crate;
         if (!decode_item_crate_payload(decoded.payload, protocol, crate, payload_error) ||
-            !bounded_block_location(crate.location))
+            !valid_network_block_location(crate.location))
             return reject(message, ClientGameplayAuthorityError::invalid_packet);
     }
     else if (message == "DestroyCrateMessage")
     {
         IntVector3 location;
         if (!decode_int_vector_payload(decoded.payload, location, payload_error) ||
-            !bounded_block_location(location))
+            !valid_network_block_location(location))
             return reject(message, ClientGameplayAuthorityError::invalid_packet);
     }
     else if (message == "DestroyCustomBlockMessage")
     {
         DestroyCustomBlockPayload custom;
         if (!decode_destroy_custom_block_payload(decoded.payload, custom, payload_error) ||
-            !bounded_block_location(custom.location))
+            !valid_network_block_location(custom.location))
             return reject(message, ClientGameplayAuthorityError::invalid_packet);
     }
     else if (message == "RemoveBlocksMessage")
@@ -226,14 +226,14 @@ ClientGameplayDecision assess_client_gameplay_authority(
             removal.blocks.empty())
             return reject(message, ClientGameplayAuthorityError::invalid_packet);
         for (const IntVector3 location : removal.blocks)
-            if (!bounded_block_location(location))
+            if (!valid_network_block_location(location))
                 return reject(message, ClientGameplayAuthorityError::invalid_packet);
     }
     else if (message == "DigMessage")
     {
         DigPayload dig;
         if (!decode_dig_payload(decoded.payload, protocol, dig, payload_error) ||
-            !bounded_world_point(dig.location) || !face_normal(dig.direction))
+            !bounded_world_point(dig.location) || !valid_network_surface_normal(dig.direction))
             return reject(message, ClientGameplayAuthorityError::invalid_packet);
     }
     else if (message == "PlayerUpdateMessage")
@@ -284,7 +284,7 @@ ClientGameplayDecision assess_client_gameplay_authority(
         if (encoded_owner != inbound.sender_gid)
             return reject(message, ClientGameplayAuthorityError::identity_spoof);
         for (const IntVector3 location : detonation.blocks_to_remove)
-            if (!bounded_block_location(location))
+            if (!valid_network_block_location(location))
                 return reject(message, ClientGameplayAuthorityError::invalid_packet);
     }
     else if (message == "ExistingDragonMessage")
