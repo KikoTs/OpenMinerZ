@@ -51,7 +51,16 @@ std::filesystem::path local_pack_root()
 
 std::string_view style_directory() noexcept
 {
-    return selected_style == AssetStyle::classic ? "classic" : "modern";
+    switch (selected_style)
+    {
+    case AssetStyle::classic:
+        return "classic";
+    case AssetStyle::classic_hd:
+        return "classic-hd";
+    case AssetStyle::modern:
+        return "modern";
+    }
+    return "modern";
 }
 
 bool usable_pack(const std::filesystem::path &path)

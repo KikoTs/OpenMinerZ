@@ -20,6 +20,7 @@ enum class PresentationProfile
 enum class AssetStyle
 {
     classic,
+    classic_hd,
     modern
 };
 enum class QualityLevel

@@ -30,7 +30,7 @@ const std::vector<SettingRow> graphics_rows{
     {SettingId::presentation, "Presentation",
      "Classic preserves the original mood; Rebirth enables modern rendering.", SettingKind::choice},
     {SettingId::texture_style, "Texture style",
-     "Switch the complete Classic or Modern asset pack. Takes effect after restart.",
+     "Switch Classic, AI-restored Classic HD, or Modern. Takes effect after restart.",
      SettingKind::choice},
     {SettingId::render_scale, "Render scale",
      "Internal 3D resolution. The interface always stays native-resolution.", SettingKind::slider},
@@ -217,7 +217,16 @@ std::string setting_value(const Settings &settings, SettingId id)
     case SettingId::presentation:
         return settings.presentation == PresentationProfile::classic ? "CLASSIC" : "REBIRTH";
     case SettingId::texture_style:
-        return settings.texture_style == AssetStyle::classic ? "CLASSIC" : "MODERN";
+        switch (settings.texture_style)
+        {
+        case AssetStyle::classic:
+            return "CLASSIC";
+        case AssetStyle::classic_hd:
+            return "CLASSIC HD";
+        case AssetStyle::modern:
+            return "MODERN";
+        }
+        break;
     case SettingId::render_scale:
         return percent(settings.render_scale);
     case SettingId::texture_quality:
@@ -426,9 +435,9 @@ void adjust_setting(Settings &settings, SettingId id, int direction)
                                     : PresentationProfile::classic;
         break;
     case SettingId::texture_style:
-        settings.texture_style = settings.texture_style == AssetStyle::classic
-                                     ? AssetStyle::modern
-                                     : AssetStyle::classic;
+        settings.texture_style =
+            cycle(settings.texture_style, sign,
+                  std::array{AssetStyle::classic, AssetStyle::classic_hd, AssetStyle::modern});
         break;
     case SettingId::render_scale:
         settings.render_scale += 0.05F * static_cast<float>(sign);

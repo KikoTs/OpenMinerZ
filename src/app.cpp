@@ -376,8 +376,7 @@ class Application::Impl final
         : options_(std::move(options)), store_(default_settings_path()), settings_(store_.load())
     {
         if (options_.asset_style >= 0)
-            settings_.texture_style =
-                options_.asset_style == 0 ? AssetStyle::classic : AssetStyle::modern;
+            settings_.texture_style = static_cast<AssetStyle>(options_.asset_style);
         if (options_.presentation_profile >= 0)
             settings_.presentation = options_.presentation_profile == 0
                                          ? PresentationProfile::classic
@@ -696,8 +695,11 @@ class Application::Impl final
         std::cout << "OpenMinerZ frontend initialized with " << SDL_GetRendererName(renderer_)
                   << '\n';
         std::cout << "Settings: " << store_.path().string() << '\n';
-        std::cout << "Content pack: "
-                  << (loaded_asset_style_ == AssetStyle::classic ? "Classic" : "Modern") << " ("
+        const std::string_view loaded_style_name =
+            loaded_asset_style_ == AssetStyle::classic      ? "Classic"
+            : loaded_asset_style_ == AssetStyle::classic_hd ? "Classic HD"
+                                                            : "Modern";
+        std::cout << "Content pack: " << loaded_style_name << " ("
                   << active_content_pack_path().string() << ")\n";
     }
 
@@ -8287,8 +8289,7 @@ class Application::Impl final
             {
                 toast("RESTART REQUIRED",
                       std::format("{} ASSET PACK WILL LOAD ON NEXT START",
-                                  settings_.texture_style == AssetStyle::classic ? "CLASSIC"
-                                                                                 : "MODERN"));
+                                  ui::setting_value(settings_, ui::SettingId::texture_style)));
             }
             if (id == ui::SettingId::audio_output)
             {

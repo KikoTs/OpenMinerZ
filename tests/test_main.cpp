@@ -269,7 +269,7 @@ void settings_clamp_and_round_trip()
     settings.window_width = 2560;
     settings.window_height = 1440;
     settings.presentation = openminerz::PresentationProfile::classic;
-    settings.texture_style = openminerz::AssetStyle::classic;
+    settings.texture_style = openminerz::AssetStyle::classic_hd;
     settings.audio_output_id = "{test-renderer-id}";
     settings.audio_output_name = "Test speakers";
     settings.creative_flight_speed = 19.0F;
@@ -281,8 +281,8 @@ void settings_clamp_and_round_trip()
            "resolution must survive a settings round trip");
     expect(loaded.presentation == openminerz::PresentationProfile::classic,
            "presentation profile must survive a settings round trip");
-    expect(loaded.texture_style == openminerz::AssetStyle::classic,
-           "texture style must survive a settings round trip");
+    expect(loaded.texture_style == openminerz::AssetStyle::classic_hd,
+           "Classic HD texture style must survive a settings round trip");
     expect(loaded.audio_output_id == settings.audio_output_id &&
                loaded.audio_output_name == settings.audio_output_name,
            "audio output selection must survive a settings round trip");
@@ -308,7 +308,13 @@ void advanced_settings_have_live_adjustments()
            "ore glow must expose a readable live toggle");
     openminerz::ui::adjust_setting(settings, openminerz::ui::SettingId::texture_style, 1);
     expect(settings.texture_style == openminerz::AssetStyle::classic,
-           "texture style must expose both restart-scoped content packs");
+           "texture style must cycle through the restart-scoped content packs");
+    openminerz::ui::adjust_setting(settings, openminerz::ui::SettingId::texture_style, 1);
+    expect(settings.texture_style == openminerz::AssetStyle::classic_hd &&
+               openminerz::ui::setting_value(settings,
+                                              openminerz::ui::SettingId::texture_style) ==
+                   "CLASSIC HD",
+           "texture style must expose the locally generated Classic HD pack");
     const float original_flight_speed = settings.creative_flight_speed;
     openminerz::ui::adjust_setting(settings, openminerz::ui::SettingId::creative_flight_speed, 1);
     expect(settings.creative_flight_speed == original_flight_speed + 1.0F &&

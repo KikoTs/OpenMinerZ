@@ -51,6 +51,10 @@ steam_appid.txt
 /.vscode/
 /tools/**/bin/
 /tools/**/obj/
+/tools/**/.venv/
+/.classic-hd-work/
+__pycache__/
+*.py[cod]
 *.suo
 *.user
 *.VC.db

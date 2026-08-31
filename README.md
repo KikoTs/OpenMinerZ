@@ -87,6 +87,22 @@ Imported content is generated under
 stages `steam_api.dll` beside the executable; never copy that DLL into the
 source tree or commit it.
 
+### Classic HD texture pack
+
+After importing the owned Classic content, generate the local AI-restored pack
+with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/TextureUpscale/setup_classic_hd.ps1
+```
+
+The script downloads the pinned official Real-ESRGAN Vulkan release, prepares a
+private Python environment, upscales every repeating diffuse tile independently,
+and installs `classic-hd` under `%LOCALAPPDATA%/OpenMinerZ/ContentPacks`. Generated
+textures, model weights, and owned source content remain outside Git. Select
+`CLASSIC HD` under Graphics > Texture style and restart the game. See
+`tools/TextureUpscale/README.md` for the reproducible pipeline and overrides.
+
 The generated game executable is:
 
 ```text

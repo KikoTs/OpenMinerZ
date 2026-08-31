@@ -409,12 +409,13 @@ int main(int argc, char **argv)
         else if (argument == "--texture-style" && index + 1 < argc)
         {
             const std::string_view style{argv[++index]};
-            if (style != "classic" && style != "modern")
+            if (style != "classic" && style != "classic-hd" && style != "modern")
             {
-                std::cerr << "Invalid --texture-style value; expected classic or modern\n";
+                std::cerr
+                    << "Invalid --texture-style value; expected classic, classic-hd, or modern\n";
                 return 2;
             }
-            options.asset_style = style == "modern" ? 1 : 0;
+            options.asset_style = style == "classic" ? 0 : (style == "classic-hd" ? 1 : 2);
         }
         else if (argument == "--presentation" && index + 1 < argc)
         {
@@ -506,7 +507,7 @@ int main(int argc, char **argv)
                    "  --item ID             Equip an original item id (0..131) for capture\n"
                    "  --viewmodel STATE     idle|use|aim|aim-idle|unshoulder|fire|aim-fire|reload\n"
                    "  --viewmodel-progress N  Fix the selected viewmodel clip at [0, 1]\n"
-                   "  --texture-style NAME  classic|modern startup content-pack override\n"
+                   "  --texture-style NAME  classic|classic-hd|modern content-pack override\n"
                    "  --presentation NAME   classic|rebirth render-profile override\n"
                     "  --screenshot PATH     Render two frames, save BMP, and exit\n"
                     "  --pickup-item ID      Place one dropped-item visual for capture\n"

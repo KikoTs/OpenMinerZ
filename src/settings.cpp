@@ -147,7 +147,9 @@ Settings SettingsStore::load() const
         {{"classic", PresentationProfile::classic}, {"rebirth", PresentationProfile::rebirth}});
     result.texture_style =
         parse_enum<AssetStyle>(value_or(values, "texture_style"), result.texture_style,
-                               {{"classic", AssetStyle::classic}, {"modern", AssetStyle::modern}});
+                               {{"classic", AssetStyle::classic},
+                                {"classic_hd", AssetStyle::classic_hd},
+                                {"modern", AssetStyle::modern}});
     result.render_scale = parse_float(value_or(values, "render_scale"), result.render_scale);
     result.texture_quality =
         parse_enum<QualityLevel>(value_or(values, "texture_quality"), result.texture_quality,
@@ -328,7 +330,16 @@ std::string to_string(PresentationProfile value)
 
 std::string to_string(AssetStyle value)
 {
-    return value == AssetStyle::classic ? "classic" : "modern";
+    switch (value)
+    {
+    case AssetStyle::classic:
+        return "classic";
+    case AssetStyle::classic_hd:
+        return "classic_hd";
+    case AssetStyle::modern:
+        return "modern";
+    }
+    return "modern";
 }
 
 std::string to_string(QualityLevel value)
