@@ -274,6 +274,7 @@ void settings_clamp_and_round_trip()
     settings.audio_output_name = "Test speakers";
     settings.creative_flight_speed = 19.0F;
     settings.reduced_motion = true;
+    settings.ore_glow = false;
     store.save(settings);
     const auto loaded = store.load();
     expect(loaded.window_width == 2560 && loaded.window_height == 1440,
@@ -288,6 +289,7 @@ void settings_clamp_and_round_trip()
     expect(near(loaded.creative_flight_speed, 19.0F),
            "Creative flight speed must survive a settings round trip");
     expect(loaded.reduced_motion, "accessibility settings must survive a round trip");
+    expect(!loaded.ore_glow, "ore glow must survive a settings round trip");
     std::filesystem::remove(path);
 }
 
@@ -299,6 +301,11 @@ void advanced_settings_have_live_adjustments()
     expect(settings.ui_scale > original_scale, "UI scale must adjust live");
     openminerz::ui::adjust_setting(settings, openminerz::ui::SettingId::reduced_motion, 1);
     expect(settings.reduced_motion, "toggle settings must adjust live");
+    openminerz::ui::adjust_setting(settings, openminerz::ui::SettingId::ore_glow, 1);
+    expect(!settings.ore_glow &&
+               openminerz::ui::setting_value(settings,
+                                              openminerz::ui::SettingId::ore_glow) == "OFF",
+           "ore glow must expose a readable live toggle");
     openminerz::ui::adjust_setting(settings, openminerz::ui::SettingId::texture_style, 1);
     expect(settings.texture_style == openminerz::AssetStyle::classic,
            "texture style must expose both restart-scoped content packs");

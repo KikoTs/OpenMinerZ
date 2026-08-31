@@ -38,6 +38,8 @@ const std::vector<SettingRow> graphics_rows{
      "Controls moving sunlight contrast across voxel faces.", SettingKind::choice},
     {SettingId::ambient_occlusion, "Ambient occlusion",
      "Uses the original-style neighbour mask for per-corner contact shading.", SettingKind::toggle},
+    {SettingId::ore_glow, "Ore glow",
+     "Adds a subtle emissive shimmer to exposed ore veins.", SettingKind::toggle},
     {SettingId::particle_quality, "Particle quality",
      "Controls effect density while preserving event timing.", SettingKind::choice},
     {SettingId::tone_mapping, "Tone mapping",
@@ -237,6 +239,8 @@ std::string setting_value(const Settings &settings, SettingId id)
         break;
     case SettingId::ambient_occlusion:
         return settings.ambient_occlusion ? "ON" : "OFF";
+    case SettingId::ore_glow:
+        return settings.ore_glow ? "ON" : "OFF";
     case SettingId::particle_quality:
         return to_string(settings.particle_quality);
     case SettingId::tone_mapping:
@@ -446,6 +450,9 @@ void adjust_setting(Settings &settings, SettingId id, int direction)
         break;
     case SettingId::ambient_occlusion:
         toggle(settings.ambient_occlusion);
+        break;
+    case SettingId::ore_glow:
+        toggle(settings.ore_glow);
         break;
     case SettingId::particle_quality:
         settings.particle_quality = cycle(settings.particle_quality, sign,

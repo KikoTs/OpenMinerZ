@@ -104,7 +104,7 @@ class WorldPreviewRenderer final
               const world::PlayerState &player, float vertical_fov_degrees, float elapsed_seconds,
               float render_scale, float camera_bob, float screen_shake, float viewmodel_fov_degrees,
               bool rebirth_presentation, bool reduced_motion, bool inspector_view,
-              bool ambient_occlusion, float shadow_strength);
+              bool ambient_occlusion, bool ore_glow, float shadow_strength);
     [[nodiscard]] const WorldPreviewStats &stats() const noexcept;
     [[nodiscard]] const world::WorldRegion &region() const noexcept;
     [[nodiscard]] world::WorldRegion &region() noexcept;
@@ -257,10 +257,10 @@ class WorldPreviewRenderer final
                   bool reduced_motion, float yaw, float pitch, float vertical_fov_degrees,
                   bool rebirth_presentation);
     void draw_inspector(const ui::UiMetrics &metrics, const world::SkyState &sky,
-                        bool ambient_occlusion, float shadow_strength);
+                        bool ambient_occlusion, bool ore_glow, float shadow_strength);
     void draw_first_person(const ui::UiMetrics &metrics, const world::SkyState &sky,
                            const world::PlayerState &player, float vertical_fov_degrees,
-                           bool ambient_occlusion, float shadow_strength);
+                           bool ambient_occlusion, bool ore_glow, float shadow_strength);
     void draw_target_outline(const ui::UiMetrics &metrics, const world::PlayerState &player,
                              float vertical_fov_degrees, float elapsed_seconds);
     void draw_mining_effects(const ui::UiMetrics &metrics, const world::PlayerState &player,

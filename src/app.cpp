@@ -13948,7 +13948,7 @@ class Application::Impl final
                 // arms leave the frame edges.
                 std::lerp(settings_.viewmodel_fov, settings_.viewmodel_fov * 0.5F, draw_aim),
                 settings_.presentation == PresentationProfile::rebirth, settings_.reduced_motion,
-                inspector_view_, settings_.ambient_occlusion,
+                inspector_view_, settings_.ambient_occlusion, settings_.ore_glow,
                 terrain_shadow_strength(settings_.shadow_quality));
             if (menu_.screen() == ui::MenuScreen::world_preview)
                 world_thumbnail_captured_for_pause_ = false;

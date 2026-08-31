@@ -40,6 +40,7 @@ enum class SettingId
     shadow_quality,
     anti_aliasing,
     ambient_occlusion,
+    ore_glow,
     particle_quality,
     tone_mapping,
     auto_exposure,

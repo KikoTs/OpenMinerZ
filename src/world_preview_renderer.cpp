@@ -198,7 +198,7 @@ struct Projection final
 };
 
 SDL_Color face_color(const world::WorldFace &face, const world::SkyState &sky, bool textured,
-                     bool ambient_occlusion, float shadow_strength)
+                     bool ambient_occlusion, bool ore_glow, float shadow_strength)
 {
     world::Vec3 normal{};
     switch (face.direction)
@@ -245,6 +245,11 @@ SDL_Color face_color(const world::WorldFace &face, const world::SkyState &sky, b
     const float torch_red = torch_gain;
     const float torch_green = torch_gain * (235.0F / 255.0F);
     const float torch_blue = torch_gain * (190.0F / 255.0F);
+    const bool glowing_ore =
+        ore_glow && face.block >= world::BlockType::gold_ore &&
+        face.block <= world::BlockType::diamond_ore;
+    const float ore_lift = glowing_ore ? (face.block == world::BlockType::coal_ore ? 0.08F : 0.18F)
+                                        : 0.0F;
     const auto illumination = [](float ambient, float direct) {
         return std::min(1.0F, (ambient * 0.35F + direct * 0.65F) * 1.2F);
     };
@@ -258,9 +263,12 @@ SDL_Color face_color(const world::WorldFace &face, const world::SkyState &sky, b
             return static_cast<Uint8>(std::clamp(lit, 0.0F, 1.0F) * 255.0F);
         };
         return {
-            channel(face_light * illumination(sky.ambient.red, sky.direct.red) + torch_red),
-            channel(face_light * illumination(sky.ambient.green, sky.direct.green) + torch_green),
-            channel(face_light * illumination(sky.ambient.blue, sky.direct.blue) + torch_blue),
+            channel(face_light * illumination(sky.ambient.red, sky.direct.red) + torch_red +
+                    ore_lift),
+            channel(face_light * illumination(sky.ambient.green, sky.direct.green) + torch_green +
+                    ore_lift),
+            channel(face_light * illumination(sky.ambient.blue, sky.direct.blue) + torch_blue +
+                    ore_lift),
             255U};
     }
     const auto base = world::fallback_color(face.block);
@@ -2701,7 +2709,7 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                                 float elapsed_seconds, float render_scale, float camera_bob,
                                 float screen_shake, float viewmodel_fov_degrees,
                                 bool rebirth_presentation, bool reduced_motion, bool inspector_view,
-                                bool ambient_occlusion, float shadow_strength)
+                                bool ambient_occlusion, bool ore_glow, float shadow_strength)
 {
     world::PlayerState render_player = player;
     render_player.clock_time_of_day = sky.time_of_day;
@@ -2737,7 +2745,7 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
         inspector_view ? -0.08F : render_player.pitch, vertical_fov_degrees, rebirth_presentation);
     if (inspector_view)
     {
-        draw_inspector(metrics, sky, ambient_occlusion, shadow_strength);
+        draw_inspector(metrics, sky, ambient_occlusion, ore_glow, shadow_strength);
     }
     else
     {
@@ -3688,7 +3696,8 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
             depth_renderer_ != nullptr &&
             depth_renderer_->draw(metrics, sky, render_player, vertical_fov_degrees, render_scale,
                                   elapsed_seconds, visibility_distance_, biome_, water_enabled,
-                                  rebirth_presentation, ambient_occlusion, shadow_strength);
+                                  rebirth_presentation, ambient_occlusion, ore_glow,
+                                  shadow_strength);
         if (!depth_rendered)
         {
             if (expected_depth_renderer && depth_renderer_ != nullptr)
@@ -3698,7 +3707,7 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
             }
             stats_.depth_buffered = false;
             draw_first_person(metrics, sky, render_player, vertical_fov_degrees, ambient_occlusion,
-                              shadow_strength);
+                              ore_glow, shadow_strength);
         }
         // The depth path draws target decals, particles and pickups inside the
         // entity batch. SDL overlays only backstop the non-D3D fallback.
@@ -4200,7 +4209,8 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
 }
 
 void WorldPreviewRenderer::draw_inspector(const ui::UiMetrics &metrics, const world::SkyState &sky,
-                                          bool ambient_occlusion, float shadow_strength)
+                                          bool ambient_occlusion, bool ore_glow,
+                                          float shadow_strength)
 {
     refresh_flat_faces();
     const float width = static_cast<float>(metrics.output_width);
@@ -4255,7 +4265,7 @@ void WorldPreviewRenderer::draw_inspector(const ui::UiMetrics &metrics, const wo
         const float u1 = static_cast<float>(tile_x + 1) / 8.0F - inset;
         const float v1 = static_cast<float>(tile_y + 1) / 8.0F - inset;
         const SDL_Color color =
-            face_color(face, sky, atlas_ != nullptr, ambient_occlusion, shadow_strength);
+            face_color(face, sky, atlas_ != nullptr, ambient_occlusion, ore_glow, shadow_strength);
         const auto face_uv = world::atlas_uv_corners(face.direction, u0, v0, u1, v1);
         const std::array<SDL_FPoint, 4> texture_coordinates{{
             {face_uv[0][0], face_uv[0][1]},
@@ -4281,7 +4291,7 @@ void WorldPreviewRenderer::draw_first_person(const ui::UiMetrics &metrics,
                                              const world::SkyState &sky,
                                              const world::PlayerState &player,
                                              float vertical_fov_degrees, bool ambient_occlusion,
-                                             float shadow_strength)
+                                             bool ore_glow, float shadow_strength)
 {
     refresh_flat_faces();
     struct ProjectedFace final
@@ -4430,7 +4440,7 @@ void WorldPreviewRenderer::draw_first_person(const ui::UiMetrics &metrics,
                                        {face_uv[2][0], face_uv[2][1]},
                                        {face_uv[3][0], face_uv[3][1]}}};
         SDL_Color color =
-            face_color(face, sky, atlas_ != nullptr, ambient_occlusion, shadow_strength);
+            face_color(face, sky, atlas_ != nullptr, ambient_occlusion, ore_glow, shadow_strength);
         const float distance = std::sqrt(dx * dx + dz * dz);
         const float fog_end = std::clamp(visibility_distance_ - 10.0F, 24.0F, 118.0F);
         const float fog_start = std::min(24.0F, fog_end - 8.0F);

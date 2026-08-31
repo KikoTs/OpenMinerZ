@@ -60,7 +60,7 @@ class DepthVoxelRenderer final
                             const world::PlayerState &player, float vertical_fov_degrees,
                             float render_scale, float elapsed_seconds, float visibility_distance,
                             world::BiomeKind biome, bool water_enabled, bool enhanced_foliage,
-                            bool ambient_occlusion, float shadow_strength);
+                            bool ambient_occlusion, bool ore_glow, float shadow_strength);
 
   private:
     class Impl;

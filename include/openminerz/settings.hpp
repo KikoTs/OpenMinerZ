@@ -73,6 +73,9 @@ struct Settings final
     QualityLevel shadow_quality{QualityLevel::high};
     AntiAliasing anti_aliasing{AntiAliasing::taa};
     bool ambient_occlusion{true};
+    // Adds a restrained emissive shimmer to exposed ore veins. This is a
+    // presentation-only option and never changes block lighting or gameplay.
+    bool ore_glow{true};
     QualityLevel particle_quality{QualityLevel::high};
     // Tone mapping and its manual exposure trim (stops, -2..+2). Auto exposure
     // measures the scene each frame; this biases the result.

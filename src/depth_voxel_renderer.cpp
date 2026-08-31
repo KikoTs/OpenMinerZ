@@ -324,7 +324,7 @@ class DepthVoxelRenderer::Impl final
                             const world::PlayerState &player, float vertical_fov_degrees,
                             float render_scale, float elapsed_seconds, float visibility_distance,
                             world::BiomeKind biome, bool water_enabled, bool enhanced_foliage,
-                            bool ambient_occlusion, float shadow_strength)
+                            bool ambient_occlusion, bool ore_glow, float shadow_strength)
     {
 #if defined(_WIN32)
         if (!available_ || (vertex_buffer_ == nullptr && chunk_meshes_.empty()))
@@ -633,7 +633,7 @@ class DepthVoxelRenderer::Impl final
             biome_atmosphere_enabled ? biome_atmosphere.grade_strength * atmosphere_presence
                                      : 0.0F};
         constants.biome_params = {biome_atmosphere_enabled ? biome_atmosphere.saturation : 1.0F,
-                                  0.0F, 0.0F, 0.0F};
+                                  ore_glow ? 1.0F : 0.0F, 0.0F, 0.0F};
         for (std::size_t index = 0U; index < crater_masks_.size(); ++index)
         {
             constants.crater_masks[index] = {crater_masks_[index][0], crater_masks_[index][1],
@@ -1041,6 +1041,7 @@ class DepthVoxelRenderer::Impl final
         (void)water_enabled;
         (void)enhanced_foliage;
         (void)ambient_occlusion;
+        (void)ore_glow;
         (void)shadow_strength;
         return false;
 #endif
@@ -1411,8 +1412,9 @@ class DepthVoxelRenderer::Impl final
         Float4 dynamic_radiance_origin;
         Float4 dynamic_radiance_params;
         // Display-referred biome grade. Tint w is blend strength; params x is
-        // the target saturation. This stays after every lighting constant so
-        // existing terrain/entity shader layouts retain their exact offsets.
+        // the target saturation and params y enables the presentation-only ore
+        // glow. This stays after every lighting constant so existing
+        // terrain/entity shader layouts retain their exact offsets.
         Float4 biome_tint;
         Float4 biome_params;
         // xy = crash-site centre, z = dry radius, w = active. Lagoon water is
@@ -2513,6 +2515,28 @@ float4 main(PixelInput input) : SV_TARGET
     }
     float authored_light = max(metal_light.g, metal_light.b);
     lit += texel.rgb * authored_light * 0.48f;
+    // The modern material atlas already contains a precise smoothness mask for
+    // the mineral fragments in tiles 6..10. Reusing it keeps the surrounding
+    // rock dark instead of making the entire ore block self-illuminated. The
+    // pulse is deliberately shallow: it gives exposed veins a readable glint
+    // and a little bloom without turning them into gameplay light sources.
+    if (BiomeParams.y > 0.5f && input.tile >= 5.5f && input.tile <= 10.5f)
+    {
+        float ore_mask = smoothstep(0.34f, 0.88f, saturate(metal_light.r));
+        float3 ore_tint = input.tile < 6.5f
+                              ? float3(1.00f, 0.46f, 0.08f)
+                          : input.tile < 7.5f
+                              ? float3(0.72f, 0.84f, 1.00f)
+                          : input.tile < 8.5f
+                              ? float3(1.00f, 0.28f, 0.07f)
+                          : input.tile < 9.5f
+                              ? float3(0.34f, 0.38f, 0.46f)
+                              : float3(0.08f, 0.92f, 1.00f);
+        float ore_strength = input.tile >= 8.5f && input.tile < 9.5f ? 0.14f : 0.34f;
+        float pulse = 0.92f + 0.08f * sin(WaterAndTime.x * 1.45f +
+                                         dot(input.world_position, float3(0.31f, 0.17f, 0.23f)));
+        lit += ore_tint * ore_mask * ore_strength * pulse;
+    }
     lit = lerp(lit, texel.rgb * 1.12f, saturate(input.emission));
     return float4(lerp(lit, FogAndEnd.rgb, fog), 1.0f);
 }
@@ -5029,11 +5053,11 @@ bool DepthVoxelRenderer::draw(const ui::UiMetrics &metrics, const world::SkyStat
                               const world::PlayerState &player, float vertical_fov_degrees,
                               float render_scale, float elapsed_seconds, float visibility_distance,
                               world::BiomeKind biome, bool water_enabled, bool enhanced_foliage,
-                              bool ambient_occlusion, float shadow_strength)
+                              bool ambient_occlusion, bool ore_glow, float shadow_strength)
 {
     return impl_->draw(metrics, sky, player, vertical_fov_degrees, render_scale, elapsed_seconds,
                        visibility_distance, biome, water_enabled, enhanced_foliage,
-                       ambient_occlusion, shadow_strength);
+                       ambient_occlusion, ore_glow, shadow_strength);
 }
 
 } // namespace openminerz

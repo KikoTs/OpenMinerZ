@@ -169,6 +169,7 @@ Settings SettingsStore::load() const
                                   {"msaa_4x", AntiAliasing::msaa4x}});
     result.ambient_occlusion =
         parse_bool(value_or(values, "ambient_occlusion"), result.ambient_occlusion);
+    result.ore_glow = parse_bool(value_or(values, "ore_glow"), result.ore_glow);
     result.particle_quality =
         parse_enum<QualityLevel>(value_or(values, "particle_quality"), result.particle_quality,
                                  {{"low", QualityLevel::low},
@@ -262,6 +263,7 @@ void SettingsStore::save(const Settings &source) const
     output << "shadow_quality=" << to_string(settings.shadow_quality) << '\n';
     output << "anti_aliasing=" << to_string(settings.anti_aliasing) << '\n';
     output << "ambient_occlusion=" << settings.ambient_occlusion << '\n';
+    output << "ore_glow=" << settings.ore_glow << '\n';
     output << "particle_quality=" << to_string(settings.particle_quality) << '\n';
     output << "tone_mapping=" << to_string(settings.tone_mapping) << '\n';
     output << "exposure_compensation=" << settings.exposure_compensation << '\n';
