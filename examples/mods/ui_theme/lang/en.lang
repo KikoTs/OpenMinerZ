@@ -1,0 +1,10 @@
+# Ember theme: English strings.
+clock = Day {day}  {time}
+menu.about = About Ember
+menu.about_hint = What this theme changes, and its settings.
+about.title = Ember Theme
+about.text = A client mod: it changes only how the game looks on this computer, so it works on any server, vanilla CastleMiner Z hosts included.\nSettings live on Add-Ons > Ember Theme. F8 shows or hides the day clock.
+about.close = Close
+key.clock = Show or hide the day clock
+setting.clock = Day clock on the HUD
+setting.clock_hint = A small panel at the top right with the day and the time.

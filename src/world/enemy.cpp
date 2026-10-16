@@ -1,5 +1,9 @@
 #include "openminerz/world/enemy.hpp"
 
+#include "enemy_simulation.hpp"
+
+#include "openminerz/world/dragon_brain.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -228,11 +232,6 @@ constexpr std::array<EnemyAttack, 2> felguard_attack_list{{
     return {left.x - right.x, left.y - right.y, left.z - right.z};
 }
 
-[[nodiscard]] float horizontal_length(Vec3 value) noexcept
-{
-    return std::sqrt(value.x * value.x + value.z * value.z);
-}
-
 [[nodiscard]] int block_dig_hardness(BlockType type) noexcept
 {
     switch (type)
@@ -300,63 +299,10 @@ constexpr std::array<EnemyAttack, 2> felguard_attack_list{{
     return 5;
 }
 
-// Lightweight axis-separated voxel collision for a standing capsule the size the
-// original enemies use.
+// BaseZombie.PlayerAABB, the box weapons trace against. Movement itself is the
+// original swept box in enemy_simulation.cpp.
 constexpr float enemy_half_width = 0.35F;
 constexpr float enemy_height = 1.65F;
-constexpr float enemy_gravity = -20.0F;
-
-[[nodiscard]] bool box_intersects_solid(const WorldRegion &region, Vec3 feet) noexcept
-{
-    const int min_x = static_cast<int>(std::floor(feet.x - enemy_half_width));
-    const int max_x = static_cast<int>(std::floor(feet.x + enemy_half_width));
-    const int min_y = static_cast<int>(std::floor(feet.y));
-    const int max_y = static_cast<int>(std::floor(feet.y + enemy_height - 0.01F));
-    const int min_z = static_cast<int>(std::floor(feet.z - enemy_half_width));
-    const int max_z = static_cast<int>(std::floor(feet.z + enemy_half_width));
-    for (int y = min_y; y <= max_y; ++y)
-        for (int z = min_z; z <= max_z; ++z)
-            for (int x = min_x; x <= max_x; ++x)
-                if (region.contains(x, y, z) && blocks_player(region.block(x, y, z)))
-                    return true;
-    return false;
-}
-
-void move_enemy(const WorldRegion &region, Enemy &enemy, float delta_seconds)
-{
-    enemy.velocity.y = std::max(enemy.velocity.y + enemy_gravity * delta_seconds, -40.0F);
-    Vec3 next = enemy.position;
-    next.x += enemy.velocity.x * delta_seconds;
-    if (box_intersects_solid(region, next))
-    {
-        next.x = enemy.position.x;
-        enemy.velocity.x = 0.0F;
-    }
-    next.z += enemy.velocity.z * delta_seconds;
-    if (box_intersects_solid(region, next))
-    {
-        next.z = enemy.position.z;
-        enemy.velocity.z = 0.0F;
-    }
-    next.y += enemy.velocity.y * delta_seconds;
-    enemy.on_ground = false;
-    if (box_intersects_solid(region, next))
-    {
-        if (enemy.velocity.y <= 0.0F)
-        {
-            enemy.on_ground = true;
-            next.y = std::floor(next.y) + 1.0F;
-            if (box_intersects_solid(region, next))
-                next.y = enemy.position.y;
-        }
-        else
-        {
-            next.y = enemy.position.y;
-        }
-        enemy.velocity.y = 0.0F;
-    }
-    enemy.position = next;
-}
 
 } // namespace
 
@@ -413,17 +359,20 @@ float enemy_damage_multiplier(int type, DamageFlags damage, bool headshot) noexc
 
 const EnemyAttackSet &enemy_attacks(EnemyClass enemy_class) noexcept
 {
+    // RageAnimation of each *TryAttack state: the clip played when the miss
+    // budget runs out. Zombies and every skeleton play "enraged"; the Alien
+    // and the Felguard replay "Attack1".
     static const EnemyAttackSet zombie{
-        zombie_attack_list.data(), static_cast<int>(zombie_attack_list.size()), "attack5", 1.0F};
+        zombie_attack_list.data(), static_cast<int>(zombie_attack_list.size()), "enraged", 1.0F};
     static const EnemyAttackSet skeleton{skeleton_attack_list.data(),
-                                         static_cast<int>(skeleton_attack_list.size()), "attack3",
+                                         static_cast<int>(skeleton_attack_list.size()), "enraged",
                                          1.0F};
     static const EnemyAttackSet axes{axes_attack_list.data(),
-                                     static_cast<int>(axes_attack_list.size()), "attack3", 1.0F};
+                                     static_cast<int>(axes_attack_list.size()), "enraged", 1.0F};
     static const EnemyAttackSet alien{alien_attack_list.data(),
-                                      static_cast<int>(alien_attack_list.size()), "Attack2", 1.0F};
+                                      static_cast<int>(alien_attack_list.size()), "Attack1", 1.0F};
     static const EnemyAttackSet felguard{felguard_attack_list.data(),
-                                         static_cast<int>(felguard_attack_list.size()), "atack_3",
+                                         static_cast<int>(felguard_attack_list.size()), "Attack1",
                                          1.0F};
     switch (enemy_class)
     {
@@ -672,7 +621,14 @@ float minimum_enemy_spawn_seconds(float distance, bool hard_branch) noexcept
     // GetMinEnemySpawnTime: Endurance/Normal/Hardcore run 5s -> 1s; Easy runs
     // 45s -> 20s.  The gap is the difference between a quiet night and the
     // original's storm.
-    const float amount = std::clamp(distance / 3450.0F, 0.0F, 1.0F);
+    //
+    // It is `MathHelper.Lerp(5f, 1f, d / 3450f)`, and XNA's Lerp does not
+    // clamp: past 3450 blocks the time keeps falling (zero at 4312 on the
+    // hard branch, negative beyond), which is what makes the far lands -
+    // and a long Endurance run, whose distance grows by 120 a day - swarm.
+    // Clamping it held the hard branch at one second and the easy one at
+    // twenty for good. (Executed: SemanticsParityProbe facts spawn.min_time.*.)
+    const float amount = distance / 3450.0F;
     if (hard_branch)
     {
         return 5.0F + (1.0F - 5.0F) * amount;
@@ -685,12 +641,12 @@ EnemyLoot enemy_loot(int type, float distance_from_origin, float enemy_y, EnemyR
     const EnemyStats &stats = enemy_stats(type);
     const float floor = std::clamp(distance_from_origin / 5000.0F, 0.0F, 1.0F);
     const float roll = floor + rng.next01() * (1.0F - floor);
-    if (stats.habitat == EnemyHabitat::hell)
-    {
-        // Felguards always pay out explosive powder.
-        const std::uint16_t count = roll < 0.5F ? 1U : (roll < 0.8F ? 2U : 3U);
-        return {108U, count}; // ExplosivePowder
-    }
+    // BaseZombie.CreatePickup does pick Explosive Powder for a HELL enemy, but
+    // the very next statement is `if (CRASHSITE) {...} else {...}` with no
+    // `else` in front of it, so a hell enemy runs the ordinary branch below and
+    // the powder is thrown away: nothing on a roll under 0.5, otherwise the
+    // cave or surface table. Both shipped generations read this way; powder
+    // comes from dragons (and, in 1.9.9.8, from its recipe).
     if (stats.habitat == EnemyHabitat::crash_site)
     {
         if (roll < 0.5F)
@@ -798,6 +754,71 @@ DragonBasis dragon_attitude_basis(float yaw, float pitch, float roll) noexcept
     const Vec3 up{xy - wz, 1.0F - xx - zz, yz + wx};
     const Vec3 backward{xz + wy, yz - wx, 1.0F - xx - yy};
     return {right, up, {-backward.x, -backward.y, -backward.z}};
+}
+
+bool dragon_blast_reaches(Vec3 impact, int x, int y, int z) noexcept
+{
+    const float dx = static_cast<float>(x) + 0.5F - impact.x;
+    const float dy = static_cast<float>(y) + 0.5F - impact.y;
+    const float dz = static_cast<float>(z) + 0.5F - impact.z;
+    return dx * dx + dy * dy + dz * dz <= 25.0F;
+}
+
+Vec3 dragon_fireball_velocity(DragonKind kind, Vec3 origin, Vec3 target) noexcept
+{
+    const Vec3 delta{target.x - origin.x, target.y - origin.y, target.z - origin.z};
+    const float length = std::sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+    if (length < 0.000001F)
+        return {};
+    const float scale = dragon_stats(kind).fireball_velocity / length;
+    return {delta.x * scale, delta.y * scale, delta.z * scale};
+}
+
+Vec3 dragon_muzzle_offset(std::uint8_t animation) noexcept
+{
+    // Mean "Bip01_Ponytail1" translation in DragonClientEntity space over a
+    // 180-second original flight (identical in 1.6.3.8 and 1.9.9.8). The bone
+    // rides the wing beat, so an individual shot may sit up to ~2 units away.
+    switch (animation)
+    {
+    case 1U: // FLAP, "fly_forward"
+        return {0.014F, 0.764F, -8.266F};
+    case 3U: // HOVER, "Idle"
+        return {-0.395F, 3.340F, -6.232F};
+    default: // SOAR, "flying_idle" (and the ATTACK clip, which blends from it)
+        return {0.021F, 0.453F, -6.833F};
+    }
+}
+
+std::uint8_t dragon_animation_index(std::string_view clip) noexcept
+{
+    // DragonEntity.AnimNames: flying_idle, fly_forward, gethit, Idle.
+    if (clip == "Idle")
+        return 3U;
+    if (clip == "attack")
+        return 2U;
+    if (clip == "fly_forward")
+        return 1U;
+    return 0U;
+}
+
+float dragon_move_toward_target(float current, float target, float rate,
+                                float delta_seconds) noexcept
+{
+    if (target == current)
+        return current;
+    // The original is 32-bit .NET: a float expression is evaluated in the x87
+    // FPU at double precision and rounded once, when it is stored. Doing the
+    // same keeps the 0.01 snap (and everything downstream of it) on the frame
+    // the original takes it.
+    double step = static_cast<double>(target) - static_cast<double>(current);
+    const double magnitude = std::abs(step);
+    if (magnitude > static_cast<double>(rate))
+        step *= static_cast<double>(rate) / magnitude;
+    const double moved = static_cast<double>(current) + step * static_cast<double>(delta_seconds);
+    return std::abs(moved - static_cast<double>(target)) < static_cast<double>(0.01F)
+               ? target
+               : static_cast<float>(moved);
 }
 
 std::optional<DragonRayHit> trace_dragon(const Dragon &dragon, Vec3 origin, Vec3 direction,
@@ -977,6 +998,16 @@ void DragonFlight::spawn(DragonKind kind, Vec3 player_position, EnemyRng &rng)
     network_replica_ready_ = true;
     network_waiting_to_shoot_ = false;
     network_events_.clear();
+    network_owner_ = false;
+    network_timeout_ = 0.0F;
+    owner_messages_.clear();
+    owner_echo_.clear();
+    // InitSpawnState: Yaw = DefaultHeading = the random approach heading.
+    default_heading_ = angle;
+    brain_target_yaw_ = angle;
+    brain_target_pitch_ = 0.0F;
+    brain_target_roll_ = 0.0F;
+    brain_target_velocity_ = stats.speed;
     active_ = true;
 }
 
@@ -995,13 +1026,183 @@ void DragonFlight::install_replica(DragonKind kind, float health) noexcept
     network_replica_ready_ = false;
     network_waiting_to_shoot_ = false;
     network_events_.clear();
+    network_owner_ = false;
+    network_timeout_ = 0.0F;
+    owner_messages_.clear();
+    owner_echo_.clear();
     active_ = true;
+}
+
+void DragonFlight::begin_network_ownership(std::uint8_t local_gid,
+                                           std::uint32_t next_fireball_index) noexcept
+{
+    if (!active_)
+        return;
+    // `new DragonEntity(type, forBiome, null)` beside `new DragonClientEntity`.
+    const DragonKind kind = dragon_.kind;
+    const float health = dragon_.health;
+    const Vec3 spawned = dragon_.position;
+    retail_ = std::make_shared<DragonBrainState>();
+    retail_->next_fireball_index = next_fireball_index;
+    // spawn() already drew InitSpawnState's heading and placed the dragon.
+    dragon_brain_spawn(*retail_, kind,
+                       {spawned.x - std::sin(default_heading_) * 750.0F, 0.0F,
+                        spawned.z - std::cos(default_heading_) * 750.0F},
+                       default_heading_);
+    retail_->position = spawned;
+    dragon_ = Dragon{};
+    dragon_.kind = kind;
+    dragon_.health = health;
+    dragon_.clip = "fly_forward";
+    network_waypoints_.clear();
+    network_events_.clear();
+    network_interpolation_time_ = 0.0F;
+    network_replica_ = false;
+    network_replica_ready_ = false;
+    network_waiting_to_shoot_ = false;
+    network_timeout_ = 0.0F;
+    network_owner_ = true;
+    owner_gid_ = local_gid;
+    owner_messages_.clear();
+    owner_echo_.clear();
+    sync_brain_view();
+}
+
+void DragonFlight::adopt_network_ownership(std::uint8_t local_gid,
+                                           const DragonMigrationState &migration,
+                                           DragonBrainSession &session)
+{
+    if (!active_)
+        return;
+    // `new DragonEntity(type, forBiome, miginfo)`: InitAfterHostChange. The
+    // replica this peer is already presenting is not touched.
+    if (retail_ == nullptr)
+        retail_ = std::make_shared<DragonBrainState>();
+    dragon_brain_adopt(*retail_, dragon_.kind, migration, session);
+    network_owner_ = true;
+    owner_gid_ = local_gid;
+    owner_messages_.clear();
+    owner_echo_.clear();
+    sync_brain_view();
+}
+
+void DragonFlight::end_network_ownership() noexcept
+{
+    network_owner_ = false;
+    // What remains is an ordinary DragonClientEntity.
+    network_replica_ = active_;
+    owner_messages_.clear();
+    owner_echo_.clear();
+}
+
+DragonMigrationState DragonFlight::migration_state() const noexcept
+{
+    return retail_ != nullptr ? dragon_brain_migration(*retail_) : DragonMigrationState{};
+}
+
+float DragonFlight::owner_time() const noexcept
+{
+    return retail_ != nullptr ? retail_->dragon_time : 0.0F;
+}
+
+std::uint32_t DragonFlight::next_fireball_index() const noexcept
+{
+    return retail_ != nullptr ? retail_->next_fireball_index : 0U;
+}
+
+DragonBrainState &DragonFlight::brain_state() noexcept
+{
+    if (retail_ == nullptr)
+        retail_ = std::make_shared<DragonBrainState>();
+    return *retail_;
+}
+
+void DragonFlight::register_gunshot(Vec3 position)
+{
+    if (network_owner_ && retail_ != nullptr)
+        retail_->gunshots.push_back(position);
+}
+
+void DragonFlight::note_hit() noexcept
+{
+    if (network_owner_ && retail_ != nullptr)
+        dragon_brain_hit(*retail_);
+}
+
+// The legacy Dragon view of the retail brain, for brain() readers.
+void DragonFlight::sync_brain_view() noexcept
+{
+    if (retail_ == nullptr)
+        return;
+    brain_.kind = retail_->kind;
+    brain_.position = retail_->position;
+    brain_.yaw = retail_->yaw;
+    brain_.pitch = retail_->pitch;
+    brain_.roll = retail_->roll;
+    brain_.velocity = retail_->velocity;
+    static constexpr std::string_view clips[4]{"flying_idle", "fly_forward", "attack", "Idle"};
+    brain_.clip = clips[retail_->current_animation & 3U];
+    switch (retail_->mode)
+    {
+    case DragonBrainMode::default_state:
+        brain_.state = DragonState::approach;
+        break;
+    case DragonBrainMode::strafe_attack:
+        brain_.state = DragonState::strafe;
+        break;
+    case DragonBrainMode::hover:
+    case DragonBrainMode::hover_attack:
+        brain_.state = DragonState::hover;
+        break;
+    default:
+        brain_.state = DragonState::loiter;
+        break;
+    }
+}
+
+DragonEvents DragonFlight::update_owner(DragonBrainSession &session, float delta_seconds)
+{
+    DragonEvents events;
+    if (!active_ || !network_owner_ || retail_ == nullptr || dragon_.state == DragonState::dying)
+        return events;
+    // Message.Echo: what the brain sent last frame reaches this peer's own
+    // DragonClientEntity on this frame's message pump.
+    for (const DragonOwnerMessage &echo : owner_echo_)
+        static_cast<void>(add_network_waypoint(
+            {echo.position, echo.velocity, echo.host_time, echo.target_roll, echo.animation,
+             echo.sound, static_cast<std::uint8_t>(echo.attack ? 2U : 0U), echo.target,
+             echo.fireball_index}));
+    owner_echo_.clear();
+    retail_->modern_content = modern_content_;
+    DragonBrainOutput output;
+    dragon_brain_update(*retail_, session, delta_seconds, owner_gid_, output);
+    sync_brain_view();
+    events.remove_requested = output.remove_requests > 0;
+    events.migrate_to = output.migrate_to;
+    for (const DragonOwnerMessage &message : output.messages)
+    {
+        owner_messages_.push_back(message);
+        owner_echo_.push_back(message);
+    }
+    extrapolate_network_replica(delta_seconds);
+    return events;
+}
+
+std::vector<DragonOwnerMessage> DragonFlight::take_owner_messages() noexcept
+{
+    std::vector<DragonOwnerMessage> messages;
+    messages.swap(owner_messages_);
+    return messages;
 }
 
 void DragonFlight::apply_network_waypoint(Vec3 position, Vec3 velocity, float host_time,
                                           float target_roll, std::uint8_t animation,
                                           std::uint8_t sound) noexcept
 {
+    // An owner's replica is fed only by its own echo (update()); the same
+    // waypoint coming back through the session would be a duplicate.
+    if (network_owner_)
+        return;
     static_cast<void>(
         add_network_waypoint({position, velocity, host_time, target_roll, animation, sound}));
 }
@@ -1011,6 +1212,8 @@ bool DragonFlight::apply_network_attack_waypoint(Vec3 position, Vec3 velocity, f
                                                  std::uint8_t sound, Vec3 target,
                                                  std::int32_t fireball_id, bool animated) noexcept
 {
+    if (network_owner_)
+        return false;
     return add_network_waypoint({position, velocity, host_time, target_roll, animation, sound,
                                  static_cast<std::uint8_t>(animated ? 1U : 2U), target,
                                  fireball_id});
@@ -1019,7 +1222,12 @@ bool DragonFlight::apply_network_attack_waypoint(Vec3 position, Vec3 velocity, f
 bool DragonFlight::add_network_waypoint(NetworkWaypoint incoming) noexcept
 {
     constexpr std::size_t maximum_buffered_waypoints = 128U;
-    if (!active_ || !network_replica_ || network_waypoints_.size() >= maximum_buffered_waypoints)
+    if (!active_ || !presents_replica())
+        return false;
+    // AddActionWaypoint zeroes TimeoutTimer before it decides anything else,
+    // so even a sample it then discards keeps the dragon alive.
+    network_timeout_ = 0.0F;
+    if (network_waypoints_.size() >= maximum_buffered_waypoints)
         return false;
     for (std::size_t index{}; index < network_waypoints_.size(); ++index)
     {
@@ -1041,12 +1249,14 @@ bool DragonFlight::add_network_waypoint(NetworkWaypoint incoming) noexcept
         network_waypoints_.clear();
         const Vec3 forward =
             dragon_attitude_basis(dragon_.yaw, dragon_.pitch, dragon_.roll).forward;
+        // The bridging waypoint is a default struct apart from position,
+        // CurrentVelocity, time and CurrentAnimation: its TargetRoll is zero.
         network_waypoints_.push_back({dragon_.position,
                                       {forward.x * dragon_.velocity, forward.y * dragon_.velocity,
                                        forward.z * dragon_.velocity},
                                       network_interpolation_time_,
-                                      dragon_.roll,
-                                      incoming.animation});
+                                      0.0F,
+                                      dragon_animation_index(dragon_.clip)});
     }
     network_waypoints_.push_back(incoming);
     return true;
@@ -1054,9 +1264,17 @@ bool DragonFlight::add_network_waypoint(NetworkWaypoint incoming) noexcept
 
 void DragonFlight::emit_network_fireball(Vec3 target, std::int32_t fireball_id) noexcept
 {
-    const Vec3 forward = dragon_attitude_basis(dragon_.yaw, dragon_.pitch, dragon_.roll).forward;
-    const Vec3 origin{dragon_.position.x + forward.x * 4.0F, dragon_.position.y - 1.0F,
-                      dragon_.position.z + forward.z * 4.0F};
+    // ShootFireball reads the ponytail bone out of the pose the replica held
+    // BEFORE this frame's move, which is exactly what dragon_ still is here.
+    const DragonBasis basis = dragon_attitude_basis(dragon_.yaw, dragon_.pitch, dragon_.roll);
+    const Vec3 muzzle = dragon_muzzle_offset(dragon_animation_index(dragon_.clip));
+    const Vec3 origin{
+        dragon_.position.x + basis.right.x * muzzle.x + basis.up.x * muzzle.y -
+            basis.forward.x * muzzle.z,
+        dragon_.position.y + basis.right.y * muzzle.x + basis.up.y * muzzle.y -
+            basis.forward.y * muzzle.z,
+        dragon_.position.z + basis.right.z * muzzle.x + basis.up.z * muzzle.y -
+            basis.forward.z * muzzle.z};
     network_events_.push_back({DragonReplicaEventKind::fireball, origin, target, fireball_id});
 }
 
@@ -1127,8 +1345,9 @@ void DragonFlight::apply_network_replica_sample(Vec3 position, Vec3 velocity, fl
         dragon.yaw = std::atan2(-velocity.x, -velocity.z);
         dragon.pitch = std::atan2(velocity.y, std::max(0.001F, horizontal));
     }
-    const float maximum_roll_change = std::max(0.0F, delta_seconds);
-    dragon.roll += std::clamp(target_roll - dragon.roll, -maximum_roll_change, maximum_roll_change);
+    // Roll = MathTools.MoveTowardTarget(Roll, TargetRoll, EType.RollRate, dt).
+    dragon.roll =
+        dragon_move_toward_target(dragon.roll, target_roll, 1.0F, std::max(0.0F, delta_seconds));
     if (!network_waiting_to_shoot_)
     {
         const char *next_clip{};
@@ -1159,8 +1378,16 @@ void DragonFlight::apply_network_replica_sample(Vec3 position, Vec3 velocity, fl
 
 void DragonFlight::extrapolate_network_replica(float delta_seconds) noexcept
 {
-    if (!active_ || !network_replica_ || delta_seconds < 0.0F)
+    if (!active_ || !presents_replica() || delta_seconds < 0.0F)
         return;
+    // DragonClientEntity.Update: the watchdog runs before anything else, even
+    // while the replica is still waiting for its first three waypoints.
+    network_timeout_ += delta_seconds;
+    if (network_timeout_ > 10.0F)
+    {
+        network_timeout_ = -3600.0F;
+        network_events_.push_back({DragonReplicaEventKind::timeout, dragon_.position, {}, 0});
+    }
     if (!network_replica_ready_)
     {
         if (network_waypoints_.size() < 3U)
@@ -1267,6 +1494,18 @@ void DragonFlight::damage(float amount)
     dragon_.health -= amount;
     if (dragon_.health <= 0.0F)
     {
+        // DragonClientEntity.Kill: the body keeps CurrentVelocity, levels out
+        // on its heading, and starts death_air_1.
+        const Vec3 forward = dragon_attitude_basis(dragon_.yaw, dragon_.pitch, 0.0F).forward;
+        death_velocity_ = {forward.x * dragon_.velocity, forward.y * dragon_.velocity,
+                           forward.z * dragon_.velocity};
+        dragon_.pitch = 0.0F;
+        dragon_.roll = 0.0F;
+        death_phase_ = 0U;
+        death_reaction_time_ = 0.0F;
+        death_clip_time_ = 0.0F;
+        death_clip_playing_ = true;
+        death_timer_ = 0.0F;
         dragon_.state = DragonState::dying;
         dragon_.state_time = 0.0F;
         dragon_.clip = "death_air_1";
@@ -1274,13 +1513,368 @@ void DragonFlight::damage(float amount)
     }
 }
 
+namespace
+{
+
+struct DeadBodySweep final
+{
+    bool hit{};
+    float time{1.0F};
+    Vec3 normal{};
+};
+
+// AABBTraceProbe with DragonClientEntity.DeadBodyBox, SkipEmbedded, against
+// DragonTraceProbe.TestThisType blocks: whatever blocks a player, except logs.
+[[nodiscard]] DeadBodySweep sweep_dead_body(const WorldRegion &region, Vec3 start, Vec3 end) noexcept
+{
+    constexpr Vec3 box_minimum{-2.5F, 0.0F, -2.5F};
+    constexpr Vec3 box_maximum{2.5F, 10.0F, 2.5F};
+    DeadBodySweep result;
+    const std::array<float, 3> origin{start.x, start.y, start.z};
+    const std::array<float, 3> delta{end.x - start.x, end.y - start.y, end.z - start.z};
+    const std::array<float, 3> low{box_minimum.x, box_minimum.y, box_minimum.z};
+    const std::array<float, 3> high{box_maximum.x, box_maximum.y, box_maximum.z};
+    std::array<int, 3> first{};
+    std::array<int, 3> last{};
+    for (std::size_t axis{}; axis < 3U; ++axis)
+    {
+        first[axis] = static_cast<int>(
+            std::floor(std::min(origin[axis], origin[axis] + delta[axis]) + low[axis]));
+        last[axis] = static_cast<int>(
+            std::floor(std::max(origin[axis], origin[axis] + delta[axis]) + high[axis]));
+    }
+    for (int z = first[2]; z <= last[2]; ++z)
+        for (int y = first[1]; y <= last[1]; ++y)
+            for (int x = first[0]; x <= last[0]; ++x)
+            {
+                if (!region.contains(x, y, z))
+                    continue;
+                const BlockType block = region.block(x, y, z);
+                if (block == BlockType::log || !blocks_player(block))
+                    continue;
+                // The voxel grown by the body box turns the sweep into a segment test.
+                const std::array<int, 3> cell{x, y, z};
+                float enter = -std::numeric_limits<float>::infinity();
+                float exit = std::numeric_limits<float>::infinity();
+                std::size_t enter_axis{};
+                bool miss{};
+                for (std::size_t axis{}; axis < 3U && !miss; ++axis)
+                {
+                    const float minimum = static_cast<float>(cell[axis]) - high[axis];
+                    const float maximum = static_cast<float>(cell[axis]) + 1.0F - low[axis];
+                    if (std::abs(delta[axis]) < 1.0e-9F)
+                    {
+                        miss = origin[axis] <= minimum || origin[axis] >= maximum;
+                        continue;
+                    }
+                    float near_time = (minimum - origin[axis]) / delta[axis];
+                    float far_time = (maximum - origin[axis]) / delta[axis];
+                    if (near_time > far_time)
+                        std::swap(near_time, far_time);
+                    if (near_time > enter)
+                    {
+                        enter = near_time;
+                        enter_axis = axis;
+                    }
+                    exit = std::min(exit, far_time);
+                }
+                // enter < 0: the body already overlaps this block (SkipEmbedded).
+                if (miss || enter > exit || enter < 0.0F || enter > 1.0F || enter >= result.time)
+                    continue;
+                result.hit = true;
+                result.time = enter;
+                result.normal = {};
+                const float sign = delta[enter_axis] > 0.0F ? -1.0F : 1.0F;
+                (enter_axis == 0U   ? result.normal.x
+                 : enter_axis == 1U ? result.normal.y
+                                    : result.normal.z) = sign;
+            }
+    return result;
+}
+
+} // namespace
+
+// DragonClientEntity.MoveDragonWithCollision.
+bool DragonFlight::move_dead_dragon(const WorldRegion *terrain, float delta_seconds) noexcept
+{
+    // DeathAnimationPackages[0].BoxOffset (0, 0, 7) through the yaw-only
+    // LocalToWorld Kill left behind: seven units behind the body.
+    const Vec3 offset{std::sin(dragon_.yaw) * 7.0F, 0.0F, std::cos(dragon_.yaw) * 7.0F};
+    float remaining = delta_seconds;
+    Vec3 position{dragon_.position.x + offset.x, dragon_.position.y + offset.y,
+                  dragon_.position.z + offset.z};
+    Vec3 velocity = death_velocity_;
+    bool on_ground{};
+    bool collided{};
+    int iterations{};
+    do
+    {
+        const Vec3 start = position;
+        const Vec3 step{velocity.x * remaining, velocity.y * remaining, velocity.z * remaining};
+        position = {start.x + step.x, start.y + step.y, start.z + step.z};
+        collided = false;
+        if (terrain != nullptr)
+        {
+            const DeadBodySweep sweep = sweep_dead_body(*terrain, start, position);
+            if (sweep.hit)
+            {
+                collided = true;
+                on_ground = on_ground || sweep.normal.y > 0.5F;
+                const float travelled = std::max(sweep.time - 0.001F, 0.0F);
+                position = {start.x + step.x * travelled, start.y + step.y * travelled,
+                            start.z + step.z * travelled};
+                const float into = sweep.normal.x * velocity.x + sweep.normal.y * velocity.y +
+                                   sweep.normal.z * velocity.z;
+                velocity = {velocity.x - sweep.normal.x * into, velocity.y - sweep.normal.y * into,
+                            velocity.z - sweep.normal.z * into};
+                remaining *= 1.0F - travelled;
+                if (remaining <= 1.0e-7F)
+                    break;
+                const float speed_squared =
+                    velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z;
+                const float along = death_velocity_.x * velocity.x +
+                                    death_velocity_.y * velocity.y + death_velocity_.z * velocity.z;
+                if (speed_squared <= 1.0e-6F || along <= 1.0e-6F)
+                {
+                    velocity = {};
+                    break;
+                }
+            }
+        }
+        ++iterations;
+    } while (collided && iterations < 4);
+    if (iterations == 4)
+        velocity = {};
+    position = {position.x - offset.x, position.y - offset.y, position.z - offset.z};
+    if (position.y < -64.0F)
+    {
+        position.y = -64.0F;
+        velocity.y = 0.0F;
+        on_ground = true;
+    }
+    dragon_.position = position;
+    death_velocity_ = velocity;
+    return on_ground;
+}
+
+DragonTargetChoice dragon_find_best_target(Vec3 dragon_position, Vec3 forward,
+                                           std::span<const DragonTargetCandidate> players) noexcept
+{
+    constexpr float maximum_view_distance = 300.0F;
+    constexpr float keep_alive_distance = 750.0F * 1.25F;
+    DragonTargetChoice choice;
+    choice.remove_dragon = true;
+    float best = std::numeric_limits<float>::max();
+    const Vec3 eye{dragon_position.x + forward.x * 7.0F, dragon_position.y + forward.y * 7.0F,
+                   dragon_position.z + forward.z * 7.0F};
+    for (const DragonTargetCandidate &player : players)
+    {
+        if (!player.alive)
+            continue;
+        const Vec3 toward{player.position.x - eye.x, player.position.y + 1.5F - eye.y,
+                          player.position.z - eye.z};
+        const float distance_squared =
+            toward.x * toward.x + toward.y * toward.y + toward.z * toward.z;
+        if (distance_squared < maximum_view_distance * maximum_view_distance &&
+            distance_squared > 0.001F)
+        {
+            choice.remove_dragon = false;
+            if (!player.region_loaded || !(player.sunlight > 0.0F))
+                continue;
+            const float score = distance_squared / (player.sunlight * player.sunlight);
+            if (!(score < best))
+                continue;
+            const float distance = std::sqrt(distance_squared);
+            const float facing =
+                (toward.x * forward.x + toward.y * forward.y + toward.z * forward.z) / distance;
+            if (facing > 0.17F && player.line_of_sight)
+            {
+                choice.gid = player.gid;
+                best = score;
+            }
+        }
+        else if (distance_squared < keep_alive_distance * keep_alive_distance)
+            choice.remove_dragon = false;
+    }
+    return choice;
+}
+
+bool dragon_target_requires_migration(Vec3 target_position, Vec3 owner_position) noexcept
+{
+    const float dx = target_position.x - owner_position.x;
+    const float dy = target_position.y - owner_position.y;
+    const float dz = target_position.z - owner_position.z;
+    return dx * dx + dy * dy + dz * dz > 22'500.0F;
+}
+
+std::optional<Vec3> cavern_dragon_approach(const WorldRegion &region, Vec3 player, float yaw)
+{
+    // Admit only a visible, loaded pocket large enough for the whole dragon.
+    // The encounter remains due in a narrow tunnel until the player reaches
+    // an arena. This is deliberately independent of sunlight in Hell.
+    for (const float height : {18.0F, 12.0F, 24.0F})
+        for (const float radius : {60.0F, 40.0F, 80.0F})
+            for (int bearing = 0; bearing < 8; ++bearing)
+            {
+                const float angle = yaw + static_cast<float>(bearing) * pi * 0.25F;
+                const Vec3 point{player.x + std::sin(angle) * radius, player.y + height,
+                                  player.z - std::cos(angle) * radius};
+                bool clear = true;
+                for (int z = -8; z <= 8 && clear; ++z)
+                    for (int x = -8; x <= 8 && clear; ++x)
+                        for (int y = -4; y <= 4; ++y)
+                        {
+                            const int bx = static_cast<int>(std::floor(point.x)) + x;
+                            const int by = static_cast<int>(std::floor(point.y)) + y;
+                            const int bz = static_cast<int>(std::floor(point.z)) + z;
+                            if (!region.contains(bx, by, bz) ||
+                                region.block(bx, by, bz) == BlockType::uninitialized ||
+                                blocks_player(region.block(bx, by, bz)))
+                            {
+                                clear = false;
+                                break;
+                            }
+                        }
+                if (!clear)
+                    continue;
+                Vec3 toward{player.x - point.x, player.y + 1.5F - point.y, player.z - point.z};
+                const float length = std::sqrt(toward.x*toward.x + toward.y*toward.y + toward.z*toward.z);
+                toward = {toward.x / length, toward.y / length, toward.z / length};
+                if (!PlayerSimulation::raycast_blocking(region, point, toward, length))
+                    return point;
+            }
+    return std::nullopt;
+}
+
+void DragonSchedule::recalculate(Vec3 player, EnemyRng &rng) noexcept
+{
+    center_x_ = player.x;
+    center_z_ = player.z;
+    // RecalculateDragonBox: 32/48/64/80/80/80 minutes by NextTimedDragonType,
+    // plus 16 * RandomFloat(-0.25, 0.25).
+    const float minutes =
+        dragon_schedule_minutes(static_cast<DragonKind>(std::clamp(next_type_, 0, 4)));
+    next_spawn_seconds_ = (minutes + 16.0F * (rng.next01() * 0.5F - 0.25F)) * 60.0F;
+}
+
+std::optional<DragonKind> DragonSchedule::check_box(Vec3 player, float delta_seconds,
+                                                    bool dragon_present, EnemyRng &rng) noexcept
+{
+    allowed_delay_ = std::max(0.0F, allowed_delay_ - delta_seconds);
+    next_spawn_seconds_ -= delta_seconds;
+    // DragonBox is +-500 in X and Z (and +-100 in Y, which a player cannot leave).
+    const bool outside = std::abs(player.x - center_x_) > 500.0F ||
+                         std::abs(player.z - center_z_) > 500.0F || std::abs(player.y) > 100.0F;
+    if (initialize_ || outside)
+    {
+        next_type_ = 0;
+        recalculate(player, rng);
+        if (initialize_)
+            allowed_delay_ = 5.0F;
+        initialize_ = false;
+        return std::nullopt;
+    }
+    if (!(next_spawn_seconds_ < 0.0F))
+        return std::nullopt;
+    // `NextSpawnDragonTime += 1 minute`: it asks again every minute.
+    next_spawn_seconds_ += 60.0F;
+    const bool far_out = player.x * player.x + player.z * player.z > 12'960'000.0F;
+    if (!(next_type_ < 5 || far_out))
+        return std::nullopt;
+    const int asked = next_type_;
+    next_type_ = std::min(next_type_ + 1, 5);
+    // AskForDragon.
+    if (allowed_delay_ > 0.0F || dragon_present)
+        return std::nullopt;
+    const int type = far_out ? 4 : asked;
+    if (type >= 5)
+        return std::nullopt;
+    return static_cast<DragonKind>(type);
+}
+
+void DragonSchedule::dragon_installed(DragonKind kind, bool for_biome, Vec3 player,
+                                      EnemyRng &rng) noexcept
+{
+    // SetCurrentTimedDragonType: a timed dragon moves EVERY peer's ladder on.
+    if (!for_biome && kind != DragonKind::count)
+        next_type_ = static_cast<int>(kind) + 1;
+    recalculate(player, rng);
+}
+
+void DragonSchedule::dragon_removed(Vec3 player, EnemyRng &rng) noexcept
+{
+    allowed_delay_ = 8.0F;
+    recalculate(player, rng);
+}
+
 DragonEvents DragonFlight::update(const PlayerState &player, float delta_seconds, EnemyRng &rng,
-                                  bool target_visible)
+                                  bool target_visible, const WorldRegion *terrain)
 {
     DragonEvents events;
     if (!active_)
         return events;
     const DragonStats &stats = dragon_stats(dragon_.kind);
+    // An online owner flies the retail DragonEntity (world/dragon_brain.hpp)
+    // and presents the replica its own waypoints feed. This overload gives
+    // that brain a one-player session: `player` is the only gamer and
+    // `target_visible` is every terrain trace. A dying dragon has no brain
+    // left at all (HandleKillDragonMessage removes it) and falls as the replica.
+    if (network_owner_ && dragon_.state != DragonState::dying)
+    {
+        class OnePlayerSession final : public DragonBrainSession
+        {
+          public:
+            OnePlayerSession(const PlayerState &player, bool visible, EnemyRng &rng,
+                             std::uint8_t gid) noexcept
+                : player_{player}, visible_{visible}, rng_{rng}, gid_{gid}
+            {
+            }
+            std::vector<DragonTargetCandidate> players(Vec3) override
+            {
+                return {{gid_, player_.position, true, true, 1.0F, visible_}};
+            }
+            std::optional<Vec3> living_position(std::uint8_t gid) override
+            {
+                return gid == gid_ ? std::optional{player_.position} : std::nullopt;
+            }
+            bool can_see(Vec3, Vec3) override
+            {
+                return visible_;
+            }
+            bool region_loaded(Vec3) override
+            {
+                return true;
+            }
+            std::uint8_t local_gid() override
+            {
+                return gid_;
+            }
+            bool local_valid() override
+            {
+                return true;
+            }
+            Vec3 local_position() override
+            {
+                return player_.position;
+            }
+            float random_float() override
+            {
+                return rng_.next01();
+            }
+            int random_int(int minimum, int maximum_exclusive) override
+            {
+                return rng_.next_int(minimum, maximum_exclusive);
+            }
+
+          private:
+            const PlayerState &player_;
+            bool visible_;
+            EnemyRng &rng_;
+            std::uint8_t gid_;
+        };
+        OnePlayerSession session{player, target_visible, rng, owner_gid_};
+        return update_owner(session, delta_seconds);
+    }
     Dragon &dragon = dragon_;
     dragon.state_time += delta_seconds;
     dragon.clip_time += delta_seconds;
@@ -1354,15 +1948,24 @@ DragonEvents DragonFlight::update(const PlayerState &player, float delta_seconds
                 ? 0.0F
                 : std::copysign(std::min(altitude_error * altitude_error / 30.0F, max_pitch),
                                 altitude_error);
-        dragon.yaw = wrap_angle(dragon.yaw + std::clamp(yaw_error, -yaw_rate * delta_seconds,
-                                                        yaw_rate * delta_seconds));
-        dragon.roll += std::clamp(desired_roll - dragon.roll, -roll_rate * delta_seconds,
-                                  roll_rate * delta_seconds);
-        dragon.pitch += std::clamp(desired_pitch - dragon.pitch, -pitch_rate * delta_seconds,
-                                   pitch_rate * delta_seconds);
-        dragon.velocity +=
-            std::clamp(target_speed - dragon.velocity, -max_acceleration * delta_seconds,
-                       max_acceleration * delta_seconds);
+        brain_target_yaw_ = desired_yaw;
+        brain_target_roll_ = desired_roll;
+        brain_target_pitch_ = desired_pitch;
+        brain_target_velocity_ = target_speed;
+        // MathTools.MoveTowardTargetAngle / MoveTowardTarget: each channel
+        // closes at min(|error|, rate) per second, not at a constant rate.
+        if (desired_yaw != dragon.yaw)
+        {
+            const float yaw_step = std::clamp(yaw_error, -yaw_rate, yaw_rate);
+            const float moved = wrap_angle(dragon.yaw + yaw_step * delta_seconds);
+            dragon.yaw = std::abs(moved - desired_yaw) < 0.01F ? desired_yaw : moved;
+        }
+        dragon.velocity = dragon_move_toward_target(dragon.velocity, target_speed,
+                                                    max_acceleration, delta_seconds);
+        dragon.roll =
+            dragon_move_toward_target(dragon.roll, desired_roll, roll_rate, delta_seconds);
+        dragon.pitch =
+            dragon_move_toward_target(dragon.pitch, desired_pitch, pitch_rate, delta_seconds);
         const DragonBasis basis = dragon_attitude_basis(dragon.yaw, dragon.pitch, dragon.roll);
         dragon.position.x += basis.forward.x * dragon.velocity * delta_seconds;
         dragon.position.y += basis.forward.y * dragon.velocity * delta_seconds;
@@ -1402,22 +2005,19 @@ DragonEvents DragonFlight::update(const PlayerState &player, float delta_seconds
         }
     };
     const auto launch_fireball = [&]() {
-        // ShootFireball: from the head, straight at the target's feet at
-        // FireballVelocity — no gravity, no lead.
+        // ShootFireball: from the ponytail bone, straight at the target's
+        // feet at FireballVelocity — no gravity, no lead.
         const DragonBasis basis = dragon_attitude_basis(dragon.yaw, dragon.pitch, dragon.roll);
-        Vec3 origin = dragon.position;
-        origin.x += basis.forward.x * 4.0F;
-        origin.z += basis.forward.z * 4.0F;
-        origin.y -= 1.0F;
-        Vec3 flight{player.position.x - origin.x, player.position.y - origin.y,
-                    player.position.z - origin.z};
-        const float length = std::max(
-            0.001F, std::sqrt(flight.x * flight.x + flight.y * flight.y + flight.z * flight.z));
-        flight.x = flight.x / length * stats.fireball_velocity;
-        flight.y = flight.y / length * stats.fireball_velocity;
-        flight.z = flight.z / length * stats.fireball_velocity;
+        const Vec3 muzzle = dragon_muzzle_offset(dragon_animation_index(dragon.clip));
+        const Vec3 origin{dragon.position.x + basis.right.x * muzzle.x + basis.up.x * muzzle.y -
+                              basis.forward.x * muzzle.z,
+                          dragon.position.y + basis.right.y * muzzle.x + basis.up.y * muzzle.y -
+                              basis.forward.y * muzzle.z,
+                          dragon.position.z + basis.right.z * muzzle.x + basis.up.z * muzzle.y -
+                              basis.forward.z * muzzle.z};
         events.fireball_origins.push_back(origin);
-        events.fireball_velocities.push_back(flight);
+        events.fireball_velocities.push_back(
+            dragon_fireball_velocity(dragon.kind, origin, player.position));
     };
     switch (dragon.state)
     {
@@ -1519,18 +2119,69 @@ DragonEvents DragonFlight::update(const PlayerState &player, float delta_seconds
             events.left = true;
         }
         break;
-    case DragonState::dying:
-        // Death: roll and pitch collapse, the body drops under gravity while
-        // the death clip plays (DragonClientEntity.UpdateWhileDead).
-        dragon.roll *= std::max(0.0F, 1.0F - 3.0F * delta_seconds);
-        dragon.pitch *= std::max(0.0F, 1.0F - 3.0F * delta_seconds);
-        dragon.position.y -= 14.0F * delta_seconds;
-        if (dragon.position.y < world_min_y || dragon.state_time > 6.0F)
+    case DragonState::dying: {
+        // DragonClientEntity.UpdateWhileDead. The corpse is a projectile: it
+        // keeps the velocity it died with under 10 m/s^2 until death_air_1
+        // reaches its pause frame, then falls with collision, skids to a stop
+        // on the ground, and is removed five seconds after the clip has played
+        // out. Loot appears there, not under the point where it was killed.
+        constexpr float pause_time = 1.3666667F; // DeathAnimationPackages[0].PauseTime
+        // death_air_1 in the owned content: 2.9667 s in 1.6.3.8, 3 s in 1.9.9.8.
+        const float clip_length = modern_content_ ? 3.0F : 2.9666667F;
+        if (death_phase_ < 2U)
         {
+            death_velocity_.y -= 10.0F * delta_seconds;
+            // Collision starts on the first death frame. In a low cavern the
+            // 1.37-second reaction animation can reach the floor before its
+            // pause marker; the old free-flight branch then embedded the body,
+            // and SkipEmbedded allowed the corpse to fall through the floor.
+            {
+                if (move_dead_dragon(terrain, delta_seconds))
+                {
+                    if (death_phase_ == 0U)
+                        death_phase_ = 1U;
+                    death_clip_playing_ = true; // "DragonFall", and the clip resumes
+                    death_velocity_.x *= 0.7F;
+                    death_velocity_.z *= 0.7F;
+                    if (death_velocity_.x * death_velocity_.x +
+                            death_velocity_.y * death_velocity_.y +
+                            death_velocity_.z * death_velocity_.z <
+                        0.5F)
+                    {
+                        death_phase_ = 2U;
+                        death_timer_ = 5.0F; // TimeToWaitAfterStop
+                    }
+                }
+            }
+        }
+        // `ClipCurrentTime >= PauseTime` is read BEFORE the model advances its
+        // clip, and AnimationPlayer advances by TimeSpan.FromSeconds(dt), which
+        // rounds to the millisecond: 17 ms a frame at 60 Hz. That is the
+        // original's 82 ballistic frames.
+        if (death_phase_ == 0U)
+        {
+            if (death_clip_time_ >= pause_time)
+            {
+                death_phase_ = 1U;
+                death_clip_playing_ = false;
+            }
+        }
+        else if (death_phase_ == 2U && clip_length - death_clip_time_ < 0.5F)
+            death_timer_ -= delta_seconds;
+        if (death_clip_playing_)
+            death_clip_time_ = std::min(
+                clip_length,
+                death_clip_time_ + std::floor(delta_seconds * 1000.0F + 0.5F) / 1000.0F);
+        if (death_phase_ == 2U && death_timer_ < 0.0F)
+        {
+            events.loot_position = {dragon.position.x + std::sin(dragon.yaw) * 7.0F,
+                                    dragon.position.y,
+                                    dragon.position.z + std::cos(dragon.yaw) * 7.0F};
             active_ = false;
             events.died = true;
         }
         break;
+    }
     case DragonState::despawn:
     default:
         active_ = false;
@@ -1538,152 +2189,6 @@ DragonEvents DragonFlight::update(const PlayerState &player, float delta_seconds
     }
     return events;
 }
-
-float EnemyHorde::clip_duration(const Enemy &enemy, std::string_view clip) const
-{
-    if (clip_durations_)
-    {
-        const float duration = clip_durations_(enemy_stats(enemy.type).model, clip);
-        if (duration > 0.0F)
-            return duration;
-    }
-    // Fallbacks keep the state machine sane before the exported clips are wired:
-    // attacks derive from their last authored hit moment.
-    const EnemyAttackSet &attacks = enemy_attacks(enemy_stats(enemy.type).enemy_class);
-    for (int index = 0; index < attacks.attack_count; ++index)
-    {
-        const EnemyAttack &attack = attacks.attacks[index];
-        if (attack.clip == clip)
-            return attack.hit_times[static_cast<std::size_t>(attack.hit_count - 1)] + 0.55F;
-    }
-    if (clip == "atack_archer1")
-        return 1.8F;
-    return 1.4F;
-}
-
-namespace
-{
-
-// Authored clip names per model family, from the exported skeleton manifests.
-template <typename Random>
-[[nodiscard]] std::string_view emerge_clip(EnemyClass enemy_class, Random &rng) noexcept
-{
-    switch (enemy_class)
-    {
-    case EnemyClass::zombie: {
-        // ZombieEmerge.GetClipName: "arise_" + (Rnd.Next(4) + 1).
-        constexpr std::array<std::string_view, 4> arises{"arise_1", "arise_2", "arise_3",
-                                                         "arise_4"};
-        return arises[static_cast<std::size_t>(rng.next_int(0, 4))];
-    }
-    case EnemyClass::archer:
-        // ArcherSkeletonEmerge chooses between both authored stand-up clips.
-        return rng.next_int(0, 2) == 0 ? "standup" : "standup2";
-    case EnemyClass::alien:
-        return "Jump";
-    case EnemyClass::felguard:
-        return "Idle";
-    default:
-        return "walk";
-    }
-}
-
-template <typename Random>
-[[nodiscard]] std::string_view hit_clip(EnemyClass enemy_class, Random &rng) noexcept
-{
-    switch (enemy_class)
-    {
-    case EnemyClass::zombie: {
-        // ZombieHit deliberately uses only reactions 1 and 3.
-        return rng.next_int(0, 2) == 0 ? "hit_reaction1" : "hit_reaction3";
-    }
-    case EnemyClass::alien:
-        return rng.next_int(0, 2) == 0 ? "Damage1" : "Damage2";
-    case EnemyClass::felguard:
-        return "Idle";
-    default: {
-        constexpr std::array<std::string_view, 3> hits{"gethit1", "gethit2", "gethit3"};
-        return hits[static_cast<std::size_t>(rng.next_int(0, 3))];
-    }
-    }
-}
-
-template <typename Random>
-[[nodiscard]] std::string_view death_clip(EnemyClass enemy_class, Random &rng) noexcept
-{
-    switch (enemy_class)
-    {
-    case EnemyClass::zombie: {
-        constexpr std::array<std::string_view, 3> deaths{"death1", "death2", "death3"};
-        return deaths[static_cast<std::size_t>(rng.next_int(0, 3))];
-    }
-    case EnemyClass::alien:
-        return "Death";
-    case EnemyClass::felguard:
-        return rng.next_int(0, 2) == 0 ? "death1" : "death2";
-    default: {
-        // SkeletonDie.GetAnimName covers all seven clips in every skeleton rig.
-        constexpr std::array<std::string_view, 7> deaths{"death1", "death2", "death3", "death4",
-                                                         "death5", "death6", "death7"};
-        return deaths[static_cast<std::size_t>(rng.next_int(0, 7))];
-    }
-    }
-}
-
-// ZombieChase.StartMoveAnimation: locomotion clip picked by CurrentSpeed
-// thresholds, playback rate = min(speed / reference, 1) — except the archer,
-// whose walk rate is genuinely uncapped speed-scaled.
-[[nodiscard]] std::string_view walk_clip(EnemyClass enemy_class, float speed, bool has_run_fast,
-                                         float &clip_speed) noexcept
-{
-    clip_speed = 1.0F;
-    switch (enemy_class)
-    {
-    case EnemyClass::alien:
-        return "MoveLoop";
-    case EnemyClass::archer:
-        clip_speed = std::max(speed, 0.5F);
-        return "walk_archer1";
-    case EnemyClass::felguard:
-        clip_speed = std::min(speed / (speed < 2.7F ? 1.0F : 3.0F), 1.0F);
-        return speed < 2.7F ? "walk" : "run";
-    default:
-        if (speed < 2.7F)
-        {
-            clip_speed = std::min(speed, 1.0F);
-            return "walk";
-        }
-        if (speed < 3.7F)
-        {
-            clip_speed = std::min(speed, 1.0F);
-            return "walk2";
-        }
-        if (speed < 5.0F || !has_run_fast)
-        {
-            clip_speed = std::min(speed / 3.0F, 1.0F);
-            return "run";
-        }
-        clip_speed = std::min(speed / 4.0F, 1.0F);
-        return "run_fast";
-    }
-}
-
-[[nodiscard]] std::string_view give_up_clip(EnemyClass enemy_class) noexcept
-{
-    switch (enemy_class)
-    {
-    case EnemyClass::zombie:
-        return "eat_start";
-    case EnemyClass::alien:
-        return "Jump";
-    case EnemyClass::felguard:
-        return "Idle";
-    default:
-        return "enraged";
-    }
-}
-
-} // namespace
 
 EnemyInstanceRng::EnemyInstanceRng() noexcept
 {
@@ -1782,6 +2287,19 @@ bool EnemyHorde::spawn(int type, Vec3 position, float midnight, std::uint32_t id
         initialization.normal_activation_time = 0.0F;
         initialization.emerge_speed = stats.spawn_animation_speed;
     }
+    // The original never builds an enemy from these floats: it sends them as
+    // millisecond integers (InitPackage.Write truncates `1000f * value`) and
+    // creates the enemy, its own copy included, from the echoed message
+    // (InitPackage.Read, `(float)n / 1000f`). Every peer must start from the
+    // same quantized speeds or the local copy outruns the others.
+    const auto wire = [](float value) noexcept {
+        return static_cast<float>(static_cast<std::int32_t>(1000.0F * value)) / 1000.0F;
+    };
+    initialization.slow_speed = wire(initialization.slow_speed);
+    initialization.fast_speed = wire(initialization.fast_speed);
+    initialization.emerge_speed = wire(initialization.emerge_speed);
+    initialization.run_activation_time = wire(initialization.run_activation_time);
+    initialization.normal_activation_time = wire(initialization.normal_activation_time);
     const std::int32_t random_seed = static_cast<std::int32_t>(rng_.next() & 0x7FFF'FFFFULL);
     return spawn_networked(type, position, initialization, id, random_seed, target_gid);
 }
@@ -1807,32 +2325,29 @@ bool EnemyHorde::spawn_networked(int type, Vec3 position, EnemyInitialization in
     enemy.run_activation_time = initialization.run_activation_time;
     enemy.normal_activation_time = initialization.normal_activation_time;
     enemy.emerge_speed = initialization.emerge_speed;
-    const bool skeleton_starts_chasing = stats.enemy_class == EnemyClass::skeleton ||
-                                         stats.enemy_class == EnemyClass::skeleton_sword ||
-                                         stats.enemy_class == EnemyClass::skeleton_axes;
-    if (skeleton_starts_chasing)
-    {
-        // SkeletonEnemyType.GetEmergeState returns Chase directly. These models
-        // have no stand-up clips, so do not expose one bind-pose frame first.
-        enemy.state = EnemyState::chase;
-        float clip_rate = 1.0F;
-        enemy.clip = walk_clip(stats.enemy_class, enemy.slow_speed, stats.has_run_fast, clip_rate);
-        enemy.clip_loops = true;
-        enemy.clip_speed = clip_rate;
-    }
-    else
-    {
-        enemy.state = EnemyState::emerge;
-        if (stats.enemy_class == EnemyClass::archer)
-            enemy.swing_count = 5 + enemy.instance_rng.next_int(0, 5);
-        enemy.clip = emerge_clip(stats.enemy_class, enemy.instance_rng);
-        enemy.clip_loops = false;
-        enemy.clip_speed = enemy.emerge_speed;
-        // ZombieEmerge.Enter: a random facing while clawing out of the ground.
-        enemy.yaw = enemy.instance_rng.next01() * 6.2831855F;
-    }
+    // BaseZombie..ctor ends with ChangeState(EType.GetEmergeState(this)).
+    enemy_simulation::spawn(enemy, &clip_durations_);
     enemies_.push_back(enemy);
     return true;
+}
+
+bool EnemyHorde::accept_remote_spawn() noexcept
+{
+    if (enemies_.size() < 45U)
+        return true;
+    if (enemies_.size() >= 50U)
+        return false;
+    ++remote_spawn_counter_;
+    return (remote_spawn_counter_ & 3) == 1;
+}
+
+std::size_t EnemyHorde::count_for_target(std::uint8_t target_gid) const noexcept
+{
+    std::size_t total{};
+    for (const Enemy &enemy : enemies_)
+        if (enemy.target_gid == target_gid && enemy.state != EnemyState::despawn)
+            ++total;
+    return total;
 }
 
 std::optional<std::size_t> EnemyHorde::find_enemy(EnemyIdentity identity) const noexcept
@@ -1850,11 +2365,12 @@ bool EnemyHorde::speed_up_enemy(EnemyIdentity identity)
     if (!found.has_value())
         return false;
     Enemy &enemy = enemies_[*found];
-    if (enemy.state == EnemyState::die || enemy.state == EnemyState::despawn)
+    // HandleSpeedUpEnemyMessage: `!IsMovingFast && !IsDead`. A repeat (the
+    // original sends one per frame until the enraged state arrives, and an
+    // impaired link duplicates them) must not restart the walk clip.
+    if (enemy.running || enemy.state == EnemyState::die || enemy.state == EnemyState::despawn)
         return false;
-    enemy.running = true;
-    if (enemy.state == EnemyState::chase)
-        begin_state(enemy, EnemyState::chase, {});
+    enemy_simulation::speed_up(enemy, &clip_durations_);
     return true;
 }
 
@@ -1864,9 +2380,12 @@ bool EnemyHorde::give_up_enemy(EnemyIdentity identity)
     if (!found.has_value())
         return false;
     Enemy &enemy = enemies_[*found];
-    if (enemy.state == EnemyState::die || enemy.state == EnemyState::despawn)
+    // BaseZombie.GiveUp is idempotent (`_currentState != GetGiveUpState`) and
+    // HandleEnemyGiveUpMessage skips dead enemies entirely.
+    if (enemy.state == EnemyState::give_up || enemy.state == EnemyState::die ||
+        enemy.state == EnemyState::despawn)
         return false;
-    begin_state(enemy, EnemyState::give_up, {});
+    enemy_simulation::give_up(enemy, &clip_durations_);
     return true;
 }
 
@@ -1876,21 +2395,16 @@ bool EnemyHorde::kill_enemy(EnemyIdentity identity, bool create_loot)
     if (!found.has_value())
         return false;
     Enemy &enemy = enemies_[*found];
-    if (enemy.state == EnemyState::despawn)
+    // EnemyManager.HandleKillEnemyMessage searches its list with `!IsDead`, so a
+    // kill naming an enemy that is already dying matches nothing and the whole
+    // handler — pickup roll, statistics and Kill() — is skipped. Re-arming the
+    // roll here let a duplicated or reordered KillEnemyMessage drop a second
+    // loot stack for the same corpse.
+    if (enemy.state == EnemyState::die || enemy.state == EnemyState::despawn)
         return false;
-    if (enemy.state != EnemyState::die)
-    {
-        enemy.health = 0.0F;
-        enemy.state = EnemyState::die;
-        enemy.state_time = 0.0F;
-        enemy.clip = death_clip(enemy_stats(enemy.type).enemy_class, enemy.instance_rng);
-        enemy.clip_loops = false;
-        enemy.clip_speed = enemy_stats(enemy.type).die_animation_speed;
-        enemy.clip_time = 0.0F;
-        enemy.velocity.x = 0.0F;
-        enemy.velocity.z = 0.0F;
-    }
-    enemy.loot_pending = enemy.loot_pending || create_loot;
+    enemy.health = 0.0F;
+    enemy_simulation::kill(enemy, &clip_durations_);
+    enemy.loot_pending = create_loot;
     return true;
 }
 
@@ -2009,26 +2523,14 @@ void EnemyHorde::damage_enemy(std::size_t index, float damage, DamageFlags flags
     enemy.health -= damage * enemy_damage_multiplier(enemy.type, flags, headshot);
     if (enemy.health <= 0.0F)
     {
-        enemy.state = EnemyState::die;
-        enemy.state_time = 0.0F;
-        enemy.clip = death_clip(enemy_stats(enemy.type).enemy_class, enemy.instance_rng);
-        enemy.clip_loops = false;
-        enemy.clip_speed = enemy_stats(enemy.type).die_animation_speed;
-        enemy.clip_time = 0.0F;
+        enemy_simulation::kill(enemy, &clip_durations_);
         enemy.loot_pending = create_loot;
-        enemy.velocity.x = 0.0F;
-        enemy.velocity.z = 0.0F;
     }
-    else if (enemy.state != EnemyState::hit)
+    else
     {
-        enemy.state = EnemyState::hit;
-        enemy.state_time = 0.0F;
-        enemy.clip = hit_clip(enemy_stats(enemy.type).enemy_class, enemy.instance_rng);
-        enemy.clip_loops = false;
-        enemy.clip_speed = enemy_stats(enemy.type).hit_animation_speed;
-        enemy.clip_time = 0.0F;
-        enemy.velocity.x = 0.0F;
-        enemy.velocity.z = 0.0F;
+        // BaseZombie.TakeDamage: every state but the hit reaction itself is
+        // interrupted by one, the give-up walk-off included.
+        enemy_simulation::react_to_hit(enemy, &clip_durations_);
     }
 }
 
@@ -2055,75 +2557,33 @@ std::vector<std::size_t> EnemyHorde::apply_explosive_damage(Vec3 location, float
     return killed;
 }
 
-void EnemyHorde::begin_state(Enemy &enemy, EnemyState state, const PlayerState &player)
+float EnemyHorde::attenuate_velocity(std::uint8_t target_gid, Vec3 forward,
+                                     Vec3 player_position) const noexcept
 {
-    const EnemyStats &stats = enemy_stats(enemy.type);
-    enemy.state = state;
-    enemy.state_time = 0.0F;
-    enemy.clip_time = 0.0F;
-    switch (state)
+    float scale = 1.0F;
+    for (const Enemy &enemy : enemies_)
     {
-    case EnemyState::chase: {
-        const float move_speed =
-            enemy.running && enemy.fast_speed > 0.0F ? enemy.fast_speed : enemy.slow_speed;
-        float clip_rate = 1.0F;
-        enemy.clip = walk_clip(stats.enemy_class, move_speed, stats.has_run_fast, clip_rate);
-        enemy.clip_loops = true;
-        enemy.clip_speed = clip_rate;
-        break;
-    }
-    case EnemyState::attack: {
-        if (stats.enemy_class == EnemyClass::archer)
+        if (enemy.target_gid != target_gid || !enemy.blocking ||
+            enemy.state == EnemyState::despawn)
+            continue;
+        const Vec3 offset = subtract(enemy.position, player_position);
+        const float squared = offset.x * offset.x + offset.y * offset.y + offset.z * offset.z;
+        float factor = 1.0F;
+        if (squared < 4.0F && std::abs(offset.y) < 1.5F)
         {
-            enemy.attack_index = -1;
-            enemy.clip = "atack_archer1";
-            // ArcherSkeletonTryAttack.Enter consumes the 5..9-shot budget
-            // rolled by ArcherSkeletonEmerge; it never rerolls it per shot.
-            --enemy.swing_count;
+            factor = 0.5F;
+            if (squared > 0.0001F)
+            {
+                const float inverse = 1.0F / std::sqrt(squared);
+                const float toward = (offset.x * forward.x + offset.y * forward.y +
+                                      offset.z * forward.z) * inverse;
+                if (toward > 0.0F)
+                    factor *= std::min(1.0F, 2.0F * (1.0F - toward));
+            }
         }
-        else
-        {
-            const EnemyAttackSet &attacks = enemy_attacks(stats.enemy_class);
-            enemy.attack_index = enemy.instance_rng.next_int(0, attacks.attack_count);
-            enemy.clip = attacks.attacks[enemy.attack_index].clip;
-            enemy.swing_count = 2 + enemy.instance_rng.next_int(0, 3);
-            enemy.miss_count = enemy.instance_rng.next_int(3, 5);
-        }
-        enemy.clip_loops = false;
-        enemy.clip_speed = stats.attack_animation_speed;
-        enemy.hit_count = 0;
-        enemy.velocity.x = 0.0F;
-        enemy.velocity.z = 0.0F;
-        break;
+        scale *= factor;
     }
-    case EnemyState::idle:
-        // The installed SkeletonArcher content names this clip with a hyphen,
-        // despite the source literal using an underscore.
-        enemy.clip = "idle-archer1";
-        enemy.clip_loops = true;
-        enemy.clip_speed = 1.0F;
-        enemy.state_duration = 1.0F + enemy.instance_rng.next01() * 2.0F;
-        enemy.velocity.x = 0.0F;
-        enemy.velocity.z = 0.0F;
-        break;
-    case EnemyState::give_up:
-        enemy.clip = give_up_clip(stats.enemy_class);
-        enemy.clip_loops = false;
-        enemy.clip_speed = 1.0F;
-        enemy.velocity.x = 0.0F;
-        enemy.velocity.z = 0.0F;
-        break;
-    case EnemyState::dig:
-        enemy.clip = "attack1";
-        enemy.clip_loops = true;
-        enemy.clip_speed = stats.attack_animation_speed;
-        enemy.dig_progress = 0.0F;
-        enemy.dig_valid = false;
-        break;
-    default:
-        break;
-    }
-    (void)player;
+    return scale;
 }
 
 EnemyEvents EnemyHorde::update(const WorldRegion &region, const PlayerState &player,
@@ -2132,380 +2592,118 @@ EnemyEvents EnemyHorde::update(const WorldRegion &region, const PlayerState &pla
     return update(region, player, 0U, {}, delta_seconds);
 }
 
+namespace
+{
+// Whether this client holds terrain for the column an entity stands in. Only
+// X and Z matter, as in BlockTerrain.RegionIsLoaded: height never unloads.
+bool region_holds_column(const WorldRegion &region, Vec3 position) noexcept
+{
+    const int x = static_cast<int>(std::floor(position.x));
+    const int z = static_cast<int>(std::floor(position.z));
+    return x >= region.minimum_x() && x <= region.maximum_x() && z >= region.minimum_z() &&
+           z <= region.maximum_z();
+}
+} // namespace
+
 EnemyEvents EnemyHorde::update(const WorldRegion &region, const PlayerState &local_player,
                                std::uint8_t local_gid, const TargetLookup &target_lookup,
                                float delta_seconds)
 {
     EnemyEvents events;
+    // BlockTerrain scrolls with the LOCAL player, whoever an enemy is chasing.
+    if (!terrain_window_external_)
+        terrain_window_.follow(local_player.position.x, local_player.position.z);
+    // A destination outside the window is not a scroll but BlockTerrain.Teleport:
+    // every chunk is discarded and rebuilt around the new centre, and until a
+    // chunk has geometry again RegionIsLoaded answers false for it. Every
+    // BaseZombie therefore removes itself on its next update, wherever it
+    // stands -- including the ones near where the player arrives.
+    const bool terrain_reset = terrain_resets_seen_.has_value() &&
+                               *terrain_resets_seen_ != terrain_window_.resets();
+    terrain_resets_seen_ = terrain_window_.resets();
+    if (terrain_reset)
+    {
+        enemies_.clear();
+        return events;
+    }
     for (auto &enemy : enemies_)
     {
-        std::optional<PlayerState> remote_target;
-        if (enemy.target_gid != local_gid)
-        {
-            if (!target_lookup)
-                continue;
-            remote_target = target_lookup(enemy.target_gid);
-            if (!remote_target.has_value())
-                continue;
-        }
-        const PlayerState &player = remote_target.has_value() ? *remote_target : local_player;
-        const bool local_target = enemy.target_gid == local_gid;
-        const EnemyState initial_state = enemy.state;
-        const EnemyStats &stats = enemy_stats(enemy.type);
-        enemy.state_time += delta_seconds;
-        enemy.lifetime += delta_seconds;
-        enemy.clip_time += delta_seconds * enemy.clip_speed;
-        const Vec3 to_player = subtract(player.position, enemy.position);
-        const float flat_distance = horizontal_length(to_player);
-        if (flat_distance > despawn_distance && enemy.state != EnemyState::die)
+        // BaseZombie.OnUpdate's first statement, in both shipped generations:
+        //     if (!BlockTerrain.Instance.RegionIsLoaded(LocalPosition)) { Remove(); return; }
+        // The enemy is dropped silently, on this peer only, in whatever state
+        // it is in, when it is outside the terrain THIS peer has loaded. The
+        // original has no distance-to-target rule: the flat 100-block radius
+        // that stood here removed enemies a stock peer was still fighting.
+        // "Loaded" is the original's 24-chunk window around the local player
+        // and, because this client streams a smaller window than that, also
+        // the region it actually holds: an enemy past either edge has no
+        // ground to stand on here.
+        if (!terrain_window_.contains(enemy.position.x, enemy.position.z) ||
+            !region_holds_column(region, enemy.position))
         {
             enemy.state = EnemyState::despawn;
             continue;
         }
-        switch (enemy.state)
+        std::optional<PlayerState> remote_target;
+        // A target this peer cannot resolve any more: the player left the
+        // session, or its updates stopped. BaseZombie.OnUpdate treats that as
+        // `!Target.ValidGamer` and gives up on EVERY peer, owner or not.
+        // Orphaned enemies are therefore released rather than frozen in place,
+        // and the synthetic stand-in keeps every distance rule inert while the
+        // give-up clip plays out.
+        PlayerState orphan;
+        bool target_resolved = true;
+        if (enemy.target_gid != local_gid)
         {
-        case EnemyState::emerge: {
-            // BaseZombie.IsNearAnimationEnd is based on the scaled clip clock,
-            // not wall time: transition with 0.25 authored seconds remaining.
-            const float duration = clip_duration(enemy, enemy.clip);
-            if (enemy.clip_time >= std::max(0.0F, duration - 0.25F))
-                begin_state(enemy, EnemyState::chase, player);
-            break;
+            remote_target = target_lookup ? target_lookup(enemy.target_gid)
+                                          : std::optional<PlayerState>{};
+            if (!remote_target.has_value())
+            {
+                target_resolved = false;
+                orphan.position = enemy.position;
+                orphan.health = 0.0F;
+            }
         }
-        case EnemyState::chase: {
-            // Only the targeted player's local simulation originates the
-            // source SpeedUpEnemy message; every peer applies that message.
-            if (stats.has_run_fast && !enemy.running && local_target)
+        const PlayerState &player = !target_resolved ? orphan
+                                    : remote_target.has_value() ? *remote_target
+                                                                : local_player;
+        const bool local_target = enemy.target_gid == local_gid;
+        // Scene.OnUpdate runs every entity's physics before any state machine:
+        // gravity, then BaseZombie.ResolveCollsion with the velocity the state
+        // chose on the previous frame.
+        enemy_simulation::advance_physics(region, enemy, delta_seconds);
+        enemy.state_time += delta_seconds;
+        enemy.lifetime += delta_seconds;
+        // EnemyManager handles the kill message (and therefore the killer's
+        // loot roll) at once, before the corpse has played a frame.
+        if (enemy.state == EnemyState::die && enemy.loot_pending)
+        {
+            enemy.loot_pending = false;
+            const float origin_distance = std::sqrt(enemy.position.x * enemy.position.x +
+                                                    enemy.position.z * enemy.position.z);
+            const EnemyLoot loot = enemy_loot(enemy.type, origin_distance, enemy.position.y, rng_);
+            if (loot.item_count > 0U)
             {
-                enemy.normal_activation_time -= delta_seconds;
-                const float target_speed_squared =
-                    player.velocity.x * player.velocity.x + player.velocity.z * player.velocity.z;
-                if (target_speed_squared > 3.5F)
-                    enemy.run_activation_time -= delta_seconds;
-                if (enemy.normal_activation_time <= 0.0F || enemy.run_activation_time <= 0.0F)
-                    events.speed_up_requests.push_back({enemy.target_gid, enemy.id});
+                events.drops.push_back(loot);
+                events.drop_positions.push_back(
+                    {enemy.position.x, enemy.position.y + 1.0F, enemy.position.z});
             }
-            const float speed =
-                enemy.running && enemy.fast_speed > 0.0F ? enemy.fast_speed : enemy.slow_speed;
-            if (flat_distance > 0.05F)
-            {
-                enemy.velocity.x = to_player.x / flat_distance * speed;
-                enemy.velocity.z = to_player.z / flat_distance * speed;
-                enemy.yaw = std::atan2(enemy.velocity.x, -enemy.velocity.z);
-            }
-            // ZombieChase: OnGround && TouchingWall -> jump at the FULL original
-            // impulse (10 walking, FastJumpSpeed 13-16 enraged, gravity -20).
-            if (enemy.on_ground && std::abs(enemy.velocity.x) + std::abs(enemy.velocity.z) > 0.1F)
-            {
-                Vec3 probe = enemy.position;
-                probe.x += enemy.velocity.x * 0.15F;
-                probe.z += enemy.velocity.z * 0.15F;
-                if (box_intersects_solid(region, probe))
-                {
-                    probe.y += 1.05F;
-                    if (!box_intersects_solid(region, probe))
-                        enemy.velocity.y = enemy.running ? stats.fast_jump_speed : 10.0F;
-                    else if (stats.enemy_class == EnemyClass::zombie && enemy.on_ground)
-                    {
-                        begin_state(enemy, EnemyState::dig, player);
-                        break;
-                    }
-                }
-            }
-            // ZombieChase: closing in on a player standing on a tower (or in a
-            // pit) flips zombies into the dig state to chew through the base.
-            if (stats.enemy_class == EnemyClass::zombie && enemy.on_ground &&
-                flat_distance < 5.0F && std::abs(to_player.y) > 4.0F)
-            {
-                begin_state(enemy, EnemyState::dig, player);
-                break;
-            }
-            // Archers stop and shoot from range instead of closing in.
-            if (stats.enemy_class == EnemyClass::archer && flat_distance < 30.0F &&
-                flat_distance > 4.0F)
-            {
-                begin_state(enemy, EnemyState::attack, player);
-                ++events.attacks_started;
-                break;
-            }
-            if (flat_distance <= attack_enter_distance && std::abs(to_player.y) < 1.5F)
-            {
-                begin_state(enemy, EnemyState::attack, player);
-                ++events.attacks_started;
-            }
-            else if (flat_distance > give_up_distance && enemy.lifetime > 45.0F)
-            {
-                begin_state(enemy, EnemyState::give_up, player);
-            }
-            break;
         }
-        case EnemyState::attack: {
-            enemy.velocity.x = 0.0F;
-            enemy.velocity.z = 0.0F;
-            // BaseTryAttack: melee yaw is LOCKED for the whole swing and only
-            // snaps to the target near the clip's end; archers track the
-            // target continuously while drawing.
-            const bool near_swing_end = enemy.clip_time >= clip_duration(enemy, enemy.clip) - 0.25F;
-            if (flat_distance > 0.1F &&
-                ((stats.enemy_class == EnemyClass::archer && !near_swing_end) ||
-                 (stats.enemy_class != EnemyClass::archer && near_swing_end)))
-                enemy.yaw = std::atan2(to_player.x, -to_player.z);
-            if (stats.enemy_class == EnemyClass::archer)
-            {
-                // ArcherSkeletonTryAttack: loose the arrow 1.1 seconds into the draw.
-                if (!near_swing_end && enemy.hit_count == 0 && enemy.clip_time >= 1.1F)
-                {
-                    enemy.hit_count = 1;
-                    Vec3 arrow_origin = enemy.position;
-                    arrow_origin.y += 1.5F;
-                    Vec3 target = player.position;
-                    target.y += 0.5F;
-                    Vec3 flight{};
-                    if (const auto ballistic =
-                            initial_ballistic_vector(arrow_origin, target, 25.0F, -10.0F);
-                        ballistic.has_value())
-                    {
-                        flight = *ballistic;
-                    }
-                    else
-                    {
-                        // ArcherSkeletonTryAttack's exact unreachable-target fallback
-                        // uses the unadjusted entity origins, then normalizes to 25.
-                        flight = subtract(player.position, enemy.position);
-                        const float length = std::sqrt(flight.x * flight.x + flight.y * flight.y +
-                                                       flight.z * flight.z);
-                        if (length < 0.001F)
-                            flight = {0.0F, 25.0F, 0.0F};
-                        else
-                        {
-                            flight.x = flight.x / length * 25.0F;
-                            flight.y = flight.y / length * 25.0F;
-                            flight.z = flight.z / length * 25.0F;
-                        }
-                    }
-                    events.arrow_origins.push_back(arrow_origin);
-                    events.arrow_velocities.push_back(flight);
-                    events.arrow_target_gids.push_back(enemy.target_gid);
-                    ++events.arrows_fired;
-                }
-                if (near_swing_end)
-                    begin_state(enemy,
-                                enemy.swing_count <= 0 ? EnemyState::give_up : EnemyState::idle,
-                                player);
-                break;
-            }
-            const EnemyAttackSet &attacks = enemy_attacks(stats.enemy_class);
-            const EnemyAttack &attack =
-                attacks.attacks[std::clamp(enemy.attack_index, 0, attacks.attack_count - 1)];
-            // BaseTryAttack timed hits: each authored hit moment tests height, range
-            // and facing before applying player damage.
-            while (enemy.hit_count < attack.hit_count &&
-                   enemy.clip_time >= attack.hit_times[static_cast<std::size_t>(enemy.hit_count)])
-            {
-                if (std::abs(to_player.y) < 1.2F)
-                {
-                    const float squared = to_player.x * to_player.x + to_player.z * to_player.z;
-                    bool landed = squared < 0.05F;
-                    if (!landed && squared < attack.range * attack.range)
-                    {
-                        const float inverse_distance = 1.0F / std::sqrt(squared);
-                        const float target_x = to_player.x * inverse_distance;
-                        const float target_z = to_player.z * inverse_distance;
-                        const float forward_x = std::sin(enemy.yaw);
-                        const float forward_z = -std::cos(enemy.yaw);
-                        const float facing = (target_x * forward_x + target_z * forward_z) *
-                                             attacks.hit_dot_multiplier;
-                        landed = facing > 0.7F;
-                    }
-                    if (landed && local_target)
-                    {
-                        events.player_damage += attack.damage;
-                        events.player_damage_sources.push_back(enemy.position);
-                    }
-                }
-                ++enemy.hit_count;
-            }
-            if (enemy.clip_time >= clip_duration(enemy, enemy.clip))
-            {
-                const float distance3 =
-                    std::sqrt(to_player.x * to_player.x + to_player.y * to_player.y +
-                              to_player.z * to_player.z);
-                if (distance3 >= 1.0F)
-                    begin_state(enemy, EnemyState::chase, player);
-                else
-                {
-                    begin_state(enemy, EnemyState::attack, player);
-                    ++events.attacks_started;
-                }
-            }
-            break;
-        }
-        case EnemyState::idle:
-            enemy.velocity.x = 0.0F;
-            enemy.velocity.z = 0.0F;
-            if (enemy.state_time >= enemy.state_duration)
-                begin_state(enemy, EnemyState::chase, player);
-            break;
-        case EnemyState::hit:
-            enemy.velocity.x = 0.0F;
-            enemy.velocity.z = 0.0F;
-            if (enemy.clip_time >= std::max(0.0F, clip_duration(enemy, enemy.clip) - 0.25F))
-                begin_state(enemy, EnemyState::chase, player);
-            break;
-        case EnemyState::die:
-            enemy.velocity.x = 0.0F;
-            enemy.velocity.z = 0.0F;
-            // EnemyManager handles the kill message (and therefore the local
-            // loot roll) immediately; the nonblocking corpse remains for five
-            // seconds after its death animation finishes.
-            if (enemy.loot_pending)
-            {
-                enemy.loot_pending = false;
-                const float origin_distance = std::sqrt(enemy.position.x * enemy.position.x +
-                                                        enemy.position.z * enemy.position.z);
-                const EnemyLoot loot =
-                    enemy_loot(enemy.type, origin_distance, enemy.position.y, rng_);
-                if (loot.item_count > 0U)
-                {
-                    events.drops.push_back(loot);
-                    events.drop_positions.push_back(
-                        {enemy.position.x, enemy.position.y + 1.0F, enemy.position.z});
-                }
-            }
-            if (enemy.state_time >=
-                clip_duration(enemy, enemy.clip) / std::max(0.001F, stats.die_animation_speed) +
-                    5.0F)
-            {
-                ++events.died;
-                enemy.state = EnemyState::despawn;
-            }
-            break;
-        case EnemyState::give_up:
-            enemy.velocity.x = 0.0F;
-            enemy.velocity.z = 0.0F;
-            // Every *GiveUp state inherits ZombieGiveUp.Update: play the
-            // class-specific non-looping clip once, then remove the entity.
-            if (enemy.clip_time >= clip_duration(enemy, enemy.clip))
-                enemy.state = EnemyState::despawn;
-            break;
-        case EnemyState::dig: {
-            // ZombieDig 1:1: swings of the melee clip chew a 2x3x2 block box
-            // biased toward the player. Every swing that touches solid plays
-            // the loud ZombieDig cue; a block breaks once the accumulated
-            // swings exceed its hardness, with the original's 50% roll.
-            if (!enemy.dig_valid)
-            {
-                enemy.dig_valid = true;
-                enemy.swing_count = 0;
-                enemy.dig_progress = 0.0F;
-                // Enter: a target already 16+ blocks away means give up.
-                const float target_range_squared = to_player.x * to_player.x +
-                                                   to_player.y * to_player.y +
-                                                   to_player.z * to_player.z;
-                if (target_range_squared > 256.0F)
-                {
-                    begin_state(enemy, EnemyState::give_up, player);
-                    break;
-                }
-            }
-            enemy.velocity.x = 0.0F;
-            enemy.velocity.z = 0.0F;
-            if (flat_distance > 0.1F)
-                enemy.yaw = std::atan2(to_player.x, -to_player.z);
-            // attack clips land their dig hit ~0.83s in at animation speed 2.
-            constexpr float swing_period = 0.8333F / 2.0F;
-            enemy.dig_progress += delta_seconds;
-            if (enemy.dig_progress < swing_period)
-                break;
-            enemy.dig_progress -= swing_period;
-            ++enemy.swing_count;
-            // The original's 2x3x2 target volume, biased toward the player.
-            int base_x = static_cast<int>(std::floor(enemy.position.x));
-            int base_y = static_cast<int>(std::floor(enemy.position.y));
-            int base_z = static_cast<int>(std::floor(enemy.position.z));
-            if (player.position.y >= enemy.position.y + 1.0F)
-                ++base_y;
-            else if (player.position.y <= enemy.position.y - 1.0F)
-                --base_y;
-            int min_x = base_x, max_x = base_x;
-            int min_z = base_z, max_z = base_z;
-            if (player.position.x > enemy.position.x)
-                ++max_x;
-            else
-                --min_x;
-            if (player.position.z >= enemy.position.z)
-                ++max_z;
-            else
-                --min_z;
-            const int hits =
-                static_cast<int>(static_cast<float>(enemy.swing_count) * stats.digging_multiplier);
-            bool touched_blocking = false;
-            bool any_diggable = false;
-            bool any_too_hard = false;
-            for (int y = base_y; y <= base_y + 2; ++y)
-                for (int z = min_z; z <= max_z; ++z)
-                    for (int x = min_x; x <= max_x; ++x)
-                    {
-                        if (!region.contains(x, y, z))
-                            continue;
-                        const BlockType block = region.block(x, y, z);
-                        const int hardness = enemy_dig_hardness(block);
-                        if (hardness == 0)
-                            continue;
-                        if (blocks_player(block))
-                            touched_blocking = true;
-                        if (hardness > stats.hardest_block_dug)
-                        {
-                            any_too_hard = true;
-                            continue;
-                        }
-                        any_diggable = true;
-                        // Explosive.EnemyBreakBlocks: hits > hardness, then a
-                        // coin flip per swing.
-                        if (hits > hardness && rng_.next01() < 0.5F)
-                        {
-                            // Upper halves report a successful swing but are
-                            // deliberately skipped; the lower half owns both.
-                            if (local_target && !is_upper_door(block))
-                                events.dug_blocks.push_back({x, y, z});
-                        }
-                        else if (local_target &&
-                                 (block == BlockType::tnt || block == BlockType::c4))
-                        {
-                            events.fuse_blocks.push_back({x, y, z});
-                        }
-                    }
-            if (touched_blocking)
-                events.dig_swings.push_back(enemy.position);
-            // ZombieDig exit table (checked at each swing end).
-            if (!touched_blocking)
-            {
-                begin_state(enemy, EnemyState::chase, player);
-            }
-            else if (!any_diggable && any_too_hard)
-            {
-                begin_state(enemy, EnemyState::give_up, player);
-            }
-            else if (std::abs(to_player.y) > 8.0F || (flat_distance > 16.0F))
-            {
-                begin_state(enemy, EnemyState::give_up, player);
-            }
-            else if (flat_distance < 1.0F && std::abs(to_player.y) < 1.5F)
-            {
-                begin_state(enemy, EnemyState::attack, player);
-                ++events.attacks_started;
-            }
-            break;
-        }
-        case EnemyState::despawn:
-        default:
-            break;
-        }
-        if (enemy.state != EnemyState::despawn)
-            move_enemy(region, enemy, delta_seconds);
-        if (local_target && initial_state != EnemyState::give_up &&
-            enemy.state == EnemyState::give_up)
-            events.give_up_requests.push_back({enemy.target_gid, enemy.id});
+        // BaseZombie.OnUpdate: `!Target.ValidGamer || Target.Dead` -> GiveUp()
+        // on every peer, owner or not (both stock generations read the same
+        // PlayerUpdate death flag, so this agrees without a message of its
+        // own), then the state machine, then the animation clock.
+        enemy_simulation::Context context{region, player};
+        context.target_alive = target_resolved && player.health > 0.0F;
+        context.local_target = local_target;
+        context.observe_remote = observe_remote_strikes_; // (Authority)
+        context.zombie_fest = zombie_fest_;
+        context.modern_rules = modern_rules_;
+        context.delta_seconds = delta_seconds;
+        context.clip_durations = &clip_durations_;
+        context.dig_random = &dig_random_;
+        context.events = &events;
+        enemy_simulation::update(enemy, context);
     }
     std::erase_if(enemies_, [](const Enemy &enemy) { return enemy.state == EnemyState::despawn; });
     return events;

@@ -27,6 +27,19 @@
       "name": "native-release",
       "displayName": "Native Release",
       "inherits": "native-base"
+    },
+    {
+      "name": "native-public",
+      "displayName": "Public release without owned content",
+      "inherits": "native-base",
+      "cacheVariables": {
+        "OPENMINERZ_IMPORT_OWNED_CONTENT": "OFF",
+        "OPENMINERZ_BUILD_INTEROP_LAB": "OFF",
+        "OPENMINERZ_CLASSIC_GAME_DIR": "",
+        "OPENMINERZ_MODERN_GAME_DIR": "",
+        "OPENMINERZ_STEAM_API_DLL": "",
+        "OPENMINERZ_AVATAR_ASSET": ""
+      }
     }
   ],
   "buildPresets": [
@@ -38,6 +51,11 @@
     {
       "name": "native-release",
       "configurePreset": "native-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "native-public",
+      "configurePreset": "native-public",
       "configuration": "Release"
     }
   ],
@@ -53,6 +71,14 @@
     {
       "name": "native-release",
       "configurePreset": "native-release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "native-public",
+      "configurePreset": "native-public",
       "configuration": "Release",
       "output": {
         "outputOnFailure": true

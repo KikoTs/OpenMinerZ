@@ -88,7 +88,10 @@ function Write-Certificate($Certificate, [string] $Destination) {
         if (-not [string]::IsNullOrWhiteSpace($parent)) {
             [System.IO.Directory]::CreateDirectory($parent) | Out-Null
         }
-        Set-Content -LiteralPath $Destination -Value $json -Encoding utf8NoBOM
+        # Not Set-Content -Encoding utf8NoBOM: Windows PowerShell 5.1 has no
+        # such encoding name, and CMake falls back to it when pwsh is absent.
+        [System.IO.File]::WriteAllText($Destination, ($json -join [Environment]::NewLine) +
+            [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
     }
     $json
 }

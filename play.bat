@@ -8,7 +8,7 @@ if not exist "%OPENMINERZ_GAME%" (
     exit /b 1
 )
 pushd "%~dp0out\build\native-release\Release"
-"%OPENMINERZ_GAME%"
+"%OPENMINERZ_GAME%" %*
 set "OPENMINERZ_EXIT=%ERRORLEVEL%"
 popd
 exit /b %OPENMINERZ_EXIT%

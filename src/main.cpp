@@ -3,9 +3,13 @@
 #include "openminerz/net/authoritative_bootstrap.hpp"
 #include "openminerz/net/legacy_steam_runtime_client.hpp"
 
+#include <SDL3/SDL.h>
+
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <iostream>
 #include <limits>
@@ -40,8 +44,8 @@ bool parse_size(std::string_view value, int &width, int &height)
 bool parse_state_region(std::string_view value, std::array<int, 2> &center)
 {
     const auto separator = value.find(',');
-    if (separator == std::string_view::npos || separator == 0U ||
-        separator + 1U >= value.size() || value.find(',', separator + 1U) != std::string_view::npos)
+    if (separator == std::string_view::npos || separator == 0U || separator + 1U >= value.size() ||
+        value.find(',', separator + 1U) != std::string_view::npos)
         return false;
     const auto parse_coordinate = [](std::string_view token, int &coordinate) {
         try
@@ -78,6 +82,54 @@ int main(int argc, char **argv)
         if (argument == "--settings")
         {
             options.open_settings = true;
+        }
+        else if (argument == "--ui-settings")
+        {
+            options.open_settings = true;
+            options.open_ui_settings = true;
+        }
+        else if (argument == "--diagnostic-menu" && index + 1 < argc)
+        {
+            const std::string_view name{argv[++index]};
+            constexpr std::array names{"main",   "multiplayer", "mode", "difficulty", "pause",
+                                       "addons", "credits",     "exit", "name",       "password",
+                                       "chat",   "locator",     "crate", "profile", "modern-mode",
+                                       "achievements", "achievement-last", "achievement-unlocked", "travel",
+                                       "teleport", "host-options", "players", "pause-settings",
+                                       "pause-addons"};
+            if (std::find(names.begin(), names.end(), name) == names.end())
+                return 2;
+            options.diagnostic_menu = name;
+            if (name == "pause" || name == "chat" || name == "locator" || name == "crate" ||
+                name == "teleport" || name == "host-options" || name == "players" ||
+                name == "pause-settings" || name == "pause-addons")
+                options.open_world = true;
+        }
+        else if (argument == "--settings-tab" && index + 1 < argc)
+        {
+            const std::string_view name{argv[++index]};
+            // Same order as ui::SettingsTab; the index selects the page.
+            constexpr std::array names{"display",  "graphics", "effects", "performance",
+                                       "gameplay", "controls", "ui",      "audio",
+                                       "accessibility", "extras"};
+            const auto found = std::find(names.begin(), names.end(), name);
+            if (found == names.end())
+                return 2;
+            options.open_settings = true;
+            options.diagnostic_settings_tab = static_cast<int>(found - names.begin());
+        }
+        else if (argument == "--settings-row" && index + 1 < argc)
+        {
+            const std::string_view value{argv[++index]};
+            unsigned row{};
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), row);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                row > 1000U)
+            {
+                std::cerr << "Invalid settings row\n";
+                return 2;
+            }
+            options.settings_selection = row;
         }
         else if (argument == "--host-setup")
         {
@@ -136,6 +188,26 @@ int main(int argc, char **argv)
             options.diagnostic_multiplayer = true;
             options.open_world = true;
         }
+        else if (argument == "--diagnostic-death" && index + 1 < argc)
+        {
+            try
+            {
+                std::size_t consumed{};
+                const std::string value{argv[++index]};
+                const float seconds = std::stof(value, &consumed);
+                if (consumed != value.size() || !std::isfinite(seconds) || seconds < 0.0F ||
+                    seconds > 30.0F)
+                    throw std::out_of_range{"death time"};
+                options.diagnostic_death_seconds = seconds;
+                options.open_world = true;
+                options.no_enemies = true;
+            }
+            catch (...)
+            {
+                std::cerr << "Invalid --diagnostic-death; expected seconds in [0, 30]\n";
+                return 2;
+            }
+        }
         else if (argument == "--steam-probe")
         {
             steam_probe = true;
@@ -172,6 +244,23 @@ int main(int argc, char **argv)
         {
             options.open_world_select = true;
         }
+        else if (argument == "--world-directory" && index + 1 < argc)
+            options.world_directory = argv[++index];
+        else if (argument == "--world-file" && index + 1 < argc)
+        {
+            options.world_file = argv[++index];
+            options.open_world = true;
+        }
+        else if (argument == "--world-library-index" && index + 1 < argc)
+        {
+            const std::string_view value{argv[++index]};
+            const auto result = std::from_chars(value.data(), value.data() + value.size(),
+                                                options.world_library_selection);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size())
+                return 2;
+        }
+        else if (argument == "--diagnostic-save-exit")
+            options.diagnostic_save_exit = true;
         else if (argument == "--inventory")
         {
             options.open_world = true;
@@ -281,20 +370,110 @@ int main(int argc, char **argv)
                 return 2;
             }
         }
+        else if (argument == "--seed" && index + 1 < argc)
+        {
+            const std::string_view value{argv[++index]};
+            std::int32_t seed{};
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), seed);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
+            {
+                std::cerr << "Invalid --seed value; expected a 32-bit integer\n";
+                return 2;
+            }
+            options.world_seed = seed;
+            options.open_world = true;
+        }
+        else if (argument == "--camera" && index + 1 < argc)
+        {
+            // The eye position a still is drawn from. The player is not moved.
+            float x{}, y{}, z{};
+            if (std::sscanf(argv[++index], "%f,%f,%f", &x, &y, &z) != 3 || !std::isfinite(x) ||
+                !std::isfinite(y) || !std::isfinite(z))
+            {
+                std::cerr << "Invalid --camera value; expected X,Y,Z in world blocks\n";
+                return 2;
+            }
+            options.still_camera = {x, y, z};
+            options.open_world = true;
+        }
+        else if (argument == "--teleport" && index + 1 < argc)
+        {
+            // mod-world: start the player on the ground at X,Z (the window is
+            // generated around it).
+            const std::string_view value{argv[++index]};
+            const auto comma = value.find(',');
+            float x{}, z{};
+            const bool parsed =
+                comma != std::string_view::npos &&
+                std::from_chars(value.data(), value.data() + comma, x).ec == std::errc{} &&
+                std::from_chars(value.data() + comma + 1, value.data() + value.size(), z).ec == std::errc{};
+            if (!parsed || !std::isfinite(x) || !std::isfinite(z) || std::abs(x) > 8.0e6F ||
+                std::abs(z) > 8.0e6F)
+            {
+                std::cerr << "Invalid --teleport value; expected X,Z in world blocks\n";
+                return 2;
+            }
+            options.teleport = std::array{x, z};
+            options.open_world = true;
+        }
+        else if ((argument == "--camera-fov" || argument == "--fov") && index + 1 < argc)
+        {
+            // One switch, two spellings: the world camera's vertical field of
+            // view for this run (the "Field of view" setting, without saving
+            // it). The first-person body keeps its own projection.
+            try
+            {
+                const float degrees = std::stof(argv[++index]);
+                if (!(degrees >= 10.0F && degrees <= 120.0F))
+                    throw std::out_of_range{"field of view"};
+                options.still_fov = degrees;
+                options.open_world = true;
+            }
+            catch (...)
+            {
+                std::cerr << "Invalid " << argument
+                          << " value; expected vertical degrees in [10, 120]\n";
+                return 2;
+            }
+        }
+        else if (argument == "--clean-view")
+        {
+            options.clean_view = true;
+            options.open_world = true;
+        }
+        else if (argument == "--vfx" && index + 1 < argc)
+        {
+            // One deterministic effect of the Enhanced effects layer for a
+            // capture or a benchmark (WorldPreviewRenderer::vfx_diagnostic
+            // reads the same text from OPENMINERZ_DIAGNOSTIC_VFX).
+            SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "OPENMINERZ_DIAGNOSTIC_VFX",
+                                       argv[++index], true);
+            options.open_world = true;
+        }
+        else if (argument == "--menu-backdrop" && index + 1 < argc)
+        {
+            options.menu_backdrop = argv[++index];
+        }
         else if (argument == "--environment" && index + 1 < argc)
         {
             const std::string value{argv[++index]};
-            constexpr std::string_view names[]{"surface", "water",  "cave",   "hell",
-                                               "lava",    "crater", "foliage"};
+            constexpr std::string_view names[]{"surface",     "water",      "cave",      "hell",
+                                               "lava",        "crater",     "foliage",   "lava-light",
+                                               "ores",        "hell-tunnel", "hell-shaft",
+                                               "lava-pool"};
             if (std::find(std::begin(names), std::end(names), value) == std::end(names))
             {
                 std::cerr << "Invalid --environment value; expected surface, water, cave, hell, "
-                             "lava, crater, or foliage\n";
+                             "lava, crater, foliage, lava-light, ores, hell-tunnel, hell-shaft, "
+                             "or lava-pool\n";
                 return 2;
             }
             options.preview_environment = value;
             if (value == "water")
-                options.world_biome = 1; // Lagoon is BlockTerrain.IsWaterWorld.
+                // The Lagoon band. Retail never has water (IsWaterWorld is never
+                // set), so this diagnostic also switches the Lagoon water
+                // enhancement on for the one run; see retail_parity.hpp.
+                options.world_biome = 1;
             options.open_world = true;
         }
         else if (argument == "--item" && index + 1 < argc)
@@ -406,6 +585,73 @@ int main(int argc, char **argv)
             }
             options.craft_modern = style == "modern";
         }
+        else if (argument == "--ui-style" && index + 1 < argc)
+        {
+            // The one interface style (HUD, inventory, crate and crafting
+            // together). The numbers are UiStyle's enumerator values.
+            const std::string_view style{argv[++index]};
+            if (style != "remastered" && style != "classic" && style != "modern" &&
+                style != "automatic")
+            {
+                std::cerr << "Invalid --ui-style value; expected remastered, classic, modern or "
+                             "automatic\n";
+                return 2;
+            }
+            options.ui_style =
+                style == "automatic" ? 0 : (style == "classic" ? 1 : (style == "modern" ? 2 : 3));
+        }
+        else if (argument == "--vitals" && index + 1 < argc)
+        {
+            // The Remastered health/energy look for a capture run.
+            const std::string_view look{argv[++index]};
+            if (look != "bars" && look != "hearts" && look != "top" && look != "hidden")
+            {
+                std::cerr << "Invalid --vitals value; expected bars, hearts, top or hidden\n";
+                return 2;
+            }
+            options.vitals_style =
+                look == "hearts" ? 0 : (look == "top" ? 1 : (look == "bars" ? 2 : 3));
+        }
+        else if (argument == "--ui-scale" && index + 1 < argc)
+        {
+            try
+            {
+                options.ui_scale = std::stof(argv[++index]);
+                if (!(options.ui_scale >= 0.75F && options.ui_scale <= 1.5F))
+                    throw std::out_of_range{"ui scale"};
+            }
+            catch (...)
+            {
+                std::cerr << "Invalid --ui-scale value; expected a number in [0.75, 1.5]\n";
+                return 2;
+            }
+        }
+        else if (argument == "--hud-option" && index + 1 < argc)
+        {
+            // Switch one HUD element for a capture run: NAME=0|1 with NAME one
+            // of compass, clock, hints, coordinates, server, notifications.
+            options.hud_options.emplace_back(argv[++index]);
+        }
+        else if (argument == "--gamepad-prompts")
+        {
+            options.gamepad_prompts = true;
+        }
+        else if (argument == "--screen-script" && index + 1 < argc)
+        {
+            options.screen_script = argv[++index];
+        }
+        else if (argument == "--screen-backdrop" && index + 1 < argc)
+        {
+            int red = 0, green = 0, blue = 0;
+            if (std::sscanf(argv[++index], "%d,%d,%d", &red, &green, &blue) != 3)
+            {
+                std::cerr << "Invalid --screen-backdrop value; expected R,G,B\n";
+                return 2;
+            }
+            options.screen_backdrop = {static_cast<std::uint8_t>(std::clamp(red, 0, 255)),
+                                       static_cast<std::uint8_t>(std::clamp(green, 0, 255)),
+                                       static_cast<std::uint8_t>(std::clamp(blue, 0, 255))};
+        }
         else if (argument == "--texture-style" && index + 1 < argc)
         {
             const std::string_view style{argv[++index]};
@@ -478,6 +724,14 @@ int main(int argc, char **argv)
                 << "OpenMinerZ frontend\n"
                    "  --size WIDTHxHEIGHT   Override initial window size\n"
                    "  --settings            Open the settings screen\n"
+                   "  --ui-settings         Open HUD and interface preferences\n"
+                   "  --settings-tab NAME   "
+                   "display|graphics|effects|performance|gameplay|controls|ui|audio|"
+                   "accessibility|extras\n"
+                   "  --settings-row N      Select a settings row for visual checks\n"
+                   "  --diagnostic-menu NAME  "
+                   "main|multiplayer|mode|difficulty|pause|addons|credits|exit|name|password|chat|"
+                   "locator|crate|profile|modern-mode|achievements|achievement-last|achievement-unlocked|travel\n"
                    "  --host-setup          Open multiplayer host preflight\n"
                    "  --host-details        Open host identity and capacity settings\n"
                    "  --host-access         Open host access and privacy settings\n"
@@ -493,8 +747,23 @@ int main(int argc, char **argv)
                    "  --steam-probe-modern  Query only Modern v4 lobbies\n"
                    "  --steam-join-probe-modern ID  Trace Modern admission for one lobby\n"
                    "  --world               Open the generated world preview\n"
-                   "  --world-list          Open the saved-world card browser\n"
+                   "  --world-list          Open the saved-world library\n"
+                   "  --world-directory PATH  Use a separate local world library\n"
+                   "  --world-file PATH     Continue a specific local world\n"
+                   "  --world-library-index N  Select a library row for diagnostics\n"
+                   "  --diagnostic-save-exit  Close a --world-file after 24 ready frames\n"
                    "  --inventory           Open the world with the inventory visible\n"
+                   "  --craft-style S       World rules for --world: classic or modern\n"
+                   "  --ui-style S          Interface style for this run: remastered, classic,\n"
+                   "                        modern, automatic (HUD, inventory, crate and crafting)\n"
+                   "  --vitals LOOK         Remastered health look: bars, hearts, top, hidden\n"
+                   "  --ui-scale N          Interface scale for this run, 0.75 to 1.5\n"
+                   "  --hud-option NAME=0|1 compass, clock, hints, coordinates, server, notifications;\n"
+                   "                        notice=1|2 and caption=1 show a sample notice / caption\n"
+                   "  --gamepad-prompts     Show controller prompts in the Remastered screens\n"
+                   "  --screen-script TEXT  Drive the inventory/crate/crafting screen, e.g.\n"
+                   "                        \"clear;give 0=1x64 32=23x1@0.6;open inventory;move 0\"\n"
+                   "  --screen-backdrop R,G,B  Flat colour behind those screens instead of the world\n"
                    "  --no-enemies          Disable hostile spawns in a world preview\n"
                    "  --lightning           Force the sky-only lightning frame for capture\n"
                    "  --time HOUR           Fix preview time to an hour in [0, 24)\n"
@@ -502,19 +771,34 @@ int main(int argc, char **argv)
                    "  --view-distance N     Override terrain visibility setting (4..32)\n"
                    "  --tonemap CURVE       legacy|reinhard|filmic|aces\n"
                    "  --pitch DEGREES       Fix preview camera pitch in [-85, 85]\n"
-                   "  --environment NAME    surface|water|cave|hell|lava|crater|foliage diagnostic "
-                   "spawn\n"
+                   "  --yaw DEGREES         Fix preview camera yaw (0 looks along -Z, 90 along +X)\n"
+                   "  --seed N              World seed of the --world preview\n"
+                   "  --camera X,Y,Z        Draw a still from this eye position (player not moved)\n"
+                   "  --teleport X,Z        Start the player on the ground at X,Z\n"
+                   "  --camera-fov DEGREES  Vertical field of view of that still, in [10, 120]\n"
+                   "  --fov DEGREES         Same switch: the world's vertical field of view for this\n"
+                   "                        run (hands and held item scale together with FOV)\n"
+                   "  --clean-view          World only: no HUD, viewmodel, nametags or notices\n"
+                   "  --vfx SPEC            One Enhanced effect for a capture: NAME[,dist=8][,age=S]\n"
+                   "                        [,up=0.5][,side=0][,count=1][,gap=4][,repeat=S][,scale=1];\n"
+                   "                        age holds it still at that instant, repeat replays it.\n"
+                   "                        NAME is a recipe (explosion_tnt, torch_flame, ...) or inside\n"
+                   "  --menu-backdrop PATH  Picture behind the menus for this run (BMP)\n"
+                   "  --environment NAME    surface|water|cave|hell|lava|crater|foliage|lava-light|ores|"
+                   "\n"
+                   "                        hell-tunnel|hell-shaft|lava-pool diagnostic spawn\n"
                    "  --item ID             Equip an original item id (0..131) for capture\n"
                    "  --viewmodel STATE     idle|use|aim|aim-idle|unshoulder|fire|aim-fire|reload\n"
                    "  --viewmodel-progress N  Fix the selected viewmodel clip at [0, 1]\n"
                    "  --texture-style NAME  classic|classic-hd|modern content-pack override\n"
                    "  --presentation NAME   classic|rebirth render-profile override\n"
-                    "  --screenshot PATH     Render two frames, save BMP, and exit\n"
-                    "  --pickup-item ID      Place one dropped-item visual for capture\n"
-                    "  --network-trace PATH  Append redacted protocol JSONL for interop testing\n"
-                    "  --state-dump PATH     Write a redacted final interop state snapshot\n"
-                    "  --state-region X,Z   Use one exact 33x128x33 world-space state region\n"
-                    "  --bench N             Render N world frames, print timings, exit\n";
+                   "  --screenshot PATH     Render two frames, save BMP, and exit\n"
+                   "  --diagnostic-death S  Preview the authored local death body at S seconds\n"
+                   "  --pickup-item ID      Place one dropped-item visual for capture\n"
+                   "  --network-trace PATH  Append redacted protocol JSONL for interop testing\n"
+                   "  --state-dump PATH     Write a redacted final interop state snapshot\n"
+                   "  --state-region X,Z   Use one exact 33x128x33 world-space state region\n"
+                   "  --bench N             Render N world frames, print timings, exit\n";
             return 0;
         }
         else
@@ -524,6 +808,11 @@ int main(int argc, char **argv)
         }
     }
 
+    if (options.diagnostic_save_exit && !options.world_file)
+    {
+        std::cerr << "--diagnostic-save-exit requires --world-file\n";
+        return 2;
+    }
     try
     {
         if (steam_probe)

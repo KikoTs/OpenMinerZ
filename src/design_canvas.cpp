@@ -28,7 +28,7 @@ UiMetrics DesignCanvas::compute(int output_width, int output_height, float ui_sc
     const float normalized_safe_area = std::clamp(safe_area, 0.80F, 1.00F);
     const float fit_scale = std::min(static_cast<float>(output_width) / reference_width,
                                      static_cast<float>(output_height) / reference_height);
-    const float density = std::clamp(fit_scale * normalized_ui_scale, 0.50F, 4.00F);
+    const float requested_density = std::clamp(fit_scale * normalized_ui_scale, 0.50F, 4.00F);
     const float horizontal_inset =
         static_cast<float>(output_width) * (1.0F - normalized_safe_area) * 0.5F;
     const float vertical_inset =
@@ -37,11 +37,14 @@ UiMetrics DesignCanvas::compute(int output_width, int output_height, float ui_sc
     UiMetrics metrics;
     metrics.output_width = output_width;
     metrics.output_height = output_height;
-    metrics.scale = density;
-    metrics.density = density;
     metrics.safe = {horizontal_inset, vertical_inset,
                     static_cast<float>(output_width) - horizontal_inset * 2.0F,
                     static_cast<float>(output_height) - vertical_inset * 2.0F};
+    // Fit the complete interface, including its header and footer. Scaling only
+    // an outer panel leaves its children spilling out at large UI sizes.
+    metrics.scale =
+        std::min({requested_density, metrics.safe.width / 1650.0F, metrics.safe.height / 920.0F});
+    metrics.density = metrics.scale;
     return metrics;
 }
 

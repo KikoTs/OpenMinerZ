@@ -585,7 +585,9 @@ namespace OpenMinerZ.OriginalStateHost
                 X = ReflectionAccess.Float(position, "X"),
                 Y = ReflectionAccess.Float(position, "Y"),
                 Z = ReflectionAccess.Float(position, "Z"),
-                Yaw = yaw,
+                // State barriers use the native camera convention (+yaw faces
+                // +X). Original XNA Y-axis quaternion yaw faces -X.
+                Yaw = -yaw,
                 Pitch = pitch == null ? 0.0f : ReflectionAccess.Float(pitch, "Radians"),
                 Health = health,
                 Dead = ReflectionAccess.Bool(player, "Dead", false)

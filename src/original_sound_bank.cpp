@@ -179,6 +179,11 @@ class OriginalSoundBank::Impl final
             input_ = nullptr;
             return;
         }
+        // Commands are written from the frame thread, so the write must never
+        // wait for the helper (see play). If this fails the pipe stays as it
+        // was: blocking, and correct for a helper that keeps reading.
+        DWORD no_wait = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        static_cast<void>(SetNamedPipeHandleState(input_, &no_wait, nullptr, nullptr));
 
         HANDLE child_output{};
         if (!CreatePipe(&output_, &child_output, &attributes, 0U) ||
@@ -400,14 +405,44 @@ class OriginalSoundBank::Impl final
         {
             return;
         }
-        std::string command{cue};
-        command.push_back('\n');
-        DWORD written{};
-        if (!WriteFile(input_, command.data(), static_cast<DWORD>(command.size()), &written,
-                       nullptr))
+        // A blocking write here froze the whole game for as long as the helper
+        // was alive but not reading: stalled in the audio stack, suspended, or
+        // sitting behind a crash dialog. A few seconds of cues fill the pipe
+        // and WriteFile then never returns (measured: the window went "Not
+        // Responding" 12 s after the helper was suspended and stayed so). The
+        // pipe is in no-wait mode instead; what does not fit waits in pending_
+        // and goes out with the next command. A helper that stays behind
+        // loses cues, never the frame.
+        if (pending_.size() + cue.size() + 1U > maximum_pending_bytes)
         {
-            CloseHandle(input_);
-            input_ = nullptr;
+            // Stale by now. Only the rest of a command whose first bytes are
+            // already in the pipe has to follow them.
+            const std::size_t line_end = command_begun_ ? pending_.find('\n') : std::string::npos;
+            pending_.erase(line_end == std::string::npos ? 0U : line_end + 1U);
+        }
+        pending_.append(cue);
+        pending_.push_back('\n');
+        while (!pending_.empty())
+        {
+            // One command per write. A full no-wait pipe may take as much as
+            // fits or nothing at all; a single command always fits an empty
+            // pipe, so neither answer can leave the queue stuck behind a
+            // write larger than the pipe itself.
+            const std::size_t line_end = pending_.find('\n');
+            const std::size_t count =
+                line_end == std::string::npos ? pending_.size() : line_end + 1U;
+            DWORD written{};
+            if (!WriteFile(input_, pending_.data(), static_cast<DWORD>(count), &written, nullptr))
+            {
+                CloseHandle(input_);
+                input_ = nullptr;
+                pending_.clear();
+                break;
+            }
+            if (written == 0U)
+                break; // The pipe is full: the helper has not caught up yet.
+            command_begun_ = pending_[written - 1U] != '\n';
+            pending_.erase(0U, written);
         }
 #else
         (void)cue;
@@ -416,14 +451,41 @@ class OriginalSoundBank::Impl final
 
   private:
 #if defined(_WIN32)
+    // About a second of commands at their busiest; more than that is history.
+    static constexpr std::size_t maximum_pending_bytes = 16U * 1024U;
     HANDLE input_{};
     HANDLE output_{};
     HANDLE process_{};
     bool ready_{};
+    // Commands not yet accepted by the pipe, and whether the pipe holds the
+    // beginning of the one at the front.
+    std::string pending_;
+    bool command_begun_{};
 #endif
     std::string renderer_id_;
     std::string renderer_name_;
 };
+
+namespace
+{
+// (Graphics area) the installed sound pack's cue replacements (see set_cue_override).
+OriginalSoundBank::CueOverride &cue_override_hook()
+{
+    static OriginalSoundBank::CueOverride hook;
+    return hook;
+}
+
+bool cue_replaced(std::string_view cue, const world::Vec3 *position = nullptr)
+{
+    const auto &hook = cue_override_hook();
+    return hook && hook(cue, position);
+}
+} // namespace
+
+void OriginalSoundBank::set_cue_override(CueOverride hook)
+{
+    cue_override_hook() = std::move(hook);
+}
 
 OriginalSoundBank::OriginalSoundBank(std::string_view output_id)
     : impl_(std::make_unique<Impl>(output_id))
@@ -477,55 +539,65 @@ void OriginalSoundBank::play_break(world::BlockType block)
     {
     case world::BlockType::sand:
     case world::BlockType::snow:
-        impl_->play("Sand");
+        if (!cue_replaced("Sand"))
+            impl_->play("Sand");
         break;
     case world::BlockType::leaves:
-        impl_->play("leaves");
+        if (!cue_replaced("leaves"))
+            impl_->play("leaves");
         break;
     default:
-        impl_->play("punch");
+        if (!cue_replaced("punch"))
+            impl_->play("punch");
         break;
     }
 }
 
 void OriginalSoundBank::play_place()
 {
-    impl_->play("Place");
+    if (!cue_replaced("Place"))
+        impl_->play("Place");
 }
 
 void OriginalSoundBank::play_footstep()
 {
-    impl_->play("FootStep");
+    if (!cue_replaced("FootStep"))
+        impl_->play("FootStep");
 }
 
 void OriginalSoundBank::play_pickup()
 {
-    impl_->play("pickupitem");
+    if (!cue_replaced("pickupitem"))
+        impl_->play("pickupitem");
 }
 
 void OriginalSoundBank::play_click()
 {
-    impl_->play("Click");
+    if (!cue_replaced("Click"))
+        impl_->play("Click");
 }
 
 void OriginalSoundBank::play_drop()
 {
-    impl_->play("dropitem");
+    if (!cue_replaced("dropitem"))
+        impl_->play("dropitem");
 }
 
 void OriginalSoundBank::play_pistol()
 {
-    impl_->play("GunShot4");
+    if (!cue_replaced("GunShot4"))
+        impl_->play("GunShot4");
 }
 
 void OriginalSoundBank::play_reload()
 {
-    impl_->play("Reload");
+    if (!cue_replaced("Reload"))
+        impl_->play("Reload");
 }
 
 void OriginalSoundBank::play_cue(std::string_view cue)
 {
-    if (!cue.empty())
+    if (!cue.empty() && !cue_replaced(cue))
         impl_->play(cue);
 }
 
@@ -556,7 +628,7 @@ void OriginalSoundBank::update_listener(world::Vec3 position, float yaw)
 
 void OriginalSoundBank::play_cue_at(std::string_view cue, world::Vec3 position)
 {
-    if (!cue.empty())
+    if (!cue.empty() && !cue_replaced(cue, &position))
         impl_->play(
             std::format("cue3d {} {:.2f} {:.2f} {:.2f}", cue, position.x, position.y, position.z));
 }

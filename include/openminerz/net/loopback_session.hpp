@@ -43,7 +43,7 @@ struct SessionPacketResult final
 class LoopbackSession final
 {
   public:
-    LoopbackSession(HostSessionSettings settings, bool game_begun, std::int32_t game_mode,
+    LoopbackSession(HostSessionSettings settings, bool join_closed, std::int32_t game_mode,
                     std::int32_t difficulty, bool infinite_resources,
                     bool host_occupies_player_slot = true);
 
@@ -69,6 +69,9 @@ class LoopbackSession final
     }
 
   private:
+    // (Network) A mod channel or mod download frame on the control channel.
+    [[nodiscard]] SessionPacketResult submit_mod_frame(PeerId peer, bool from_peer,
+                                                       std::span<const std::uint8_t> packet);
     [[nodiscard]] SessionPacketResult submit_gameplay(PeerId sender, PeerId recipient,
                                                       std::span<const std::uint8_t> packet,
                                                       MessageDeliveryPolicy delivery,

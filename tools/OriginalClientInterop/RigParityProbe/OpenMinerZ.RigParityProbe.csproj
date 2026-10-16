@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <PlatformTarget>x86</PlatformTarget>
+    <Prefer32Bit>true</Prefer32Bit>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AssemblyName>OpenMinerZ.RigParityProbe</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- XNA comes from the machine's own XNA 4.0 install; nothing is copied. -->
+    <Reference Include="Microsoft.Xna.Framework">
+      <HintPath>$(WINDIR)\Microsoft.NET\assembly\GAC_32\Microsoft.Xna.Framework\v4.0_4.0.0.0__842cf8be1de50553\Microsoft.Xna.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Xna.Framework.Game">
+      <HintPath>$(WINDIR)\Microsoft.NET\assembly\GAC_32\Microsoft.Xna.Framework.Game\v4.0_4.0.0.0__842cf8be1de50553\Microsoft.Xna.Framework.Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Xna.Framework.Graphics">
+      <HintPath>$(WINDIR)\Microsoft.NET\assembly\GAC_32\Microsoft.Xna.Framework.Graphics\v4.0_4.0.0.0__842cf8be1de50553\Microsoft.Xna.Framework.Graphics.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="System.Windows.Forms" />
+    <!-- The IL reader for the game's clip registrations is shared with the importer. -->
+    <Compile Include="..\..\ContentBridge\RetailRegistrations.cs" Link="RetailRegistrations.cs" />
+    <!-- So is the code that assembles a real Avatar around the game's own body. -->
+    <Compile Include="..\..\ContentBridge\RetailCharacter.cs" Link="RetailCharacter.cs" />
+  </ItemGroup>
+</Project>

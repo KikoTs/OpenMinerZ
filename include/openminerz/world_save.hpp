@@ -3,6 +3,7 @@
 #include "openminerz/game_mode.hpp"
 #include "openminerz/inventory.hpp"
 #include "openminerz/world/player.hpp"
+#include "openminerz/world/encounters.hpp"
 
 #include <array>
 #include <cstddef>
@@ -12,6 +13,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace openminerz
@@ -24,14 +26,30 @@ using WorldSaveCrateMap = std::map<WorldSaveCrateKey, WorldSaveCrateSlots>;
 using WorldSaveDoorMap = std::map<WorldSaveCrateKey, std::uint8_t>;
 using WorldSaveSpawnerMap = std::map<WorldSaveCrateKey, std::string>;
 
-// Project-owned offline save data. Networking will use the original binary
-// contracts later; this small text codec keeps local worlds deterministic and
-// independently testable without constructing the SDL application.
+struct WorldHistory final
+{
+    std::string creator;
+    std::int64_t created_unix_seconds{};
+    std::int64_t tracked_since_unix_seconds{};
+    double play_seconds{};
+    std::uint32_t sessions{};
+    std::uint32_t deaths{};
+
+    // Legacy worlds begin tracking now; their earlier history stays unknown.
+    void begin_session(std::int64_t now, std::string_view player, bool new_world);
+    void add_play_time(double seconds) noexcept;
+};
+
+// Project-owned checkpoint. Version 9 adds travel destinations and encounter
+// progression to version 8's world history. Versions 1–8 remain readable. Network peers
+// use the separate original binary contracts. Files retain one valid .bak checkpoint.
 struct WorldSaveData final
 {
-    int version{6};
+    int version{9};
+    bool recovered_from_backup{}; // Load result only; not serialized.
     std::string owner;
     std::int64_t saved_unix_seconds{};
+    WorldHistory history;
     std::int32_t seed{};
     GameMode mode{GameMode::survival};
     GameDifficulty difficulty{GameDifficulty::hard};
@@ -52,9 +70,11 @@ struct WorldSaveData final
     int next_song_index{};
 
     PlayerInventory inventory;
+    PlayerInventory::Slot held_stack;
     WorldSaveCrateMap crates;
     WorldSaveDoorMap doors;
     WorldSaveSpawnerMap spawners;
+    world::WorldEncounterState encounters;
     std::vector<std::array<int, 4>> edits;
 };
 

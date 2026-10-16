@@ -55,15 +55,16 @@ std::array<float, 3> transform_point(const std::array<float, 3> &point,
 }
 
 SDL_Texture *texture_from_rgba(SDL_Renderer *renderer, int width, int height,
-                               std::vector<std::uint8_t> &rgba)
+                               std::vector<std::uint8_t> &rgba, bool emission_mask = false)
 {
     if (width <= 0 || height <= 0 || rgba.empty())
         return nullptr;
     // ModelEntity/GunEntity/PickModelEntity all use XNA's opaque pass. DXT edge texels and
     // authored atlas padding can still decode with partial alpha; baking them into an SDL
     // texture otherwise punches translucent seams through the pick head and weapon bodies.
-    for (std::size_t alpha = 3U; alpha < rgba.size(); alpha += 4U)
-        rgba[alpha] = 255U;
+    if (!emission_mask)
+        for (std::size_t alpha = 3U; alpha < rgba.size(); alpha += 4U)
+            rgba[alpha] = 255U;
     SDL_Surface *surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, rgba.data(),
                                                  width * 4);
     if (surface == nullptr)
@@ -110,6 +111,15 @@ StaticModelAsset::StaticModelAsset(SDL_Renderer *renderer, const std::filesystem
                 value = reader.read<float>();
             if (version >= 3)
                 part.material_flags = reader.read<std::uint8_t>();
+            // Existing content packs predate the explicit Beam material flag.
+            // Saber exports contain the hilt followed by the blade mesh.
+            if (path.stem() == "saber" && part_index == 1)
+                part.material_flags |= 5U;
+            const auto stem = path.stem().string();
+            const bool laser_material = stem == "space_ak" || stem == "space_pistol" ||
+                stem == "space_rifle" || stem == "space_smg" || stem == "space_shotgun";
+            if (laser_material)
+                part.material_flags |= 8U;
             for (float &value : part.diffuse)
                 value = reader.read<float>();
             const int texture_width = reader.read<std::int32_t>();
@@ -121,7 +131,8 @@ StaticModelAsset::StaticModelAsset(SDL_Renderer *renderer, const std::filesystem
                                               static_cast<std::size_t>(texture_height) * 4U;
             std::vector<std::uint8_t> rgba(texture_bytes);
             reader.bytes(rgba.data(), rgba.size());
-            part.texture = texture_from_rgba(renderer, texture_width, texture_height, rgba);
+            part.texture = texture_from_rgba(renderer, texture_width, texture_height, rgba,
+                                             laser_material);
 
             const int vertex_count = reader.read<std::int32_t>();
             if (vertex_count <= 0 || vertex_count > 1000000)

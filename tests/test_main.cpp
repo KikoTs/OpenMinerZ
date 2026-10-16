@@ -1,7 +1,9 @@
+#include "classic_item_tables.hpp"
 #include "openminerz/design_canvas.hpp"
 #include "openminerz/input_contract.hpp"
-#include "openminerz/inventory.hpp"
 #include "openminerz/interop_state.hpp"
+#include "openminerz/inventory.hpp"
+#include "openminerz/menu_look.hpp"
 #include "openminerz/menu_model.hpp"
 #include "openminerz/net/admission.hpp"
 #include "openminerz/net/authoritative_bootstrap.hpp"
@@ -20,6 +22,7 @@
 #include "openminerz/net/mod_catalog.hpp"
 #include "openminerz/net/mod_handshake.hpp"
 #include "openminerz/net/payload_codec.hpp"
+#include "openminerz/net/peer_inventory_store.hpp"
 #include "openminerz/net/pickup_codec.hpp"
 #include "openminerz/net/player_replication.hpp"
 #include "openminerz/net/protocol.hpp"
@@ -28,6 +31,8 @@
 #include "openminerz/net/steam_bridge_client.hpp"
 #include "openminerz/net/steam_bridge_protocol.hpp"
 #include "openminerz/net/transport.hpp"
+#include "openminerz/retail_items.hpp"
+#include "openminerz/retail_text.hpp"
 #include "openminerz/settings.hpp"
 #include "openminerz/settings_menu.hpp"
 #include "openminerz/world/biome_atmosphere.hpp"
@@ -35,13 +40,17 @@
 #include "openminerz/world/dynamic_radiance.hpp"
 #include "openminerz/world/enemy.hpp"
 #include "openminerz/world/explosive.hpp"
+#include "openminerz/world/hell_atmosphere.hpp"
 #include "openminerz/world/legacy_noise.hpp"
 #include "openminerz/world/loot.hpp"
 #include "openminerz/world/player.hpp"
+#include "openminerz/world/shadow_cascade.hpp"
 #include "openminerz/world/sky.hpp"
 #include "openminerz/world/spawner.hpp"
 #include "openminerz/world/world.hpp"
 #include "openminerz/world_save.hpp"
+
+#include "state_digest.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -118,6 +127,616 @@ void pointer_input_contract_never_routes_secondary_to_jump_or_drop()
            "gameplay controls must exist only in a ready world, never in loading or menu state");
 }
 
+// InGameMenu.OnPushed/OnPoped freeze the scene only when !IsOnlineGame, and a
+// host is IsOnlineGame (a PlayerMatch session) with or without guests.
+void pause_contract_freezes_only_a_private_game()
+{
+    using openminerz::WorldOverlay;
+    using openminerz::world_simulation_active;
+
+    struct Session final
+    {
+        std::string_view name;
+        bool online;
+    };
+    constexpr std::array<Session, 3> sessions{
+        Session{"offline", false}, Session{"hosting", true}, Session{"joined", true}};
+    for (const Session &session : sessions)
+    {
+        const std::string who{session.name};
+        expect(world_simulation_active(WorldOverlay::none, session.online, false),
+               who + ": the first-person view always simulates");
+        expect(world_simulation_active(WorldOverlay::dialog, session.online, false),
+               who + ": an in-world picker is a pushed dialog and never pauses");
+        expect(world_simulation_active(WorldOverlay::pause_menu, session.online, false) ==
+                   session.online,
+               who + ": the pause menu freezes a private game and nothing else");
+        expect(!world_simulation_active(WorldOverlay::frontend, session.online, false),
+               who + ": frontend screens play no world");
+        for (const WorldOverlay overlay : {WorldOverlay::none, WorldOverlay::pause_menu,
+                                           WorldOverlay::dialog, WorldOverlay::frontend})
+            expect(!world_simulation_active(overlay, session.online, true),
+                   who + ": a world that is still loading cannot simulate");
+
+        // The detached inspector camera parks the fixed step in a private
+        // world only; a host must keep simulating and a peer replicating.
+        expect(openminerz::world_fixed_step_active(true, false, session.online) &&
+                   openminerz::world_fixed_step_active(true, true, session.online) ==
+                       session.online &&
+                   !openminerz::world_fixed_step_active(false, false, session.online) &&
+                   !openminerz::world_fixed_step_active(false, true, session.online),
+               who + ": the fixed step must follow the simulation and the inspector rule");
+    }
+
+    // Screen facts map to exactly one overlay; the pause family wins over a picker.
+    expect(openminerz::classify_world_overlay(true, false, false) == WorldOverlay::none &&
+               openminerz::classify_world_overlay(false, true, false) == WorldOverlay::pause_menu &&
+               openminerz::classify_world_overlay(false, true, true) == WorldOverlay::pause_menu &&
+               openminerz::classify_world_overlay(false, false, true) == WorldOverlay::dialog &&
+               openminerz::classify_world_overlay(false, false, false) == WorldOverlay::frontend,
+           "screen facts must classify into one overlay");
+
+    // Options and Achievements pushed from the pause menu are still the pause
+    // overlay (the original never pops InGameMenu under them); the same
+    // screens reached from the main menu are plain frontend.
+    openminerz::Settings settings;
+    openminerz::ui::MenuModel menu;
+    expect(!menu.pause_overlay_active(), "the main menu is not a pause overlay");
+    menu.open(openminerz::ui::MenuScreen::pause);
+    expect(menu.pause_overlay_active(), "the pause menu is the pause overlay");
+    const auto &pause_entries = menu.entries();
+    std::size_t settings_row = pause_entries.size();
+    std::size_t achievements_row = pause_entries.size();
+    for (std::size_t row{}; row < pause_entries.size(); ++row)
+    {
+        if (pause_entries[row].command == openminerz::ui::MenuCommand::open_settings)
+            settings_row = row;
+        if (pause_entries[row].command == openminerz::ui::MenuCommand::open_achievements)
+            achievements_row = row;
+    }
+    expect(settings_row < pause_entries.size() && achievements_row < pause_entries.size(),
+           "the pause menu must offer settings and achievements");
+    for (const std::size_t row : {settings_row, achievements_row})
+    {
+        menu.open(openminerz::ui::MenuScreen::pause);
+        menu.set_selection(row, settings);
+        static_cast<void>(menu.activate(settings));
+        expect(menu.screen() != openminerz::ui::MenuScreen::pause && menu.pause_overlay_active(),
+               "a screen opened from the pause menu must stay a pause overlay");
+        expect(world_simulation_active(
+                   openminerz::classify_world_overlay(false, menu.pause_overlay_active(), false),
+                   true, false) &&
+                   !world_simulation_active(
+                       openminerz::classify_world_overlay(false, menu.pause_overlay_active(),
+                                                          false),
+                       false, false),
+               "a pause submenu must keep an online world running and a private one frozen");
+        static_cast<void>(menu.back());
+        expect(menu.screen() == openminerz::ui::MenuScreen::pause && menu.pause_overlay_active(),
+               "backing out of a pause submenu must return to the pause menu");
+    }
+    static_cast<void>(menu.back());
+    expect(menu.screen() == openminerz::ui::MenuScreen::world_preview &&
+               !menu.pause_overlay_active(),
+           "leaving the pause menu must return to the world view");
+    menu.open(openminerz::ui::MenuScreen::main);
+    for (std::size_t row{}; row < menu.entries().size(); ++row)
+        if (menu.entries()[row].command == openminerz::ui::MenuCommand::open_settings)
+            menu.set_selection(row, settings);
+    static_cast<void>(menu.activate(settings));
+    expect(menu.screen() == openminerz::ui::MenuScreen::settings && !menu.pause_overlay_active(),
+           "settings opened from the main menu must not count as a pause overlay");
+
+    // Nothing has to be registered: whatever screen is opened while the pause
+    // overlay is up inherits it and backs out to the pause menu, so a screen
+    // added to the pause menu later is covered without touching this logic.
+    using openminerz::ui::MenuScreen;
+    for (const MenuScreen screen : {MenuScreen::credits, MenuScreen::addons, MenuScreen::travel,
+                                    MenuScreen::multiplayer, MenuScreen::achievements})
+    {
+        menu.open(MenuScreen::pause);
+        menu.open(screen);
+        expect(menu.screen() == screen && menu.pause_overlay_active(),
+               "any screen reached from the pause menu must count as the pause overlay");
+        expect(world_simulation_active(
+                   openminerz::classify_world_overlay(false, menu.pause_overlay_active(), false),
+                   true, false),
+               "an online world must keep running behind any pause sub-screen");
+        static_cast<void>(menu.back());
+        expect(menu.screen() == MenuScreen::pause && menu.pause_overlay_active(),
+               "back from any pause sub-screen must return to the pause menu");
+    }
+    menu.open(MenuScreen::pause);
+    menu.open(MenuScreen::credits);
+    menu.open(MenuScreen::main);
+    expect(!menu.pause_overlay_active(), "leaving for the main menu must end the pause overlay");
+    menu.open(MenuScreen::credits);
+    expect(!menu.pause_overlay_active(),
+           "the same screen reached from the main menu is not a pause overlay");
+    static_cast<void>(menu.back());
+    expect(menu.screen() == MenuScreen::main, "a frontend screen must still back out to main");
+    menu.open(MenuScreen::pause);
+    menu.open(MenuScreen::credits);
+    menu.open(MenuScreen::world_preview);
+    expect(!menu.pause_overlay_active(), "returning to the world must end the pause overlay");
+}
+
+// InGameMenu, TeleportMenu, HostOptions and SelectPlayerScreen as the shipped
+// CastleMinerZ.exe 1.6.3.8 (Classic) and 1.9.9.8 (Modern) build and route them.
+void in_game_menu_matches_the_shipped_binaries()
+{
+    using openminerz::ui::InGameMenuFacts;
+    using openminerz::ui::MenuCommand;
+    using openminerz::ui::MenuEntry;
+    using openminerz::ui::MenuScreen;
+    const auto labels = [](const std::vector<MenuEntry> &entries) {
+        std::string joined;
+        for (const MenuEntry &entry : entries)
+        {
+            joined += entry.label;
+            joined += '|';
+        }
+        return joined;
+    };
+    const auto row_of = [](const std::vector<MenuEntry> &entries, MenuCommand command) {
+        std::size_t row{};
+        while (row < entries.size() && entries[row].command != command)
+            ++row;
+        return row;
+    };
+
+    InGameMenuFacts classic;
+    expect(labels(openminerz::ui::in_game_menu_entries(classic)) ==
+               "Return To Game|Inventory|Teleport|Controls|Settings|Achievements|Main Menu|",
+           "a private Classic game must list InGameMenu's rows in the original order");
+    InGameMenuFacts modern;
+    modern.modern = true;
+    expect(labels(openminerz::ui::in_game_menu_entries(modern)) ==
+               "Return To Game|Inventory|Teleport|Options|Achievements|Main Menu|",
+           "1.9.9.8 folds Controls and Settings into one Options row");
+
+    // Teleport exists only when GameMode != Endurance && Difficulty != HARDCORE.
+    for (const bool modern_profile : {false, true})
+    {
+        InGameMenuFacts facts;
+        facts.modern = modern_profile;
+        facts.endurance = true;
+        const auto endurance = openminerz::ui::in_game_menu_entries(facts);
+        facts.endurance = false;
+        facts.hardcore = true;
+        const auto hardcore = openminerz::ui::in_game_menu_entries(facts);
+        expect(row_of(endurance, MenuCommand::open_teleport) == endurance.size() &&
+                   row_of(hardcore, MenuCommand::open_teleport) == hardcore.size(),
+               "Endurance and Hardcore must not offer Teleport");
+    }
+
+    // Host Options: only the online session's host, just above Main Menu.
+    InGameMenuFacts guest = classic;
+    guest.online = true;
+    InGameMenuFacts host = guest;
+    host.host = true;
+    InGameMenuFacts offline_host = classic;
+    offline_host.host = true;
+    const auto host_rows = openminerz::ui::in_game_menu_entries(host);
+    expect(row_of(openminerz::ui::in_game_menu_entries(guest), MenuCommand::open_host_options) ==
+                   openminerz::ui::in_game_menu_entries(guest).size() &&
+               row_of(openminerz::ui::in_game_menu_entries(offline_host),
+                      MenuCommand::open_host_options) ==
+                   openminerz::ui::in_game_menu_entries(offline_host).size() &&
+               row_of(host_rows, MenuCommand::open_host_options) + 2U == host_rows.size() &&
+               host_rows.back().command == MenuCommand::return_to_main,
+           "Host Options belongs to the online host only and sits above Main Menu");
+
+    // TeleportMenu: Teleport To Player needs IsOnlineGame, and in 1.9.9.8 also
+    // PVPState == Off.
+    expect(labels(openminerz::ui::teleport_menu_entries(classic)) ==
+               "Return To Game|Teleport To Surface|Teleport To Start|" &&
+               labels(openminerz::ui::teleport_menu_entries(guest)) ==
+                   "Return To Game|Teleport To Surface|Teleport To Start|Teleport To Player|",
+           "Teleport To Player must appear exactly when the game is online");
+    InGameMenuFacts pvp_guest = guest;
+    pvp_guest.pvp = 1;
+    InGameMenuFacts modern_guest = guest;
+    modern_guest.modern = true;
+    InGameMenuFacts modern_pvp_guest = modern_guest;
+    modern_pvp_guest.pvp = 2;
+    expect(openminerz::ui::teleport_menu_entries(pvp_guest).size() == 4U &&
+               openminerz::ui::teleport_menu_entries(modern_guest).size() == 4U &&
+               openminerz::ui::teleport_menu_entries(modern_pvp_guest).size() == 3U,
+           "only 1.9.9.8 hides Teleport To Player while PVP is on");
+
+    // HostOptions, in the order the shipped constructor adds its rows: the
+    // PVP and join-policy rows name their state; Clear Ban List needs a ban.
+    expect(labels(openminerz::ui::host_options_entries(host)) ==
+               "Return To Game|Kick Player|Ban Player|Restart|PVP: Off|Set Password|"
+               "Server Message|Who can join: Anyone|",
+           "HostOptions must list its rows in the original order");
+    InGameMenuFacts banning_host = host;
+    banning_host.pvp = 2;
+    banning_host.ban_list_empty = false;
+    banning_host.join_policy = 2;
+    expect(labels(openminerz::ui::host_options_entries(banning_host)) ==
+               "Return To Game|Kick Player|Ban Player|Restart|PVP: Non-Friends Only|"
+               "Set Password|Server Message|Clear Ban List|Who can join: Invited Friends|" &&
+               openminerz::ui::pvp_state_text(1) == "PVP: Everyone" &&
+               openminerz::ui::join_policy_text(1) == "Who can join: Friends Only",
+           "the PVP row, Clear Ban List and the join policy must follow the session");
+    // Set Password, Server Message and Who can join act in place, like PVP.
+    {
+        openminerz::Settings row_settings;
+        openminerz::ui::MenuModel host_menu;
+        host_menu.set_in_game_facts(host);
+        host_menu.open(MenuScreen::host_options);
+        for (const MenuCommand in_place :
+             {MenuCommand::host_set_password, MenuCommand::host_server_message,
+              MenuCommand::host_cycle_join_policy})
+        {
+            host_menu.set_selection(row_of(host_menu.entries(), in_place), row_settings);
+            expect(host_menu.activate(row_settings).command == in_place &&
+                       host_menu.screen() == MenuScreen::host_options,
+                   "a lobby row of HostOptions must act without leaving the screen");
+        }
+    }
+
+    // Routing. TeleportMenu's first row pops it and InGameMenu with it;
+    // Escape pops one screen.
+    openminerz::Settings settings;
+    openminerz::ui::MenuModel menu;
+    menu.set_in_game_facts(host);
+    menu.open(MenuScreen::pause);
+    menu.set_selection(row_of(menu.entries(), MenuCommand::open_teleport), settings);
+    expect(menu.activate(settings).command == MenuCommand::open_teleport &&
+               menu.screen() == MenuScreen::teleport && menu.pause_overlay_active(),
+           "Teleport must push the teleport menu on the in-game menu");
+    static_cast<void>(menu.back());
+    expect(menu.screen() == MenuScreen::pause, "Escape in the teleport menu must pop one screen");
+    menu.open(MenuScreen::teleport);
+    menu.set_selection(0U, settings);
+    expect(menu.activate(settings).command == MenuCommand::resume_game &&
+               menu.screen() == MenuScreen::world_preview && !menu.pause_overlay_active(),
+           "the teleport menu's Return To Game must land in the world");
+    for (const MenuCommand choice : {MenuCommand::teleport_surface, MenuCommand::teleport_start})
+    {
+        menu.open(MenuScreen::pause);
+        menu.open(MenuScreen::teleport);
+        menu.set_selection(row_of(menu.entries(), choice), settings);
+        expect(menu.activate(settings).command == choice &&
+                   menu.screen() == MenuScreen::world_preview,
+               "a surface or start teleport must close both menus");
+    }
+
+    // SelectPlayerScreen: rows are the app's; leaving a teleport pick lands in
+    // the world, leaving a kick or ban pick lands back in HostOptions.
+    menu.open(MenuScreen::pause);
+    menu.open(MenuScreen::teleport);
+    menu.set_selection(row_of(menu.entries(), MenuCommand::teleport_to_player), settings);
+    expect(menu.activate(settings).command == MenuCommand::teleport_to_player &&
+               menu.screen() == MenuScreen::select_player && menu.pause_overlay_active(),
+           "Teleport To Player must open the player list as a pause overlay");
+    expect(menu.entries().empty() && menu.activate(settings).command == MenuCommand::none,
+           "an empty player list must not act");
+    menu.set_player_entries({{"Alice", {}, MenuCommand::choose_player, true, {}},
+                             {"Bob", {}, MenuCommand::choose_player, true, {}},
+                             {"Carol", {}, MenuCommand::choose_player, true, {}}});
+    menu.set_selection(2U, settings);
+    const openminerz::ui::MenuEvent picked = menu.activate(settings);
+    expect(picked.command == MenuCommand::choose_player && !picked.screen_changed &&
+               menu.selection() == 2U,
+           "picking a player must hand the row to the app without moving");
+    menu.set_player_entries({{"Alice", {}, MenuCommand::choose_player, true, {}}});
+    expect(menu.selection() == 0U, "a shrinking roster must not leave the cursor off the list");
+    const openminerz::ui::MenuEvent cancelled = menu.back();
+    expect(cancelled.command == MenuCommand::resume_game &&
+               menu.screen() == MenuScreen::world_preview,
+           "cancelling a teleport pick must return to the game, as the original does");
+
+    for (const MenuCommand removal : {MenuCommand::host_kick_player, MenuCommand::host_ban_player})
+    {
+        menu.open(MenuScreen::pause);
+        menu.set_selection(row_of(menu.entries(), MenuCommand::open_host_options), settings);
+        expect(menu.activate(settings).command == MenuCommand::open_host_options &&
+                   menu.screen() == MenuScreen::host_options,
+               "Host Options must open from the in-game menu");
+        menu.set_selection(row_of(menu.entries(), removal), settings);
+        expect(menu.activate(settings).command == removal &&
+                   menu.screen() == MenuScreen::select_player,
+               "Kick Player and Ban Player must open the player list");
+        expect(menu.back().command == MenuCommand::back &&
+                   menu.screen() == MenuScreen::host_options && menu.pause_overlay_active(),
+               "cancelling a kick or ban pick must return to Host Options");
+    }
+    // HostOptions' own Return To Game pops one screen; Restart and PVP act in place.
+    menu.set_selection(0U, settings);
+    static_cast<void>(menu.activate(settings));
+    expect(menu.screen() == MenuScreen::pause,
+           "HostOptions' first row must return to the in-game menu");
+    menu.open(MenuScreen::host_options);
+    for (const MenuCommand in_place : {MenuCommand::host_restart, MenuCommand::host_cycle_pvp})
+    {
+        menu.set_selection(row_of(menu.entries(), in_place), settings);
+        const openminerz::ui::MenuEvent event = menu.activate(settings);
+        expect(event.command == in_place && !event.screen_changed &&
+                   menu.screen() == MenuScreen::host_options,
+               "Restart and PVP must act without leaving Host Options");
+    }
+
+    // A row appearing or vanishing must not slide another command under the
+    // cursor: the selection follows its command.
+    menu.set_in_game_facts(host);
+    menu.open(MenuScreen::host_options);
+    menu.set_selection(row_of(menu.entries(), MenuCommand::host_cycle_pvp), settings);
+    menu.set_in_game_facts(banning_host);
+    expect(menu.entries()[menu.selection()].command == MenuCommand::host_cycle_pvp &&
+               menu.entries()[menu.selection()].label == "PVP: Non-Friends Only",
+           "the cursor must stay on the PVP row while its text changes");
+    menu.open(MenuScreen::pause);
+    menu.set_selection(row_of(menu.entries(), MenuCommand::return_to_main), settings);
+    menu.set_in_game_facts(guest);
+    expect(menu.entries()[menu.selection()].command == MenuCommand::return_to_main,
+           "losing Host Options must not move the cursor off Main Menu");
+    menu.set_selection(row_of(menu.entries(), MenuCommand::open_teleport), settings);
+    InGameMenuFacts hardcore_guest = guest;
+    hardcore_guest.hardcore = true;
+    menu.set_in_game_facts(hardcore_guest);
+    expect(menu.selection() < menu.entries().size(),
+           "a vanished row must leave the cursor on a real row");
+
+    // 1.6.3.8's Controls row lands on the controls page and backs out to the menu.
+    menu.set_in_game_facts(classic);
+    menu.open(MenuScreen::pause);
+    menu.set_selection(row_of(menu.entries(), MenuCommand::open_controls), settings);
+    static_cast<void>(menu.activate(settings));
+    expect(menu.screen() == MenuScreen::settings &&
+               menu.settings_tab() == openminerz::ui::SettingsTab::controls &&
+               menu.pause_overlay_active(),
+           "Controls must open the controls page as a pause overlay");
+    static_cast<void>(menu.back());
+    expect(menu.screen() == MenuScreen::pause, "Controls must back out to the in-game menu");
+}
+
+// InGameHUD.OnLostFocus clears every control when another screen is pushed and
+// the screen above swallows input, while the scene (online) keeps updating.
+void released_controls_stop_input_but_not_physics()
+{
+    using openminerz::WorldOverlay;
+    using openminerz::local_player_controls_enabled;
+    using openminerz::local_player_movement_enabled;
+
+    expect(local_player_controls_enabled(WorldOverlay::none, false, false, false, false),
+           "a ready first-person view owns the controls");
+    for (const WorldOverlay overlay :
+         {WorldOverlay::pause_menu, WorldOverlay::dialog, WorldOverlay::frontend})
+        expect(!local_player_controls_enabled(overlay, false, false, false, false),
+               "no overlay may leave movement, look or actions connected");
+    expect(!local_player_controls_enabled(WorldOverlay::none, true, false, false, false) &&
+               !local_player_controls_enabled(WorldOverlay::none, false, true, false, false) &&
+               !local_player_controls_enabled(WorldOverlay::none, false, false, true, false) &&
+               !local_player_controls_enabled(WorldOverlay::none, false, false, false, true),
+           "loading, the inspector, the inventory and text entry each release the controls");
+    expect(local_player_movement_enabled(true, true) && !local_player_movement_enabled(true, false) &&
+               !local_player_movement_enabled(false, true) &&
+               !local_player_movement_enabled(false, false),
+           "a dead player is simulated but never moved by input");
+    expect(openminerz::pointer_capture_allowed(WorldOverlay::none) &&
+               !openminerz::pointer_capture_allowed(WorldOverlay::pause_menu) &&
+               !openminerz::pointer_capture_allowed(WorldOverlay::dialog) &&
+               !openminerz::pointer_capture_allowed(WorldOverlay::frontend),
+           "only the first-person view may capture the pointer");
+    expect(openminerz::local_controls_released(true, false) &&
+               !openminerz::local_controls_released(true, true) &&
+               !openminerz::local_controls_released(false, false) &&
+               !openminerz::local_controls_released(false, true),
+           "held actions end on exactly the frame the controls are taken away");
+
+    // A key that was down while the controls were away must be let go first.
+    openminerz::HeldInputLatch latch;
+    expect(latch.filter(true) && !latch.filter(false) && !latch.armed(),
+           "an unarmed latch must pass the input through");
+    latch.arm();
+    expect(!latch.filter(true) && !latch.filter(true) && latch.armed(),
+           "a key held across a menu must not act while it stays down");
+    expect(!latch.filter(false) && !latch.armed() && latch.filter(true),
+           "releasing the key re-enables it");
+    latch.arm();
+    latch.arm();
+    expect(!latch.filter(false) && latch.filter(true),
+           "re-arming every frame the controls are away must stay a single release");
+
+    // The simulation side of the same contract: an empty input stops the walk
+    // on the next tick, the body still falls and still lands.
+    openminerz::world::WorldRegion world{0, 0, 1, 1};
+    for (int z = 0; z < openminerz::world::chunk_depth; ++z)
+        for (int x = 0; x < openminerz::world::chunk_width; ++x)
+            world.set_block(x, 0, z, openminerz::world::BlockType::rock);
+    openminerz::world::PlayerSimulation player;
+    player.spawn(world, 8, 8);
+    for (int tick = 0; tick < 30; ++tick)
+        player.update(world, {}, 1.0F / 60.0F, false);
+    openminerz::world::PlayerInput held;
+    held.forward = 1.0F;
+    held.strafe = 1.0F;
+    for (int tick = 0; tick < 20; ++tick)
+        player.update(world, held, 1.0F / 60.0F, false);
+    expect(std::hypot(player.state().velocity.x, player.state().velocity.z) > 1.0F,
+           "the fixture must be walking before the controls are released");
+    const openminerz::world::Vec3 released_at = player.state().position;
+    player.update(world, {}, 1.0F / 60.0F, false);
+    expect(near(player.state().velocity.x, 0.0F) && near(player.state().velocity.z, 0.0F),
+           "released controls must stop horizontal motion on the next tick");
+    for (int tick = 0; tick < 120; ++tick)
+        player.update(world, {}, 1.0F / 60.0F, false);
+    expect(near(player.state().position.x, released_at.x, 0.001F) &&
+               near(player.state().position.z, released_at.z, 0.001F) && player.state().grounded,
+           "a player whose controls are released must stay put on the ground");
+    player.state().position.y += 6.0F;
+    player.state().grounded = false;
+    const float drop_start = player.state().position.y;
+    player.update(world, {}, 1.0F / 60.0F, false);
+    player.update(world, {}, 1.0F / 60.0F, false);
+    expect(player.state().position.y < drop_start && player.state().velocity.y < 0.0F,
+           "a player behind a menu must keep obeying gravity");
+    for (int tick = 0; tick < 240; ++tick)
+        player.update(world, {}, 1.0F / 60.0F, false);
+    expect(player.state().grounded && near(player.state().position.y, 1.001F, 0.01F) &&
+               near(player.state().velocity.y, 0.0F),
+           "a falling player behind a menu must still land and come to rest");
+
+    // The press that selects "Resume" (Space or pad A) is still down when the
+    // world gets its controls back. Without the latch the simulation sees a
+    // fresh jump edge; with it nothing happens until the key is released.
+    const auto resume_with_jump_held = [&](bool latched) {
+        openminerz::world::PlayerSimulation resumed;
+        resumed.spawn(world, 8, 8);
+        for (int tick = 0; tick < 30; ++tick)
+            resumed.update(world, {}, 1.0F / 60.0F, false);
+        openminerz::HeldInputLatch jump_latch;
+        if (latched)
+            jump_latch.arm();
+        float highest = resumed.state().position.y;
+        for (int tick = 0; tick < 30; ++tick)
+        {
+            openminerz::world::PlayerInput input;
+            input.jump = jump_latch.filter(true);
+            resumed.update(world, input, 1.0F / 60.0F, false);
+            highest = std::max(highest, resumed.state().position.y);
+        }
+        return highest;
+    };
+    expect(resume_with_jump_held(false) > 1.5F && near(resume_with_jump_held(true), 1.001F, 0.01F),
+           "a jump key held across the menu must not jump on resume");
+}
+
+// Nothing may bank wall-clock time while the game is frozen or the thread is
+// blocked and then spend it in a burst.
+void frozen_or_stalled_time_never_fast_forwards()
+{
+    using openminerz::WorldOverlay;
+    using openminerz::bounded_update_delta;
+    using openminerz::maximum_update_delta_seconds;
+
+    expect(near(bounded_update_delta(1.0 / 60.0), 1.0F / 60.0F, 0.00001F) &&
+               near(bounded_update_delta(0.004), 0.004F, 0.00001F),
+           "an ordinary frame must simulate exactly its own duration");
+    expect(bounded_update_delta(0.0) == 0.0F && bounded_update_delta(-5.0) == 0.0F &&
+               bounded_update_delta(std::numeric_limits<double>::quiet_NaN()) == 0.0F,
+           "a zero, negative or invalid interval must simulate nothing");
+    expect(bounded_update_delta(0.05) == maximum_update_delta_seconds &&
+               bounded_update_delta(3600.0) == maximum_update_delta_seconds &&
+               bounded_update_delta(std::numeric_limits<double>::infinity()) ==
+                   maximum_update_delta_seconds,
+           "a stall of any length must cost at most one bounded update");
+
+    // The frame loop reduced to its policy: wall time passes every frame, but
+    // game time only accrues on frames the contract says simulate, and only by
+    // the bounded delta. Same 60 Hz fixed step and accumulator cap as the game.
+    struct Clocks final
+    {
+        double world_seconds{};
+        float accumulator{};
+        int fixed_ticks{};
+        int largest_tick_burst{};
+    };
+    const auto run_frame = [](Clocks &clocks, WorldOverlay overlay, bool online,
+                              double wall_seconds) {
+        if (!openminerz::world_simulation_active(overlay, online, false))
+            return;
+        const float delta = bounded_update_delta(wall_seconds);
+        clocks.world_seconds += static_cast<double>(delta);
+        clocks.accumulator = std::min(clocks.accumulator + delta, 0.25F);
+        int burst{};
+        while (clocks.accumulator >= 1.0F / 60.0F)
+        {
+            clocks.accumulator -= 1.0F / 60.0F;
+            ++burst;
+        }
+        clocks.fixed_ticks += burst;
+        clocks.largest_tick_burst = std::max(clocks.largest_tick_burst, burst);
+    };
+
+    // A private game paused for an hour, shown at 60 Hz, then resumed after one
+    // extra 30-second hitch (the resume frame itself is late).
+    Clocks offline;
+    for (int frame = 0; frame < 600; ++frame)
+        run_frame(offline, WorldOverlay::none, false, 1.0 / 60.0);
+    const Clocks before_pause = offline;
+    for (int frame = 0; frame < 60 * 3600; ++frame)
+        run_frame(offline, WorldOverlay::pause_menu, false, 1.0 / 60.0);
+    expect(offline.world_seconds == before_pause.world_seconds &&
+               offline.fixed_ticks == before_pause.fixed_ticks &&
+               offline.accumulator == before_pause.accumulator,
+           "an hour in the pause menu must not move a private world at all");
+    run_frame(offline, WorldOverlay::none, false, 30.0);
+    expect(offline.world_seconds - before_pause.world_seconds <=
+                   static_cast<double>(maximum_update_delta_seconds) + 1e-9 &&
+               offline.fixed_ticks - before_pause.fixed_ticks <= 4,
+           "resuming must not replay the time spent paused or stalled");
+    for (int frame = 0; frame < 600; ++frame)
+        run_frame(offline, WorldOverlay::none, false, 1.0 / 60.0);
+    expect(offline.largest_tick_burst <= 4,
+           "no frame around a pause may run a burst of catch-up ticks");
+
+    // The same hour online: the world never stops, and never bursts either.
+    Clocks online;
+    for (int frame = 0; frame < 60 * 60; ++frame)
+        run_frame(online, WorldOverlay::pause_menu, true, 1.0 / 60.0);
+    expect(near(static_cast<float>(online.world_seconds), 60.0F, 0.05F) &&
+               std::abs(online.fixed_ticks - 3600) <= 2 && online.largest_tick_burst <= 2,
+           "an online world behind the pause menu must keep real time, tick for tick");
+    // A host whose window was blocked for ten seconds loses that time instead
+    // of replaying it at its guests.
+    const Clocks before_stall = online;
+    run_frame(online, WorldOverlay::pause_menu, true, 10.0);
+    expect(online.world_seconds - before_stall.world_seconds <=
+                   static_cast<double>(maximum_update_delta_seconds) + 1e-9 &&
+               online.fixed_ticks - before_stall.fixed_ticks <= 4,
+           "a blocked main thread must not fast-forward the world afterwards");
+
+    // Frames ticked from inside the Windows modal move/size loop. The modal
+    // timer is always a frame; a move or size event is one only once the frame
+    // loop has visibly stalled, so ordinary polling never doubles a frame.
+    using openminerz::StalledLoopSignal;
+    using openminerz::stalled_loop_frame_due;
+    expect(stalled_loop_frame_due(StalledLoopSignal::modal_timer, 1.0 / 64.0) &&
+               stalled_loop_frame_due(StalledLoopSignal::modal_timer, 2.0) &&
+               !stalled_loop_frame_due(StalledLoopSignal::modal_timer, 0.0005),
+           "the modal timer must drive frames without spinning");
+    expect(!stalled_loop_frame_due(StalledLoopSignal::window_changed, 1.0 / 240.0) &&
+               !stalled_loop_frame_due(StalledLoopSignal::window_changed, 1.0 / 60.0) &&
+               !stalled_loop_frame_due(StalledLoopSignal::window_changed, 1.0 / 30.0) &&
+               stalled_loop_frame_due(StalledLoopSignal::window_changed, 0.05) &&
+               stalled_loop_frame_due(StalledLoopSignal::window_changed, 3.0),
+           "a move or size event must tick a frame only when the frame loop has stalled");
+
+    // A host dragging its window for ten seconds. Each tick pays what it owes
+    // in bounded updates, capped per tick: real time is kept while ticks keep
+    // coming, and a starved loop loses time rather than bursting.
+    const auto dragged_seconds = [](double tick_interval, int &largest_update_burst) {
+        double simulated{};
+        largest_update_burst = 0;
+        for (double wall = tick_interval; wall <= 10.0 + 1e-9; wall += tick_interval)
+        {
+            double owed = std::min(openminerz::maximum_stalled_frame_debt_seconds, tick_interval);
+            int updates{};
+            do
+            {
+                const float delta = bounded_update_delta(owed);
+                owed -= static_cast<double>(delta);
+                simulated += static_cast<double>(delta);
+            } while (++updates < 5 && owed > 0.001);
+            largest_update_burst = std::max(largest_update_burst, updates);
+        }
+        return simulated;
+    };
+    int burst{};
+    expect(near(static_cast<float>(dragged_seconds(1.0 / 64.0, burst)), 10.0F, 0.05F) && burst == 1,
+           "timer-driven modal frames must keep an online world in real time");
+    expect(near(static_cast<float>(dragged_seconds(0.05, burst)), 10.0F, 0.05F) && burst <= 2 &&
+               near(static_cast<float>(dragged_seconds(0.2, burst)), 10.0F, 0.05F) && burst <= 5,
+           "event-driven modal frames must still keep real time during a busy drag");
+    expect(near(static_cast<float>(dragged_seconds(1.0, burst)), 2.5F, 0.01F) && burst == 5,
+           "a starved modal loop must lose time instead of replaying it");
+}
+
 void biome_atmospheres_are_distinct_bounded_and_reversible()
 {
     using namespace openminerz::world;
@@ -126,31 +745,94 @@ void biome_atmospheres_are_distinct_bounded_and_reversible()
     const BiomeAtmosphere arctic = biome_atmosphere(BiomeKind::arctic);
     const BiomeAtmosphere lagoon = biome_atmosphere(BiomeKind::lagoon);
 
-    expect(classic.storminess == 1.0F && classic.saturation < 0.9F &&
-               classic.fog_start_ratio < 0.40F && classic.grade_strength > 0.0F,
+    expect(classic.storminess == 1.0F && classic.saturation < 1.0F &&
+               classic.fog_start_ratio >= 0.60F && classic.grade_strength > 0.0F,
            "the origin biome must retain its cool foggy storm identity through daylight");
     expect(desert.fog_target.red > desert.fog_target.blue &&
                desert.grade_multiplier.red > desert.grade_multiplier.blue &&
-               desert.fog_start_ratio < classic.fog_start_ratio,
-           "desert air must be warmer and begin farther from the streaming edge");
+               desert.fog_start_ratio > classic.fog_start_ratio,
+           "desert air must be warmer while leaving more of the nearby terrain clear");
     expect(arctic.fog_target.blue > arctic.fog_target.red &&
                arctic.grade_multiplier.blue > arctic.grade_multiplier.red &&
                arctic.saturation < 1.0F,
            "arctic air must be colder and more desaturated than neutral presentation");
     expect(lagoon.grade_multiplier.blue > lagoon.grade_multiplier.red &&
-               lagoon.fog_start_ratio > desert.fog_start_ratio &&
+               lagoon.fog_start_ratio < desert.fog_start_ratio &&
                lagoon.storminess < classic.storminess && lagoon.storminess > desert.storminess,
-           "humid lagoon haze must remain distinct from the denser desert dust curtain");
+           "humid lagoon haze must begin earlier than dry desert haze");
     for (BiomeKind biome : {BiomeKind::classic, BiomeKind::lagoon, BiomeKind::desert,
                             BiomeKind::mountain, BiomeKind::arctic, BiomeKind::descent})
     {
         const BiomeAtmosphere atmosphere = biome_atmosphere(biome);
-        expect(atmosphere.fog_start_ratio >= 0.30F && atmosphere.fog_start_ratio <= 0.55F &&
-                   atmosphere.grade_strength >= 0.0F && atmosphere.grade_strength <= 0.30F &&
-                   atmosphere.saturation >= 0.75F && atmosphere.saturation <= 1.0F &&
+        expect(atmosphere.fog_start_ratio >= 0.60F && atmosphere.fog_start_ratio <= 0.80F &&
+                   atmosphere.grade_strength >= 0.0F && atmosphere.grade_strength <= 0.15F &&
+                   atmosphere.saturation >= 0.90F && atmosphere.saturation <= 1.0F &&
                    atmosphere.storminess >= 0.0F && atmosphere.storminess <= 1.0F,
                "biome fog and grading must stay inside the restrained authored envelope");
     }
+}
+
+void atmosphere_transitions_follow_world_and_sun()
+{
+    using namespace openminerz::world;
+    for (const float boundary : {200.0F, 300.0F, 900.0F, 1000.0F, 1600.0F, 1700.0F, 2300.0F,
+                                 2400.0F, 2900.0F, 3000.0F, 4400.0F, 8800.0F})
+    {
+        const auto a = biome_atmosphere_at(boundary - 0.01F, 0.0F);
+        const auto b = biome_atmosphere_at(boundary + 0.01F, 0.0F);
+        expect(std::abs(a.storminess - b.storminess) < 0.001F &&
+                   std::abs(a.fog_target.red - b.fog_target.red) < 0.001F,
+               "biome colours and clouds must be continuous at every radial boundary");
+    }
+    const auto middle = biome_atmosphere_at(250.0F, 0.0F);
+    expect(near(middle.storminess, 0.69F) &&
+               near(middle.storminess, biome_atmosphere_at(0.0F, -8550.0F).storminess),
+           "the transition midpoint must blend both biomes and repeat in mirrored bands");
+    for (const auto biome : {BiomeKind::classic, BiomeKind::lagoon, BiomeKind::desert,
+                             BiomeKind::mountain, BiomeKind::arctic, BiomeKind::descent})
+    {
+        auto sky = DayNightCycle{0.0F}.state(SkyModel::rebirth);
+        apply_biome_atmosphere(sky, biome_atmosphere(biome));
+        expect(sky.fog.red < 0.06F && sky.fog.green < 0.06F && sky.fog.blue < 0.07F &&
+                   near(sky.direct.red, 0.0F),
+               "night air must not emit daylight colour or restore a below-horizon sun");
+    }
+    const auto weights = [](float time) {
+        const auto blend = rebirth_sky_blend(time);
+        std::array<float, 4> result{};
+        result[static_cast<std::size_t>(blend.first)] += 1.0F - blend.amount;
+        result[static_cast<std::size_t>(blend.second)] += blend.amount;
+        return result;
+    };
+    for (int minute = 0; minute <= 1440; ++minute)
+    {
+        const float time = static_cast<float>(minute) / 1440.0F;
+        const auto previous = weights(time - 0.00001F);
+        const auto next = weights(time + 0.00001F);
+        for (std::size_t i = 0; i < previous.size(); ++i)
+            expect(
+                std::abs(previous[i] - next[i]) < 0.001F,
+                "sky cube blending must remain continuous through the full day and midnight wrap");
+    }
+    expect(weights(0.5F)[static_cast<std::size_t>(SkyTexture::day)] > 0.99F &&
+               weights(0.0F)[static_cast<std::size_t>(SkyTexture::night)] > 0.99F &&
+               weights(0.75F)[static_cast<std::size_t>(SkyTexture::sunset)] > 0.9F,
+           "sky textures must agree with noon, midnight and the actual sunset");
+
+    for (const float aspect : {4.0F / 3.0F, 16.0F / 9.0F, 32.0F / 9.0F})
+        for (const float fov : {50.0F, 73.0F, 105.0F})
+        {
+            const float ty = std::tan(fov * 3.14159265358979323846F / 360.0F);
+            const float tx = ty * aspect;
+            const auto slice = shadow_slice(0.1F, 16.0F, 48.0F, tx, ty);
+            expect(slice.near_depth <= 16.0F - (16.0F - 0.1F) * 0.14F + 0.001F,
+                   "the second shadow map must include the first map's entire blend interval");
+            for (const float depth : {slice.near_depth, slice.far_depth})
+                expect(depth * depth * (tx * tx + ty * ty) +
+                               (depth - slice.center_depth) * (depth - slice.center_depth) <=
+                           slice.radius * slice.radius + 0.001F,
+                       "stable cascade sphere must contain all frustum corners at every FOV");
+        }
 }
 
 void dynamic_radiance_is_world_anchored_colored_and_occlusion_safe()
@@ -248,6 +930,19 @@ void canvas_normalizes_resolutions_and_fonts()
     expect(hd.font_pixels(24.0F) == 24 && uhd.font_pixels(24.0F) == 48,
            "font pixels must track real output density");
     expect(ultrawide.safe.width > 3000.0F, "safe area must preserve ultrawide horizontal space");
+    for (const auto size : {std::pair{960, 540}, std::pair{1024, 768}, std::pair{1280, 720},
+                            std::pair{1920, 1080}, std::pair{3440, 1440}, std::pair{3840, 2160}})
+        for (float scale : {0.75F, 1.0F, 1.5F})
+            for (float safe : {0.8F, 0.96F, 1.0F})
+            {
+                const auto fitted =
+                    openminerz::ui::DesignCanvas::compute(size.first, size.second, scale, safe);
+                expect(fitted.scale * 1650.0F <= fitted.safe.width + 0.01F &&
+                           fitted.scale * 920.0F <= fitted.safe.height + 0.01F,
+                       "large interface preferences must fit complete menus inside screen margins");
+                expect(fitted.font_pixels(9.0F) >= 12 && near(fitted.scale, fitted.density),
+                       "text stays readable and uses the same scale as its containers");
+            }
 }
 
 void settings_clamp_and_round_trip()
@@ -259,7 +954,8 @@ void settings_clamp_and_round_trip()
     settings.creative_flight_speed = 100.0F;
     settings.normalize();
     expect(near(settings.ui_scale, 1.5F), "UI scale must clamp high values");
-    expect(near(settings.vertical_fov, 50.0F), "vertical FOV must clamp low values");
+    expect(near(settings.vertical_fov, 36.0F),
+           "vertical FOV must clamp low values (36 degrees: 60 across a 16:9 display)");
     expect(near(settings.master_volume, 0.0F), "volume must clamp low values");
     expect(near(settings.creative_flight_speed, 32.0F),
            "Creative flight speed must clamp unsafe high values");
@@ -323,8 +1019,66 @@ void advanced_settings_have_live_adjustments()
            "Creative flight speed must expose a readable live slider");
     expect(openminerz::ui::rows_for_tab(openminerz::ui::SettingsTab::graphics).size() >= 8U,
            "graphics settings must expose the advanced control surface");
-    expect(openminerz::ui::rows_for_tab(openminerz::ui::SettingsTab::accessibility).size() >= 5U,
+    expect(openminerz::ui::rows_for_tab(openminerz::ui::SettingsTab::accessibility).size() >= 3U,
            "accessibility must be a first-class category");
+}
+
+void ui_preferences_survive_restart_and_legacy_settings()
+{
+    using namespace openminerz;
+    const auto path = std::filesystem::temp_directory_path() / "openminerz-ui-settings-test.cfg";
+    SettingsStore store{path};
+    {
+        std::ofstream legacy{path};
+        legacy << "hud_visible=0\nsubtitles=0\nui_scale=1.2\n";
+    }
+    Settings settings = store.load();
+    expect(!settings.hud_visible && !settings.subtitles && !settings.hud_debug &&
+               !settings.hud_coordinates && !settings.hud_server && settings.hud_compass &&
+               settings.ui_style == UiStyle::remastered,
+           "old settings must preserve existing choices, keep the diagnostics off and load as "
+           "the Remastered interface with its compass, which is what such a file always showed");
+    const auto &rows = ui::rows_for_tab(ui::SettingsTab::interface);
+    for (const auto &row : rows)
+        if (row.kind == ui::SettingKind::toggle)
+            ui::adjust_setting(settings, row.id, 1);
+    for (const auto style :
+         {VitalsStyle::classic, VitalsStyle::modern, VitalsStyle::remastered, VitalsStyle::none})
+    {
+        settings.vitals_style = style;
+        store.save(settings);
+        const auto restored = store.load();
+        for (const auto &row : rows)
+            expect(ui::setting_value(restored, row.id) == ui::setting_value(settings, row.id),
+                   "each UI control must persist independently across restart");
+    }
+    const auto chosen_style = settings.vitals_style;
+    ui::adjust_setting(settings, ui::SettingId::hud_visible, 1);
+    ui::adjust_setting(settings, ui::SettingId::hud_visible, 1);
+    expect(settings.vitals_style == chosen_style && settings.hud_debug,
+           "the master switch must retain individual HUD preferences");
+    {
+        std::ofstream invalid{path};
+        invalid << "vitals_style=unknown\nhud_debug=invalid\n";
+    }
+    const auto fallback = store.load();
+    expect(fallback.vitals_style == VitalsStyle::remastered && !fallback.hud_debug,
+           "unrecognized settings must use safe defaults");
+    ui::SettingsTab tab = ui::SettingsTab::display;
+    std::set<ui::SettingsTab> visited;
+    const std::size_t tab_count = ui::all_tabs().size();
+    for (std::size_t index = 0; index < tab_count; ++index)
+    {
+        visited.insert(tab);
+        tab = ui::next_tab(tab, 1);
+    }
+    expect(visited.contains(ui::SettingsTab::interface) && visited.size() == tab_count &&
+               tab == ui::SettingsTab::display &&
+               ui::next_tab(ui::SettingsTab::display, -1) == ui::all_tabs().back() &&
+               ui::all_tabs().back() == ui::SettingsTab::enhancements,
+           "keyboard tab navigation must reach UI and wrap in both directions, with the "
+           "not-in-the-original page last");
+    std::filesystem::remove(path);
 }
 
 void main_menu_routes_without_scrolling_or_dead_actions()
@@ -332,12 +1086,16 @@ void main_menu_routes_without_scrolling_or_dead_actions()
     openminerz::Settings settings;
     openminerz::ui::MenuModel menu;
     expect(menu.screen() == openminerz::ui::MenuScreen::main && menu.selection() == 0U &&
-               menu.entries().size() == 6U,
+               menu.entries().size() == 7U,
            "main menu must start on a playable action and keep every option visible");
     auto event = menu.activate(settings);
     expect(event.command == openminerz::ui::MenuCommand::play_offline &&
+               menu.screen() == openminerz::ui::MenuScreen::game_profile,
+           "solo activation must choose Classic or Modern before its game mode");
+    event = menu.activate(settings);
+    expect(event.command == openminerz::ui::MenuCommand::select_profile_classic &&
                menu.screen() == openminerz::ui::MenuScreen::game_mode,
-           "solo activation must open the game-mode screen first");
+           "Classic selection must open its game modes");
     // Original flow: Survival -> difficulty screen with the cursor on NORMAL;
     // picking a difficulty starts the world.
     menu.set_selection(1U, settings);
@@ -373,6 +1131,175 @@ void main_menu_routes_without_scrolling_or_dead_actions()
     expect(event.command == openminerz::ui::MenuCommand::back &&
                menu.screen() == openminerz::ui::MenuScreen::main,
            "modal back must return to the main menu");
+}
+
+// The front end's rows are worded and cased as CastleMiner Z's own menus are
+// wherever it has the same entry. The game-mode and difficulty names are
+// checked against the table generated from the shipped Strings resource.
+void menu_rows_are_worded_as_the_shipped_menus_are()
+{
+    using openminerz::GameDifficulty;
+    using openminerz::GameMode;
+    using openminerz::RetailGeneration;
+    using openminerz::RetailString;
+    using openminerz::ui::MenuEntry;
+    using openminerz::ui::MenuModel;
+    using openminerz::ui::MenuScreen;
+    const auto labels = [](const std::vector<MenuEntry> &entries) {
+        std::string joined;
+        for (const MenuEntry &entry : entries)
+        {
+            joined += entry.label;
+            joined += '|';
+        }
+        return joined;
+    };
+    MenuModel menu;
+    expect(labels(menu.entries()) == "Play Offline|Multiplayer|Add-Ons|Options|Awards|Credits|Exit|",
+           "the title screen must use the originals' words for the rows they have");
+    menu.open(MenuScreen::multiplayer);
+    expect(labels(menu.entries()) == "Host Online|Join Online|Back|",
+           "hosting and joining must be named as MainMenu names them");
+    for (const RetailGeneration generation : {RetailGeneration::classic, RetailGeneration::modern})
+    {
+        using openminerz::retail_text;
+        expect(retail_text(RetailString::Play_Offline, generation) == "Play Offline" &&
+                   retail_text(RetailString::Host_Online, generation) == "Host Online" &&
+                   retail_text(RetailString::Join_Online, generation) == "Join Online" &&
+                   retail_text(RetailString::Options, generation) == "Options" &&
+                   retail_text(RetailString::Awards, generation) == "Awards" &&
+                   retail_text(RetailString::Exit, generation) == "Exit" &&
+                   retail_text(RetailString::Back, generation) == "Back",
+               "those words are the shipped Strings resource's");
+        const bool modern = generation == RetailGeneration::modern;
+        menu.set_gameplay_profile(modern, true);
+        menu.open(MenuScreen::game_mode);
+        std::string modes;
+        for (const GameMode mode : {GameMode::endurance, GameMode::survival,
+                                    GameMode::dragon_endurance, GameMode::creative})
+            modes += std::string{openminerz::retail_game_mode_name(mode, generation)} + '|';
+        if (modern)
+            for (const GameMode mode : {GameMode::exploration, GameMode::scavenger})
+                modes += std::string{openminerz::retail_game_mode_name(mode, generation)} + '|';
+        expect(labels(menu.entries()) == modes + "Back|",
+               "game modes must be listed under GameModeMenu's own names, in its order");
+        menu.open(MenuScreen::difficulty);
+        std::string levels;
+        for (const GameDifficulty level : {GameDifficulty::no_enemies, GameDifficulty::easy,
+                                           GameDifficulty::hard, GameDifficulty::hardcore})
+            levels += std::string{openminerz::retail_difficulty_name(level, generation)} + '|';
+        expect(labels(menu.entries()) == levels + "Back|",
+               "difficulty levels must be listed under DifficultyLevelScreen's own names");
+    }
+    // Nothing in the front end shouts: every row has a lower-case letter.
+    for (const MenuScreen screen :
+         {MenuScreen::main, MenuScreen::multiplayer, MenuScreen::game_profile, MenuScreen::game_mode,
+          MenuScreen::difficulty, MenuScreen::host_setup, MenuScreen::host_details,
+          MenuScreen::host_access, MenuScreen::host_gameplay, MenuScreen::join_details,
+          MenuScreen::exit_confirmation})
+    {
+        menu.open(screen);
+        for (const MenuEntry &entry : menu.entries())
+            expect(entry.label == "PVP" ||
+                       std::ranges::any_of(entry.label,
+                                           [](char character) {
+                                               return std::islower(static_cast<unsigned char>(
+                                                          character)) != 0;
+                                           }),
+                   "menu rows are Title Case, as the originals' are");
+    }
+}
+
+// openminerz/menu_look.hpp: casing, the font a line is set in, the focus
+// pulse, and the fit of the picture behind the menus.
+void menu_look_arithmetic_holds()
+{
+    using openminerz::ui::choose_menu_letter;
+    using openminerz::ui::cover_crop;
+    using openminerz::ui::menu_focus_amount;
+    using openminerz::ui::menu_title_case;
+    using openminerz::ui::menu_value_case;
+    expect(menu_title_case("View distance") == "View Distance" &&
+               menu_title_case("FADE INACTIVE ITEM TRAY") == "Fade Inactive Item Tray" &&
+               menu_title_case("Field of view") == "Field of View" &&
+               menu_title_case("health and energy") == "Health and Energy" &&
+               menu_title_case("PERFORMANCE & LATENCY") == "Performance & Latency",
+           "labels become Title Case with the joining words left small");
+    expect(menu_title_case("CLASSIC HD") == "Classic HD" && menu_title_case("vsync") == "VSync" &&
+               menu_title_case("FPS COUNTER") == "FPS Counter" &&
+               menu_title_case("SHOW HUD") == "Show HUD" &&
+               menu_title_case("MATCH DISPLAY  144 FPS") == "Match Display  144 FPS" &&
+               menu_title_case("1920 X 1080") == "1920 x 1080" && menu_title_case("8X") == "8x" &&
+               menu_title_case("64 BLOCKS") == "64 Blocks" && menu_title_case("86%") == "86%",
+           "names with their own spelling keep it and a word with a digit keeps small letters");
+    expect(menu_value_case("ENHANCED") == "Enhanced" && menu_value_case("OFF") == "Off" &&
+               menu_value_case("Speakers (USB Audio DAC)") == "Speakers (USB Audio DAC)" &&
+               menu_value_case("KikoTs's World") == "KikoTs's World" && menu_value_case("").empty(),
+           "a value in capitals is recased; a name already in mixed case is left alone");
+
+    // 1.6.3.8's display face exists with capitals 11, 18 and 36 pixels tall.
+    constexpr std::array<int, 3> display{11, 18, 36};
+    const auto pick = [&](float wanted) { return choose_menu_letter(display, wanted); };
+    expect(pick(36.0F).member == 2U && pick(36.0F).scale == 1.0F && pick(18.0F).member == 1U &&
+               pick(18.0F).scale == 1.0F && pick(11.0F).member == 0U && pick(11.0F).scale == 1.0F,
+           "at 1280x720 the menus are the shipped bitmaps, unscaled");
+    expect(pick(54.0F).member == 2U && std::abs(pick(54.0F).scale - 1.5F) < 1e-5F &&
+               pick(108.0F).member == 2U && std::abs(pick(108.0F).scale - 3.0F) < 1e-5F,
+           "only a size above the largest font is enlarged (1080p and 2160p rows)");
+    expect(pick(27.0F).member == 2U && std::abs(pick(27.0F).scale - 0.75F) < 1e-5F &&
+               pick(16.5F).member == 1U && pick(16.5F).scale < 1.0F && pick(8.25F).member == 0U &&
+               std::abs(pick(8.25F).scale - 0.75F) < 1e-5F,
+           "an in-between size is the next larger font reduced, never a smaller one stretched");
+    expect(pick(11.5F).member == 0U && pick(11.5F).scale == 1.0F && pick(35.0F).member == 2U &&
+               pick(35.0F).scale == 1.0F,
+           "a size within a few percent of a font's own is that font as it is");
+    constexpr std::array<int, 3> incomplete{0, 18, 36};
+    constexpr std::array<int, 2> missing{0, 0};
+    expect(choose_menu_letter(incomplete, 11.0F).member == 1U &&
+               choose_menu_letter(missing, 11.0F).member == missing.size() &&
+               choose_menu_letter({}, 11.0F).member == 0U,
+           "a font that did not load is never chosen");
+
+    expect(menu_focus_amount(0.0F) == 1.0F && std::abs(menu_focus_amount(0.125F) - 0.5F) < 1e-5F &&
+               std::abs(menu_focus_amount(0.25F)) < 1e-5F &&
+               std::abs(menu_focus_amount(0.375F) - 0.5F) < 1e-5F &&
+               std::abs(menu_focus_amount(0.5F) - 1.0F) < 1e-5F && menu_focus_amount(-1.0F) == 1.0F,
+           "the focused row runs from the focus colour to the row colour and back in half a "
+           "second");
+    for (float seconds = 0.0F; seconds < 2.0F; seconds += 0.01F)
+        expect(menu_focus_amount(seconds) >= 0.0F && menu_focus_amount(seconds) <= 1.0F,
+               "the focus amount must stay a blend factor");
+
+    // A 3840x2160 picture behind windows of every supported shape.
+    struct Window final
+    {
+        float width;
+        float height;
+    };
+    for (const Window window : {Window{1280.0F, 720.0F}, Window{3840.0F, 2160.0F},
+                                Window{1920.0F, 1200.0F}, Window{2560.0F, 1080.0F},
+                                Window{5120.0F, 1440.0F}, Window{1024.0F, 768.0F},
+                                Window{960.0F, 540.0F}})
+    {
+        const auto crop = cover_crop(3840.0F, 2160.0F, window.width, window.height);
+        expect(crop.x >= 0.0F && crop.y >= 0.0F && crop.x + crop.width <= 3840.01F &&
+                   crop.y + crop.height <= 2160.01F,
+               "the shown part must lie inside the picture: no bars, no seams");
+        expect(std::abs(crop.width / crop.height - window.width / window.height) < 1e-3F,
+               "the shown part must have the window's shape: nothing is stretched");
+        expect(std::abs(crop.width - 3840.0F) < 0.01F || std::abs(crop.height - 2160.0F) < 0.01F,
+               "the picture must fill the window in at least one direction");
+        expect(std::abs(crop.x - (3840.0F - crop.width) * 0.5F) < 0.01F &&
+                   std::abs(crop.y - (2160.0F - crop.height) * 0.5F) < 0.01F,
+               "what does not fit is cropped evenly from both sides");
+    }
+    const auto wide = cover_crop(3840.0F, 2160.0F, 2560.0F, 1080.0F);
+    const auto narrow = cover_crop(3840.0F, 2160.0F, 1024.0F, 768.0F);
+    expect(std::abs(wide.height - 1620.0F) < 0.01F && std::abs(wide.y - 270.0F) < 0.01F &&
+               std::abs(narrow.width - 2880.0F) < 0.01F && std::abs(narrow.x - 480.0F) < 0.01F,
+           "21:9 loses the top and bottom, 4:3 the sides");
+    const auto none = cover_crop(0.0F, 0.0F, 1280.0F, 720.0F);
+    expect(none.width == 0.0F && none.height == 0.0F, "no picture is no crop");
 }
 
 void settings_navigation_is_bounded_across_tabs()
@@ -531,7 +1458,7 @@ void network_protocol_manifest_and_framing_match_deployed_profiles()
     std::vector<std::uint8_t> oversized(maximum_packet_size + 1U);
     expect(!decode_packet(ProtocolVersion::classic_v3, oversized, decoded, error) &&
                error == PacketError::too_large,
-           "wire frames above 4096 bytes must fail before payload parsing");
+           "wire frames above the bounded native budget must fail before payload parsing");
     auto damaged = *encoded;
     damaged.back() ^= 0xFFU;
     expect(!decode_packet(ProtocolVersion::classic_v3, damaged, decoded, error) &&
@@ -2026,12 +2953,48 @@ void authoritative_late_join_bootstrap_applies_world_save_in_strict_order()
                !host.gameplay_ready(request.peer, 7U),
            "only a fresh source-ordered presence may re-enable gameplay after reconnect");
 
-    WorldSaveData incompatible = save;
-    incompatible.inventory.storage()[0] = InventoryStack{InventoryItemId::grass_block, 1U};
-    expect(!make_authoritative_bootstrap_snapshot(incompatible, settings, identity, false, snapshot,
+    // Items retail does not have (retail_items.hpp). Two rules, both pinned:
+    //   1. nothing the session's generation does not register is ever encoded
+    //      for a stock client, so the raw converter still refuses such a save;
+    //   2. a session never fails over one, because a world is cleaned of them
+    //      when it is loaded and what is left converts.
+    WorldSaveData legacy = save;
+    // Project-owned ids 123..131, one per place a stack can live.
+    legacy.inventory.storage()[0] = InventoryStack{InventoryItemId::grass_block, 7U};
+    legacy.inventory.tray()[2] = InventoryStack{InventoryItemId::surface_lava_block, 1U};
+    legacy.held_stack = InventoryStack{InventoryItemId::leaves_block, 2U};
+    legacy.crates[{10, 20, -30}][5] = InventoryStack{InventoryItemId::forced_air_block, 3U};
+    // Declared by both generations' enums and registered by neither.
+    legacy.inventory.storage()[1] = InventoryStack{InventoryItemId::space_knife, 1U};
+    // Another generation's item in this (Classic) world.
+    legacy.inventory.storage()[2] = InventoryStack{InventoryItemId::modern_chainsaw_1, 1U};
+    // A retail item beside them, which must survive untouched.
+    legacy.inventory.storage()[3] = InventoryStack{InventoryItemId::torch, 9U};
+    expect(!make_authoritative_bootstrap_snapshot(legacy, settings, identity, false, snapshot,
                                                   snapshot_error) &&
                snapshot_error == BootstrapSnapshotError::incompatible_inventory,
-           "a Modern-only item must block a Classic host before any original client sees it");
+           "an item retail does not register must never be encoded for an original client");
+    const NonRetailItemCleanup cleanup = remove_non_retail_items(legacy);
+    expect(cleanup.anything() && cleanup.stacks == 6U && cleanup.items == 15U,
+           "loading a world must remove every non-retail stack and count what it removed");
+    expect(!legacy.inventory.storage()[0].has_value() && !legacy.inventory.storage()[1].has_value() &&
+               !legacy.inventory.storage()[2].has_value() && !legacy.inventory.tray()[2].has_value() &&
+               !legacy.held_stack.has_value() && !legacy.crates[{10, 20, -30}][5].has_value(),
+           "the backpack, the trays, the cursor stack and every crate are all cleaned");
+    expect(legacy.inventory.storage()[3].has_value() &&
+               legacy.inventory.storage()[3]->item == InventoryItemId::torch &&
+               legacy.inventory.storage()[3]->count == 9U &&
+               legacy.crates[{10, 20, -30}][0].has_value() &&
+               legacy.crates[{10, 20, -30}][0]->item == InventoryItemId::torch,
+           "retail items in the same inventory and crate must be left exactly as they were");
+    expect(!remove_non_retail_items(legacy).anything(),
+           "a cleaned world has nothing left to remove: the player is told once");
+    expect(make_authoritative_bootstrap_snapshot(legacy, settings, identity, false, snapshot,
+                                                 snapshot_error),
+           "a world that held non-retail items must still be able to start a session");
+    WorldSaveData untouched = save;
+    expect(!remove_non_retail_items(untouched).anything(),
+           "a world of retail items loses nothing");
 }
 
 void oversized_world_info_uses_ordered_item_crate_replay()
@@ -2046,7 +3009,9 @@ void oversized_world_info_uses_ordered_item_crate_replay()
     for (int index{}; index < 100; ++index)
         static_cast<void>(save.crates[{index * 16, 0, 0}]);
     BootstrapWorldIdentity identity;
-    identity.name = "Large Crate World";
+    // Force the complete metadata + crate dictionary above the current packet
+    // budget while keeping the metadata itself valid for the replay fallback.
+    identity.name = std::string(maximum_packet_size - 4096U, 'W');
     identity.owner_gamer_tag = "Owner";
     identity.creator_gamer_tag = "Owner";
     identity.created_date_ticks = 638'000'000'000'000'000LL;
@@ -2294,6 +3259,27 @@ void authoritative_client_bootstrap_reconstructs_snapshot_and_fails_closed()
     expect(client_result.handled() && client_result.outbound.size() == 1U &&
                !client_result.outbound.front().recipient_gid.has_value(),
            "only the byte-exact local-GID presence echo may open broadcast inventory retrieval");
+    const auto presence_echo = host_result.replies.front().application_packet;
+    const auto duplicate_echo = client.handle_packet(local_gid, presence_echo);
+    expect(duplicate_echo.handled() && duplicate_echo.outbound.empty() && !client.failed(),
+           "a host echo after the synchronous local echo must not fail or request inventory twice");
+    AuthoritativeBootstrapClient premature_echo{client_options};
+    expect(premature_echo.begin(client_error).has_value() &&
+               premature_echo.handle_packet(local_gid, presence_echo).error ==
+                   BootstrapClientError::out_of_order && premature_echo.failed(),
+           "a local presence echo before WorldInfo must still fail closed");
+    auto invalid_echo_client = client;
+    PlayerExistsPayload altered_echo{true, client_options.avatar_description,
+                                     "Changed Identity", client_options.player_id};
+    const auto altered_payload = encode_player_exists_payload(altered_echo, payload_error);
+    const auto *echo_descriptor = message_by_name(settings.protocol, "PlayerExistsMessage");
+    PacketError echo_packet_error{};
+    const auto altered_packet = encode_packet(settings.protocol, echo_descriptor->id,
+                                              *altered_payload, echo_packet_error);
+    expect(altered_packet.has_value() &&
+               invalid_echo_client.handle_packet(local_gid, *altered_packet).error ==
+                   BootstrapClientError::invalid_presence_echo && invalid_echo_client.failed(),
+           "tolerating an identical echo must not accept a changed player identity");
     DecodedPacket host_presence_packet;
     PacketError host_presence_error{};
     PlayerExistsPayload decoded_host_presence;
@@ -2558,13 +3544,17 @@ void client_gameplay_authority_is_route_strict_and_identity_bound()
     const auto kill = inbound(packet("KillEnemyMessage", *kill_payload), 1U);
     expect(assess_client_gameplay_authority(protocol, kill).action == ClientGameplayAction::relay,
            "a kill attribution matching the admitted sender GID must relay");
-    const auto spoofed_kill_payload =
+    // BaseZombie.TakeDamage sends the kill from whichever peer's copy of the
+    // enemy reached zero and names the SHOOTER as killer, so sender != killer
+    // is the ordinary stock case, not a spoof (SemanticsParityProbe executes
+    // this against the owned assemblies: observer 3 reports shooter 7).
+    const auto observed_kill_payload =
         encode_kill_enemy_payload({31, 32, 1, 6U}, protocol, payload_error);
-    expect(spoofed_kill_payload.has_value(), "the spoofed kill fixture must encode");
-    const auto spoofed_kill = inbound(packet("KillEnemyMessage", *spoofed_kill_payload), 1U);
-    expect(assess_client_gameplay_authority(protocol, spoofed_kill).error ==
-               ClientGameplayAuthorityError::identity_spoof,
-           "an embedded killer GID may never impersonate another admitted player");
+    expect(observed_kill_payload.has_value(), "the observed kill fixture must encode");
+    const auto observed_kill = inbound(packet("KillEnemyMessage", *observed_kill_payload), 1U);
+    expect(assess_client_gameplay_authority(protocol, observed_kill).action ==
+               ClientGameplayAction::relay,
+           "a stock observer's kill crediting another player's shot must be relayed");
 
     DigPayload dig_effect{false, {1.0F, 2.0F, 3.0F}, {0.0F, 1.0F, 0.0F}, 6};
     const auto dig_effect_payload = encode_dig_payload(dig_effect, protocol, payload_error);
@@ -2716,15 +3706,20 @@ void client_gameplay_authority_is_route_strict_and_identity_bound()
                ClientGameplayAuthorityError::host_only_message,
            "a remote client may never inject host-only world output");
 
+    // _processAlterBlocksMessage applies every edit and leaves the one-second
+    // count to the separate anti-cheat sweep, so this ceiling is a hostile-peer
+    // guard only and has to sit far above a held mouse button. What it must
+    // still guarantee is a bound, per-peer isolation, and a per-second reset.
     ClientGameplayRateLimiter limiter;
-    bool first_ten_edits_allowed = true;
-    for (int index = 0; index < 10; ++index)
-        first_ten_edits_allowed =
-            first_ten_edits_allowed && limiter.allow(1005U, "AlterBlockMessage", 0U);
-    expect(first_ten_edits_allowed && !limiter.allow(1005U, "AlterBlockMessage", 0U) &&
+    int allowed_edits = 0;
+    while (allowed_edits < 1'000 && limiter.allow(1005U, "AlterBlockMessage", 0U))
+        ++allowed_edits;
+    expect(allowed_edits >= 60 && allowed_edits < 1'000,
+           "the block-edit guard must bound a flood well above one second of real building");
+    expect(!limiter.allow(1005U, "AlterBlockMessage", 0U) &&
                limiter.allow(1006U, "AlterBlockMessage", 0U) &&
                limiter.allow(1005U, "AlterBlockMessage", 1'000U),
-           "the recovered ten-edit safety window must be isolated per peer and reset each second");
+           "the block-edit safety window must be isolated per peer and reset each second");
     expect(limiter.allow_spawner_trigger(10051U, 0U),
            "an exact decoded Modern trigger must open one bounded clear transcript");
     bool spawner_clear_allowed = true;
@@ -2739,21 +3734,59 @@ void client_gameplay_authority_is_route_strict_and_identity_bound()
             sixty_four_triggers_allowed && limiter.allow_spawner_trigger(10052U, 0U);
     expect(sixty_four_triggers_allowed && !limiter.allow_spawner_trigger(10052U, 0U),
            "even exact linked-spawner announcements must remain bounded to 64 per peer-second");
-    expect(limiter.allow(1005U, "DetonateRocketMessage", 1'000U) &&
-               !limiter.allow(1005U, "DetonateGrenadeMessage", 1'000U),
-           "rocket and grenade detonations must share the original one-per-second explosion cap");
-    bool first_sixty_pickups_allowed = true;
-    for (int index = 0; index < 60; ++index)
-        first_sixty_pickups_allowed =
-            first_sixty_pickups_allowed && limiter.allow(1007U, "CreatePickupMessage", 0U);
-    expect(first_sixty_pickups_allowed && !limiter.allow(1007U, "CreatePickupMessage", 0U),
-           "pickup creation must be capped independently at sixty messages per peer per second");
-    bool first_thirty_requests_allowed = true;
-    for (int index = 0; index < 30; ++index)
-        first_thirty_requests_allowed =
-            first_thirty_requests_allowed && limiter.allow(1008U, "RequestPickupMessage", 0U);
-    expect(first_thirty_requests_allowed && !limiter.allow(1008U, "RequestPickupMessage", 0U),
-           "pickup requests must be capped independently at thirty messages per peer per second");
+    // Neither stock generation counts explosions at all, and a refused
+    // detonation is never re-sent: the thrower has already seen its own blast.
+    // Two grenades a second apart, or a rocket after a grenade, must both pass.
+    bool paired_explosions_allowed = limiter.allow(1005U, "DetonateRocketMessage", 1'000U);
+    for (int index = 0; index < 7; ++index)
+        paired_explosions_allowed = paired_explosions_allowed &&
+                                    limiter.allow(1005U, "DetonateGrenadeMessage", 1'000U);
+    int allowed_explosions = 8;
+    while (allowed_explosions < 10'000 && limiter.allow(1005U, "DetonateGrenadeMessage", 1'000U))
+        ++allowed_explosions;
+    expect(paired_explosions_allowed && allowed_explosions < 10'000,
+           "detonations within one second must all relay while a flood stays bounded");
+    // The pickup budget has to clear the largest burst PickupManager can
+    // legitimately publish in one second (a Hardcore DropAll plus two crates
+    // ejected by one blast plus mined drops), because a refused frame destroys
+    // an item the sender has already debited.
+    bool first_pickups_allowed = true;
+    for (int index = 0; index < 512; ++index)
+        first_pickups_allowed =
+            first_pickups_allowed && limiter.allow(1007U, "CreatePickupMessage", 0U);
+    int allowed_pickups = 512;
+    while (allowed_pickups < 20'000 && limiter.allow(1007U, "CreatePickupMessage", 0U))
+        ++allowed_pickups;
+    expect(first_pickups_allowed && allowed_pickups < 20'000,
+           "pickup creation must clear a crate wall's ejection and still bound a flood");
+    bool first_crate_items_allowed = true;
+    for (int index = 0; index < 192; ++index)
+        first_crate_items_allowed =
+            first_crate_items_allowed && limiter.allow(1008U, "ItemCrateMessage", 0U);
+    expect(first_crate_items_allowed && !limiter.allow(1008U, "ItemCrateMessage", 0U),
+           "crate slot writes must clear six whole-tray transfers and then be capped per peer");
+    // Explosive.FindBlocksToRemove executed over a solid block of crates
+    // sends 124 DestroyCrateMessages for ONE C4 charge.
+    bool one_charge_of_crates_allowed = true;
+    for (int index = 0; index < 124; ++index)
+        one_charge_of_crates_allowed =
+            one_charge_of_crates_allowed && limiter.allow(1009U, "DestroyCrateMessage", 0U);
+    int allowed_destructions = 124;
+    while (allowed_destructions < 10'000 && limiter.allow(1009U, "DestroyCrateMessage", 0U))
+        ++allowed_destructions;
+    expect(one_charge_of_crates_allowed && allowed_destructions < 10'000,
+           "crate destruction must be bounded without clipping one blast's worth of crates");
+    // PickupEntity requests every pickup in reach in one frame and never asks
+    // twice; the original host grants all of them (96 of 96 when executed).
+    bool pile_requests_allowed = true;
+    for (int index = 0; index < 96; ++index)
+        pile_requests_allowed =
+            pile_requests_allowed && limiter.allow(10081U, "RequestPickupMessage", 0U);
+    int allowed_requests = 96;
+    while (allowed_requests < 20'000 && limiter.allow(10081U, "RequestPickupMessage", 0U))
+        ++allowed_requests;
+    expect(pile_requests_allowed && allowed_requests < 20'000,
+           "a whole pile requested in one frame must be answered while a flood stays bounded");
     bool first_sixty_shots_allowed = true;
     for (int index = 0; index < 60; ++index)
         first_sixty_shots_allowed =
@@ -2772,42 +3805,46 @@ void client_gameplay_authority_is_route_strict_and_identity_bound()
             first_twelve_melee_attacks_allowed && limiter.allow(10101U, "MeleePlayerMessage", 0U);
     expect(first_twelve_melee_attacks_allowed && !limiter.allow(10101U, "MeleePlayerMessage", 0U),
            "direct player melee must have a bounded twelve-hit peer window");
-    expect(limiter.allow(1011U, "GrenadeMessage", 0U) &&
-               limiter.allow(1011U, "FireRocketMessage", 0U) &&
-               limiter.allow(1011U, "GrenadeMessage", 0U) &&
-               limiter.allow(1011U, "FireRocketMessage", 0U) &&
-               !limiter.allow(1011U, "GrenadeMessage", 0U),
-           "grenade and rocket launches must share a four-projectile peer window");
-    bool first_sixty_four_placed_detonations_allowed = true;
-    for (int index = 0; index < 64; ++index)
-        first_sixty_four_placed_detonations_allowed =
-            first_sixty_four_placed_detonations_allowed &&
-            limiter.allow(10111U, "DetonateExplosiveMessage", 0U);
-    expect(first_sixty_four_placed_detonations_allowed &&
-               !limiter.allow(10111U, "DetonateExplosiveMessage", 0U),
-           "bounded TNT/C4 chains must retain up to 64 ordered child detonations per second");
-    bool first_sixteen_explosive_effects_allowed = true;
-    for (int index = 0; index < 16; ++index)
-        first_sixteen_explosive_effects_allowed =
-            first_sixteen_explosive_effects_allowed &&
-            limiter.allow(
-                10112U, index % 2 == 0 ? "AddExplosionEffectsMessage" : "AddExplosiveFlashMessage",
-                0U);
-    expect(first_sixteen_explosive_effects_allowed &&
-               !limiter.allow(10112U, "AddExplosiveFlashMessage", 0U),
+    int allowed_launches = 0;
+    while (allowed_launches < 1'000 &&
+           limiter.allow(1011U, allowed_launches % 2 == 0 ? "GrenadeMessage" : "FireRocketMessage",
+                         0U))
+        ++allowed_launches;
+    expect(allowed_launches >= 4 && allowed_launches < 1'000,
+           "grenade and rocket launches must share one bounded projectile window");
+    // ProcessOneExplosion sends one DetonateExplosiveMessage for every charge a
+    // chain reaches, in the frame the first goes off: a 10x10x10 TNT block is a
+    // thousand of them, and none is ever re-sent.
+    bool tnt_block_chain_allowed = true;
+    for (int index = 0; index < 1'000; ++index)
+        tnt_block_chain_allowed =
+            tnt_block_chain_allowed && limiter.allow(10111U, "DetonateExplosiveMessage", 0U);
+    int allowed_chain = 1'000;
+    while (allowed_chain < 20'000 && limiter.allow(10111U, "DetonateExplosiveMessage", 0U))
+        ++allowed_chain;
+    expect(tnt_block_chain_allowed && allowed_chain < 20'000,
+           "a whole TNT block's chain must relay while a detonation flood stays bounded");
+    int allowed_explosive_effects = 0;
+    while (allowed_explosive_effects < 10'000 &&
+           limiter.allow(10112U,
+                         allowed_explosive_effects % 2 == 0 ? "AddExplosionEffectsMessage"
+                                                            : "AddExplosiveFlashMessage",
+                         0U))
+        ++allowed_explosive_effects;
+    expect(allowed_explosive_effects >= 16 && allowed_explosive_effects < 10'000,
            "explosion and fuse visuals must share a bounded effects window");
-    bool first_twelve_dig_effects_allowed = true;
-    for (int index = 0; index < 12; ++index)
-        first_twelve_dig_effects_allowed =
-            first_twelve_dig_effects_allowed && limiter.allow(101121U, "DigMessage", 0U);
-    expect(first_twelve_dig_effects_allowed && !limiter.allow(101121U, "DigMessage", 0U),
-           "remote place/mine presentation must have a bounded twelve-effect peer window");
-    bool first_twelve_door_events_allowed = true;
-    for (int index = 0; index < 12; ++index)
-        first_twelve_door_events_allowed =
-            first_twelve_door_events_allowed && limiter.allow(10113U, "DoorOpenCloseMessage", 0U);
-    expect(first_twelve_door_events_allowed && !limiter.allow(10113U, "DoorOpenCloseMessage", 0U),
-           "door sound broadcasts must have a bounded per-peer window");
+    // One dig effect rides along with every landed swing, so this window has to
+    // clear the block-edit cadence of a held mouse button and merely bound it.
+    int allowed_dig_effects = 0;
+    while (allowed_dig_effects < 1'000 && limiter.allow(101121U, "DigMessage", 0U))
+        ++allowed_dig_effects;
+    expect(allowed_dig_effects >= 40 && allowed_dig_effects < 1'000,
+           "remote place/mine presentation must have a bounded window above real mining");
+    int allowed_door_events = 0;
+    while (allowed_door_events < 1'000 && limiter.allow(10113U, "DoorOpenCloseMessage", 0U))
+        ++allowed_door_events;
+    expect(allowed_door_events >= 24 && allowed_door_events < 1'000,
+           "door sound broadcasts must have a bounded per-peer window above real door use");
     bool first_sixteen_custom_blocks_allowed = true;
     for (int index = 0; index < 16; ++index)
         first_sixteen_custom_blocks_allowed =
@@ -2822,26 +3859,53 @@ void client_gameplay_authority_is_route_strict_and_identity_bound()
             first_sixty_four_enemy_spawns_allowed && limiter.allow(1012U, "SpawnEnemyMessage", 0U);
     expect(first_sixty_four_enemy_spawns_allowed && !limiter.allow(1012U, "SpawnEnemyMessage", 0U),
            "linked Modern spawners must fit a bounded 64-spawn peer window");
-    bool first_thirty_enemy_events_allowed = true;
-    for (int index = 0; index < 30; ++index)
-        first_thirty_enemy_events_allowed =
-            first_thirty_enemy_events_allowed && limiter.allow(1013U, "KillEnemyMessage", 0U);
-    expect(first_thirty_enemy_events_allowed && !limiter.allow(1013U, "EnemyGiveUpMessage", 0U),
+    // A stock peer's whole local horde (50 enemies) enraged at midnight sends
+    // SpeedUpEnemyMessage for each of them on consecutive frames until its own
+    // echo lands, and a death makes all of them give up in one frame.
+    bool horde_events_allowed = true;
+    for (int index = 0; index < 200; ++index)
+        horde_events_allowed =
+            horde_events_allowed &&
+            limiter.allow(1013U, index % 2 == 0 ? "SpeedUpEnemyMessage" : "EnemyGiveUpMessage", 0U);
+    int allowed_enemy_events = 200;
+    while (allowed_enemy_events < 20'000 && limiter.allow(1013U, "KillEnemyMessage", 0U))
+        ++allowed_enemy_events;
+    expect(horde_events_allowed && allowed_enemy_events < 20'000,
            "kill, speed-up, and give-up traffic must share one bounded enemy-event window");
-    bool first_eight_dragon_updates_allowed = true;
-    for (int index = 0; index < 8; ++index)
-        first_eight_dragon_updates_allowed =
-            first_eight_dragon_updates_allowed && limiter.allow(1014U, "UpdateDragonMessage", 0U);
-    expect(first_eight_dragon_updates_allowed && !limiter.allow(1014U, "UpdateDragonMessage", 0U),
-           "the five-hertz dragon stream must retain bounded warm-up headroom per owner");
-    bool first_eight_dragon_events_allowed = true;
-    for (int index = 0; index < 7; ++index)
-        first_eight_dragon_events_allowed =
-            first_eight_dragon_events_allowed && limiter.allow(1015U, "DragonAttackMessage", 0U);
-    expect(first_eight_dragon_events_allowed &&
-               limiter.allow(1015U, "DetonateFireballMessage", 0U) &&
-               !limiter.allow(1015U, "RemoveDragonMessage", 0U),
-           "attack, detonation, existing-state, migration, and removal must share a bounded "
+    // A stock owner sends a waypoint per 0.2 s of DRAGON time; fixed-step
+    // catch-up and a stalled transport deliver several seconds of them at once.
+    bool dragon_update_burst_allowed = true;
+    for (int index = 0; index < 60; ++index)
+        dragon_update_burst_allowed =
+            dragon_update_burst_allowed && limiter.allow(1014U, "UpdateDragonMessage", 0U);
+    int allowed_dragon_updates = 60;
+    while (allowed_dragon_updates < 20'000 && limiter.allow(1014U, "UpdateDragonMessage", 0U))
+        ++allowed_dragon_updates;
+    expect(dragon_update_burst_allowed && allowed_dragon_updates < 20'000,
+           "a delayed burst of dragon waypoints must relay, inside a hostile-rate bound");
+    // One second of ordinary play for a dragon's owner: three players join
+    // together (one ExistingDragonMessage each, the first time the owner sees
+    // each of them), a shotgun finishes the dragon
+    // (DragonClientEntity.TakeDamage sends a kill per pellet until its own
+    // echo arrives), and the volley already in the air lands.
+    bool dragon_event_burst_allowed = true;
+    const auto dragon_events = [&](std::string_view name, int count) {
+        for (int index = 0; index < count; ++index)
+            dragon_event_burst_allowed =
+                dragon_event_burst_allowed && limiter.allow(1015U, name, 0U);
+    };
+    dragon_events("ExistingDragonMessage", 3);
+    dragon_events("KillDragonMessage", 12);
+    dragon_events("DragonAttackMessage", 5);
+    dragon_events("DetonateFireballMessage", 8);
+    dragon_events("MigrateDragonMessage", 1);
+    dragon_events("RemoveDragonMessage", 1);
+    int allowed_dragon_events = 30;
+    while (allowed_dragon_events < 20'000 && limiter.allow(1015U, "DetonateFireballMessage", 0U))
+        ++allowed_dragon_events;
+    expect(dragon_event_burst_allowed && allowed_dragon_events < 20'000,
+           "a join, a kill and a landing volley in one second must all relay; attack, "
+           "detonation, existing-state, kill, migration and removal still share one bounded "
            "dragon-event window");
     limiter.disconnect(1005U);
     expect(limiter.allow(1005U, "DetonateGrenadeMessage", 1'000U),
@@ -2876,7 +3940,7 @@ void player_replication_packs_original_angles_half_velocity_and_delivery()
     PlayerUpdatePayload payload;
     PayloadError error{};
     expect(make_player_update(input, ProtocolVersion::classic_v3, payload, error) &&
-               payload.yaw == 64U && payload.torso_pitch == 128U &&
+               payload.yaw == 191U && payload.torso_pitch == 128U &&
                payload.packed_movement == 0x0EU && payload.player_mode == 6U &&
                payload.velocity_x == 0x3C00U && payload.velocity_y == 0xC000U &&
                payload.velocity_z == 0x3800U &&
@@ -2895,6 +3959,140 @@ void player_replication_packs_original_angles_half_velocity_and_delivery()
     payload.state_flags = 0U;
     expect(player_update_delivery(payload) == MessageDeliveryPolicy::unreliable_sequenced,
            "idle movement must retain the original InOrder/unreliable-sequenced path");
+}
+
+void remote_prediction_preserves_packets_and_bounds_discontinuities()
+{
+    using namespace openminerz::net;
+    RemotePlayerPresentation view;
+    RemotePlayerReplicationState packet;
+    packet.position = {10.0F, 2.0F, 0.0F};
+    packet.velocity = {4.0F, 0.0F, 0.0F};
+    packet.yaw = 3.13F;
+    view.receive(packet, 1.0F);
+    expect(near(view.sample(1.05F).position.x, 10.2F), "predict remote movement between packets");
+    packet.position.x = 10.25F;
+    packet.yaw = -3.13F;
+    view.receive(packet, 1.05F);
+    expect(near(view.sample(1.05F).position.x, 10.2F),
+           "small corrections must not jump on arrival");
+    expect(std::abs(view.sample(1.1F).yaw) > 3.1F,
+           "yaw must cross the short side of the wrap boundary");
+    // One missed 20 Hz packet plus the arrival jitter, then stop: freezing at a
+    // flat 100 ms made a remote player's feet stall and then catch up.
+    expect(near(view.sample(4.0F).position.x, 10.85F),
+           "packet loss must stop prediction one packet past the last update");
+    expect(near(packet.position.x, 10.25F), "render prediction must not change authority state");
+    packet.position.x = 100.0F;
+    view.receive(packet, 4.1F);
+    expect(near(view.sample(4.1F).position.x, 100.0F),
+           "teleports must snap without a travel animation");
+    packet.dead = true;
+    view.receive(packet, 4.15F);
+    expect(near(view.sample(5.0F).position.x, 100.0F),
+           "a dead body must not drift on stale velocity");
+    packet.dead = false;
+    packet.position.x = 20.0F;
+    view.receive(packet, 5.1F);
+    expect(near(view.sample(5.1F).position.x, 20.0F), "respawn must reset presentation history");
+    for (const auto protocol : {ProtocolVersion::classic_v3, ProtocolVersion::modern_v4})
+    {
+        PlayerUpdatePayload wire;
+        wire.yaw = 64U; // Original XNA positive quarter-turn faces west (-X).
+        wire.packed_movement = 0x77U;
+        PayloadError error{};
+        RemotePlayerReplicationState native;
+        expect(apply_player_update(wire, protocol, native) && std::sin(native.yaw) < -0.999F,
+               "original yaw must face the same world direction in the native camera basis");
+        LocalPlayerReplicationInput east;
+        east.yaw = std::numbers::pi_v<float> * 0.5F;
+        expect(make_player_update(east, protocol, wire, error) && wire.yaw == 191U,
+               "native east-facing players must encode the original negative quarter-turn");
+    }
+}
+
+void peer_inventory_survives_host_restart_and_rejects_corruption()
+{
+    using namespace openminerz::net;
+    const auto root = std::filesystem::temp_directory_path() /
+                      ("openminerz-peer-save-" +
+                       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    for (const auto protocol : {ProtocolVersion::classic_v3, ProtocolVersion::modern_v4})
+    {
+        AuthoritativeBootstrapSnapshot snapshot;
+        snapshot.inventory = make_default_player_inventory(protocol, false);
+        snapshot.inventory_is_default = true;
+        auto inventory = snapshot.inventory;
+        inventory.storage[0] = inventory.trays[0][0];
+        {
+            AuthoritativeBootstrapHost host{protocol, snapshot, root};
+            expect(host.register_peer(123U, 1U) && host.store_peer_inventory(123U, inventory),
+                   "host must durably store the admitted peer inventory");
+            expect(!host.store_peer_inventory(124U, inventory),
+                   "unregistered peers cannot write saves");
+        }
+        std::optional<PlayerInventoryPayload> restored;
+        expect(read_peer_inventory(root, protocol, 123U, restored) && restored == inventory,
+               "a fresh process must recover every original PINV field from disk");
+        AuthoritativeBootstrapHost restarted{protocol, snapshot, root};
+        expect(restarted.register_peer(123U, 9U), "a new GID must restore the same stable peer");
+        const auto submit = [&](std::string_view name, std::span<const std::uint8_t> bytes,
+                                std::uint8_t channel) {
+            PacketError error{};
+            const auto *descriptor = message_by_name(protocol, name);
+            expect(descriptor != nullptr, "restart request must exist in the stock manifest");
+            const auto packet = encode_packet(protocol, descriptor->id, bytes, error);
+            expect(packet.has_value(), "restart request must retain stock framing");
+            return restarted.handle_packet(123U, *packet, channel, true);
+        };
+        expect(submit("RequestWorldInfoMessage", {}, 0U).handled(),
+               "restarted host must begin the original bootstrap transcript");
+        PlayerExistsPayload presence;
+        presence.request_response = true;
+        presence.gamer_tag = "Reconnect fixture";
+        presence.player_id = {1U};
+        PayloadError payload_error{};
+        const auto presence_bytes = encode_player_exists_payload(presence, payload_error);
+        expect(presence_bytes && submit("PlayerExistsMessage", *presence_bytes, 1U).handled(),
+               "restored guest must still complete presence admission");
+        const auto reply = submit("RequestInventoryMessage", {}, 1U);
+        DecodedPacket decoded;
+        PacketError packet_error{};
+        InventoryRetrievePayload retrieved;
+        expect(
+            reply.handled() && reply.replies.size() == 1U &&
+                decode_packet(protocol, reply.replies[0].application_packet, decoded,
+                              packet_error) &&
+                decode_inventory_retrieve_payload(decoded.payload, protocol, retrieved,
+                                                  payload_error) &&
+                retrieved.player_id == 9U && !retrieved.default_inventory &&
+                retrieved.inventory == inventory,
+            "original reconnect reply must contain saved PINV and the new GID after host restart");
+        expect(read_peer_inventory(root, protocol, 124U, restored) && !restored,
+               "another peer cannot inherit the saved player's inventory");
+        expect(read_peer_inventory(root / "another-world", protocol, 123U, restored) && !restored,
+               "world inventory records must stay isolated");
+        auto invalid = inventory;
+        invalid.trays.clear();
+        expect(!write_peer_inventory(root, protocol, 123U, invalid),
+               "invalid PINV must not overwrite progress");
+        expect(read_peer_inventory(root, protocol, 123U, restored) && restored == inventory,
+               "rejected writes must preserve the previous complete record");
+        const auto path = root / (std::to_string(static_cast<unsigned>(protocol)) + "-123.ompi");
+        {
+            std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+            file.seekp(24);
+            file.put('X');
+        }
+        restored = inventory;
+        expect(!read_peer_inventory(root, protocol, 123U, restored) && restored == inventory,
+               "corruption must fail transactionally instead of silently resetting progress");
+        AuthoritativeBootstrapHost corrupt{protocol, snapshot, root};
+        expect(!corrupt.register_peer(123U, 10U),
+               "corrupt saved progress must not become default inventory");
+    }
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
 }
 
 void paired_loopback_runs_admission_channels_typed_validation_and_delivery()
@@ -3067,10 +4265,11 @@ void legacy_random_and_atlas_match_original_contracts()
     expect(top_uv[0][0] == 0.0F && top_uv[0][1] == 0.0F && top_uv[2][0] == 1.0F &&
                top_uv[2][1] == 1.0F,
            "top faces must use vanilla's unrotated atlas orientation");
-    expect(openminerz::world::block_name(BlockType::lantern) == "LANTERN" &&
+    // BlockType.Name as shipped (see tests/test_presentation_parity.cpp).
+    expect(openminerz::world::block_name(BlockType::lantern) == "Lantern" &&
                openminerz::world::block_name(BlockType::tnt) == "TNT" &&
-               openminerz::world::block_name(BlockType::diamond_ore) == "DIAMOND ORE",
-           "gameplay widgets must expose specific names for original materials");
+               openminerz::world::block_name(BlockType::diamond_ore) == "Diamonds",
+           "gameplay widgets must expose the original's names for its materials");
 }
 
 void world_generation_is_deterministic_and_layered()
@@ -3287,6 +4486,91 @@ void terrain_vertices_carry_original_style_lighting()
            "original lantern and lava materials must keep their full-bright contract");
 }
 
+void lava_light_reaches_surfaces_and_updates_across_chunks()
+{
+    using namespace openminerz::world;
+    WorldRegion region{0, 0, 2, 1};
+    for (int z = 0; z < 16; ++z)
+        for (int x = 0; x < 32; ++x)
+        {
+            region.set_block(x, -50, z, BlockType::rock);
+            region.set_block(x, -42, z, BlockType::rock);
+            if (x == 0 || x == 31 || z == 0 || z == 15)
+                for (int y = -49; y < -42; ++y)
+                    region.set_block(x, y, z, BlockType::rock);
+        }
+    const auto floor_face = [](const std::vector<WorldFace> &faces, int x) -> WorldFace {
+        const auto found = std::find_if(faces.begin(), faces.end(), [x](const auto &face) {
+            return face.x == x && face.y == -50 && face.z == 8 &&
+                   face.direction == FaceDirection::positive_y;
+        });
+        expect(found != faces.end(), "lava fixture must retain its floor receiver");
+        return *found;
+    };
+    const auto level = [](const auto &values) {
+        return *std::max_element(values.begin(), values.end());
+    };
+    expect(level(floor_face(region.visible_faces(), 16).block_light) == 0U,
+           "a sealed room without emitters must have no block light");
+    for (const auto lava : {BlockType::surface_lava, BlockType::deep_lava})
+    {
+        region.set_block(12, -49, 8, lava);
+        const auto faces = region.visible_faces();
+        const auto near_face = floor_face(faces, 16);
+        const auto far_face = floor_face(faces, 25);
+        expect(level(near_face.lava_light) > 0U &&
+                   level(near_face.lava_light) > level(far_face.lava_light) &&
+                   level(near_face.sky_light) == 0U,
+               "both lava types must illuminate covered nearby blocks with distance falloff");
+        const auto compact = region.visible_faces_by_chunk({{1, 0, 0}});
+        expect(compact.size() == 1U &&
+                   floor_face(compact.front().faces, 16).lava_light == near_face.lava_light,
+               "section rebuilds must retain lava light from sources across a chunk boundary");
+    }
+    region.set_block(12, -49, 8, BlockType::torch);
+    const auto torch = floor_face(region.visible_faces(), 16);
+    expect(level(torch.block_light) > 0U && level(torch.lava_light) == 0U,
+           "replacing lava with a torch must clear lava colour while retaining ordinary light");
+    region.set_block(12, -49, 8, BlockType::deep_lava);
+    for (int z = 0; z < 16; ++z)
+        for (int y = world_min_y; y < world_min_y + chunk_height; ++y)
+            region.set_block(14, y, z, BlockType::rock);
+    expect(level(floor_face(region.visible_faces(), 16).lava_light) == 0U,
+           "lava light must not leak through a sealed opaque wall");
+    region.set_block(12, -49, 8, BlockType::empty);
+    expect(level(floor_face(region.visible_faces(), 10).lava_light) == 0U,
+           "removing lava must remove its light on the next mesh rebuild");
+}
+
+void hell_fill_and_lightning_are_bounded_and_independent()
+{
+    using namespace openminerz::world;
+    auto noon = DayNightCycle{0.5F}.state(SkyModel::rebirth);
+    auto night = DayNightCycle{0.0F}.state(SkyModel::rebirth);
+    noon.lightning = true;
+    noon.lightning_strength = 1.0F;
+    apply_hell_atmosphere(noon, -45.0F);
+    apply_hell_atmosphere(night, -45.0F);
+    expect(near(noon.ambient.red, night.ambient.red) && near(noon.fog.red, night.fog.red) &&
+               noon.ambient.red > 0.5F && noon.ambient.green > 0.1F && noon.ambient.blue > 0.05F &&
+               near(noon.direct.red, 0.0F) && !noon.lightning &&
+               near(noon.lightning_strength, 0.0F),
+           "Hell must retain readable red ambient light at every hour without surface lightning");
+    expect(near(hell_presence(-24.0F), 0.0F) && near(hell_presence(-30.0F), 0.5F) &&
+               near(hell_presence(-36.0F), 1.0F),
+           "Hell's ambient transition must be smooth and confined to the deep layer");
+    float sixty{}, thirty{};
+    for (int frame = 0; frame < 60; ++frame)
+        sixty = lightning_envelope(sixty, true, 1.0F / 60.0F, 0.8F, true);
+    for (int frame = 0; frame < 30; ++frame)
+        thirty = lightning_envelope(thirty, true, 1.0F / 30.0F, 0.8F, true);
+    expect(
+        near(sixty, thirty) && sixty <= 0.8F &&
+            lightning_envelope(sixty, false, 0.5F, 0.8F, true) < 0.06F &&
+            near(lightning_envelope(sixty, true, 0.1F, 1.0F, false), 0.0F),
+        "storm flashes must decay smoothly, remain frame-rate independent and vanish under cover");
+}
+
 void directional_indirect_light_bakes_color_and_emissive_bounce()
 {
     using openminerz::world::BlockType;
@@ -3404,11 +4688,23 @@ void player_physics_and_block_interaction_are_voxel_deterministic()
                near(openminerz::world::lava_damage_period_seconds, 0.5F) &&
                near(openminerz::world::lava_damage_health, 25.0F),
            "environmental survival rates must match InGameHUD's normalized health timers");
+    // The shipped BlockType table (1.6.3.8 and 1.9.9.8): SurfaceLava is
+    // `blockPlayer: true`, DeepLava and Leaves are not.
     expect(openminerz::world::blocks_player(BlockType::rock) &&
                !openminerz::world::blocks_player(BlockType::leaves) &&
-               !openminerz::world::blocks_player(BlockType::surface_lava) &&
+               openminerz::world::blocks_player(BlockType::surface_lava) &&
                !openminerz::world::blocks_player(BlockType::deep_lava),
-           "leaves and both lava variants must be pass-through player volumes");
+           "surface lava must be solid as in the original; leaves and deep lava pass-through");
+    expect(!openminerz::world::surface_lava_passable(),
+           "the sinking-lava enhancement must be off unless the application enables it");
+    openminerz::world::set_surface_lava_passable(true);
+    expect(!openminerz::world::blocks_player(BlockType::surface_lava) &&
+               !openminerz::world::blocks_player(BlockType::deep_lava) &&
+               openminerz::world::blocks_player(BlockType::rock),
+           "the sinking-lava enhancement must open surface lava and nothing else");
+    openminerz::world::set_surface_lava_passable(false);
+    expect(openminerz::world::blocks_player(BlockType::surface_lava),
+           "switching the sinking-lava enhancement off must restore the original solid block");
     expect(openminerz::world::is_solid(BlockType::leaves) &&
                openminerz::world::is_solid(BlockType::surface_lava) &&
                openminerz::world::is_solid(BlockType::deep_lava),
@@ -3459,8 +4755,11 @@ void player_physics_and_block_interaction_are_voxel_deterministic()
     {
         player.update(world, vanilla_walk, 1.0F / 60.0F, false);
     }
-    expect(near(walking_start - player.state().position.z, 5.0F, 0.02F),
-           "vanilla keyboard movement must preserve FPSRig's five-unit speed");
+    // Executed in the shipped client (SimulationParityProbe): FPSRig writes 5,
+    // then Player.UpdateAnimation overwrites it with 4 while the player is on
+    // the ground. Only an airborne 1.6.3.8 player moves at 5.
+    expect(near(walking_start - player.state().position.z, 4.0F, 0.02F),
+           "keyboard movement on the ground must run at the original four units a second");
 
     player.spawn(world, 5, 5);
     player.state().yaw = 3.14159265358979323846F;
@@ -3470,9 +4769,11 @@ void player_physics_and_block_interaction_are_voxel_deterministic()
     const float sprint_start = player.state().position.z;
     for (int frame = 0; frame < 30; ++frame)
         player.update(world, sprint, 1.0F / 60.0F, false);
-    expect(near(player.state().position.z - sprint_start, 5.0F, 0.03F) &&
+    // 1.9.9.8 Player.UpdateAnimation: `4f * _sprintMultiplier`, i.e. 8 on the
+    // ground and in the air (executed by SimulationParityProbe).
+    expect(near(player.state().position.z - sprint_start, 4.0F, 0.03F) &&
                near(player.state().stamina, 70.0F, 0.01F) && player.state().sprinting,
-           "Modern sprint must double the five-unit surface speed and spend .6 stamina per second");
+           "Modern sprint must double the four-unit run speed and spend .6 stamina per second");
 
     player.spawn(world, 5, 5);
     for (int frame = 0; frame < 99; ++frame)
@@ -3484,20 +4785,84 @@ void player_physics_and_block_interaction_are_voxel_deterministic()
            "exhaustion must block sprint immediately without overspending stamina");
     for (int frame = 0; frame < 60; ++frame)
         player.update(world, {}, 1.0F / 60.0F, false);
-    expect(player.state().stamina > 1.0F && player.state().stamina < 2.0F,
+    // InGameHUD's one-second StaminaRecoverTimer is reset by the spend on
+    // frame 99 and advances at the end of that same frame, so it has run out
+    // 59 frames later: three of these 61 frames refill, at 25/60 each.
+    expect(near(player.state().stamina, 1.0F + 3.0F * 25.0F / 60.0F, 0.02F),
            "stamina recovery must wait one second after its last use");
     for (int frame = 0; frame < 60; ++frame)
         player.update(world, {}, 1.0F / 60.0F, false);
     const float recovered_stamina = player.state().stamina;
     player.update(world, sprint, 1.0F / 60.0F, false);
-    expect(recovered_stamina > 25.0F && recovered_stamina < 27.0F && player.state().sprinting,
+    expect(near(recovered_stamina, 1.0F + 63.0F * 25.0F / 60.0F, 0.05F) &&
+               player.state().sprinting,
            "the two-second exhaustion block must expire while stamina recovers at .25 per second");
 
+    // 1.9.9.8's own flight (executed in the shipped client: SimulationParityProbe
+    // fly_creative_sprint): the ground's gait speed times six along the
+    // CAMERA, so sprint works in the air and is paid for like on the ground.
+    using FlightModel = openminerz::world::PlayerSimulation::FlightModel;
+    expect(player.flight_model() == FlightModel::retail,
+           "the original's flight must be the default flight model");
+    player.spawn(world, 5, 5);
+    player.state().fly_mode = true;
+    player.state().pitch = 0.35F;
+    player.update(world, sprint, 1.0F / 60.0F, false, false, 20.0F, true);
+    expect(player.state().sprinting && near(player.state().stamina, 99.0F, 0.01F) &&
+               near(player.state().velocity.z, -48.0F * std::cos(0.35F), 0.001F) &&
+               near(player.state().velocity.y, 48.0F * std::sin(0.35F), 0.001F) &&
+               near(player.state().velocity.x, 0.0F, 0.001F),
+           "retail flight must sprint at 48 along the camera and spend stamina for it");
+    openminerz::world::PlayerInput hover;
+    hover.jump = true;
+    player.update(world, hover, 1.0F / 60.0F, false, false, 20.0F, true);
+    expect(near(player.state().velocity.x, 0.0F) && near(player.state().velocity.z, 0.0F) &&
+               near(player.state().velocity.y, 15.0F, 0.001F),
+           "retail flight must rise at JumpImpulse * 1.5 while Jump is held and drift nowhere");
+    player.update(world, {}, 1.0F / 60.0F, false, false, 20.0F, true);
+    expect(near(player.state().velocity.x, 0.0F) && near(player.state().velocity.y, 0.0F) &&
+               near(player.state().velocity.z, 0.0F),
+           "retail flight must stop dead with no input: there is no gravity and no glide");
+    openminerz::world::PlayerInput level;
+    level.forward = 1.0F;
+    player.state().pitch = 0.0F;
+    player.update(world, level, 1.0F / 60.0F, false, false, 20.0F, true);
+    expect(near(player.state().velocity.z, -24.0F, 0.001F) &&
+               near(player.state().velocity.y, 0.0F, 0.001F),
+           "retail flight must cruise at a fixed 24, whatever the flight speed setting says");
+    openminerz::world::PlayerInput sidestep;
+    sidestep.strafe = 1.0F;
+    player.update(world, sidestep, 1.0F / 60.0F, false, false, 20.0F, true);
+    expect(near(player.state().velocity.x, 24.0F, 0.001F) &&
+               near(player.state().velocity.z, 0.2367F * 6.0F, 0.01F),
+           "retail flight must strafe at 24 with the stroll formula's 1.42 backward drift");
+    // The fly key itself: 1.9.9.8 Creative only; 1.6.3.8 never.
+    expect(openminerz::world::retail_fly_key_toggles(true, true) &&
+               !openminerz::world::retail_fly_key_toggles(true, false) &&
+               !openminerz::world::retail_fly_key_toggles(false, true) &&
+               !openminerz::world::retail_fly_key_toggles(false, false),
+           "only a 1.9.9.8 Creative world may toggle fly mode");
+    // OpenMinerZ's own rule, a deliberate difference: Creative flies in both
+    // generations; anything else only under the Free flight extra. 1.9.9.8
+    // Creative keeps retail's model, 1.6.3.8 Creative and the extra fly free.
+    expect(openminerz::world::fly_key_toggles(true, false) &&
+               openminerz::world::fly_key_toggles(false, true) &&
+               !openminerz::world::fly_key_toggles(false, false),
+           "F must fly in Creative, and elsewhere only under the Free flight extra");
+    expect(!openminerz::world::flight_is_free_model(true, true, false) &&
+               openminerz::world::flight_is_free_model(false, true, false) &&
+               openminerz::world::flight_is_free_model(true, true, true) &&
+               openminerz::world::flight_is_free_model(true, false, true),
+           "Modern Creative keeps retail flight; Classic Creative and the extra fly free");
+
+    // The Free flight extra: no sprint, the heading alone at the configured
+    // speed, Jump and the descend key on the vertical axis.
+    player.set_flight_model(FlightModel::free);
     player.spawn(world, 5, 5);
     player.state().fly_mode = true;
     player.update(world, sprint, 1.0F / 60.0F, false, false, 20.0F);
     expect(!player.state().sprinting && near(player.state().stamina, 100.0F),
-           "Creative flight must never consume or activate surface sprint stamina");
+           "the Free flight extra must never consume or activate surface sprint stamina");
 
     player.spawn(world, 5, 5);
     player.state().fly_mode = true;
@@ -3507,7 +4872,8 @@ void player_physics_and_block_interaction_are_voxel_deterministic()
     player.update(world, fast_flight, 1.0F / 60.0F, false, false, 20.0F);
     expect(near(player.state().velocity.z, -20.0F, 0.001F) &&
                near(player.state().velocity.y, 15.0F, 0.001F),
-           "Creative flight must use the configured cruise speed on both axes");
+           "the Free flight extra must use the configured cruise speed on both axes");
+    player.set_flight_model(FlightModel::retail);
 
     player.state().fly_mode = false;
     player.spawn(world, 5, 5);
@@ -3628,8 +4994,20 @@ void player_physics_and_block_interaction_are_voxel_deterministic()
     {
         player.update(world, pass_through_forward, 1.0F / 60.0F, false);
     }
+    // Retail: the leaf column is walked through and the SurfaceLava column
+    // behind it is a wall (blockPlayer true), exactly like rock.
+    expect(player.state().position.z > 4.3F && player.state().position.z < 4.45F &&
+               near(player.state().position.y, 1.001F, 0.01F),
+           "player movement must pass through leaves and be stopped by solid surface lava");
+    // The default-off sinking-lava enhancement restores the walk-through.
+    openminerz::world::set_surface_lava_passable(true);
+    for (int frame = 0; frame < 45; ++frame)
+    {
+        player.update(world, pass_through_forward, 1.0F / 60.0F, false);
+    }
+    openminerz::world::set_surface_lava_passable(false);
     expect(player.state().position.z < 2.8F && near(player.state().position.y, 1.001F, 0.01F),
-           "player movement must pass through leaf and lava columns without climbing or snagging");
+           "with sinking lava enabled, movement must pass through leaf and lava columns");
     for (int z = 2; z <= 4; ++z)
     {
         world.set_block(5, 1, z, BlockType::empty);
@@ -3642,10 +5020,12 @@ void player_physics_and_block_interaction_are_voxel_deterministic()
     diagonal_forward.forward = 1.0F;
     player.update(world, diagonal_forward, 1.0F / 60.0F, false);
     const auto view = player.view_direction();
+    // On the ground the shipped Player.UpdateAnimation replaces FPSRig's speed
+    // of 5 with a run of 4 (executed by SimulationParityProbe).
     const float forward_alignment =
         (player.state().velocity.x * view.x + player.state().velocity.z * view.z) /
-        openminerz::world::PlayerSimulation::movement_speed;
-    expect(forward_alignment > 0.99F,
+        openminerz::world::PlayerSimulation::ground_run_speed;
+    expect(forward_alignment > 0.99F && forward_alignment < 1.01F,
            "forward movement must remain aligned with the camera at non-cardinal yaw angles");
     openminerz::world::PlayerInput diagonal_strafe;
     diagonal_strafe.strafe = 1.0F;
@@ -3656,8 +5036,11 @@ void player_physics_and_block_interaction_are_voxel_deterministic()
     const float right_z = std::sin(player.state().yaw);
     const float strafe_right_alignment =
         (player.state().velocity.x * right_x + player.state().velocity.z * right_z) /
-        openminerz::world::PlayerSimulation::movement_speed;
-    expect(std::abs(strafe_forward_dot) < 0.01F && strafe_right_alignment > 0.99F,
+        openminerz::world::PlayerSimulation::ground_run_speed;
+    // The original evaluates its stroll formula for a zero forward stick too:
+    // (0 - 0.1) / 0.4 * 0.947, so a pure strafe drifts backward at 0.237.
+    expect(std::abs(strafe_forward_dot + 0.23675F) < 0.001F && strafe_right_alignment > 0.99F &&
+               strafe_right_alignment < 1.01F,
            "strafe movement must use the renderer camera's right vector");
 
     openminerz::world::PlayerInput jump;
@@ -4419,10 +5802,17 @@ void gun_stats_and_crafting_match_the_original()
     expect(std::isinf(dig_time_seconds(InventoryItemId::bare_hands, BT::tnt)) &&
                near(dig_time_seconds(InventoryItemId::stone_spade, BT::tnt), 1.0F),
            "only spades may remove TNT");
+    // 1.6.3.8 PickInventoryItem.TimeToDig returns from the laser-sword switch
+    // before it ever looks at the material, so every sword digs alike. (The
+    // "metal tier wins" combination this used to pin is the OpenClassic mod's.)
     expect(
-        near(dig_time_seconds(InventoryItemId::blood_stone_laser_sword, BT::blood_stone), 3.0F) &&
+        near(dig_time_seconds(InventoryItemId::blood_stone_laser_sword, BT::blood_stone), 1.0F) &&
+            near(dig_time_seconds(InventoryItemId::diamond_laser_sword, BT::blood_stone), 1.0F) &&
+            near(dig_time_seconds(InventoryItemId::iron_laser_sword, BT::gold_ore), 0.5F) &&
+            near(dig_time_seconds(InventoryItemId::copper_laser_sword, BT::rock), 0.01F) &&
+            near(dig_time_seconds(InventoryItemId::blood_stone_laser_sword, BT::slime), 4.0F) &&
             near(dig_time_seconds(InventoryItemId::iron_laser_sword, BT::wood), 0.01F),
-        "laser swords must combine the laser and metal-tier tables");
+        "Classic laser swords must use the laser table alone, whatever their material");
     expect(
         near(dig_time_seconds(InventoryItemId::bare_hands, BT::crate_stone), 2.0F) &&
             near(dig_time_seconds(InventoryItemId::bloodstone_pickaxe, BT::crate_bloodstone), 2.0F),
@@ -4560,12 +5950,43 @@ void enemy_roster_matches_the_original_tables()
     expect(near(minimum_enemy_spawn_seconds(0.0F, true), 5.0F) &&
                near(minimum_enemy_spawn_seconds(3450.0F, true), 1.0F),
            "hard-branch spawn cadence must lerp 5..1 seconds");
+    // MathHelper.Lerp does not clamp, so GetMinEnemySpawnTime keeps falling
+    // past 3450 blocks: zero at 4312.5 on the hard branch and negative
+    // beyond (executed in both shipped exes: spawn.min_time.* of the
+    // semantics probe). A clamp held it at 1 s / 20 s for good.
+    expect(near(minimum_enemy_spawn_seconds(4312.5F, true), 0.0F) &&
+               near(minimum_enemy_spawn_seconds(8000.0F, true), 5.0F - 4.0F * (8000.0F / 3450.0F)) &&
+               minimum_enemy_spawn_seconds(8000.0F, true) < -4.0F,
+           "the hard-branch spawn time must keep falling beyond 3450 blocks");
+    expect(near(minimum_enemy_spawn_seconds(5000.0F, false), 45.0F - 25.0F * (5000.0F / 3450.0F)) &&
+               minimum_enemy_spawn_seconds(8000.0F, false) < 0.0F,
+           "the easy spawn time must keep falling beyond 3450 blocks");
+    // CalculateMidnight: below y -40 it is 0.85 even in the midnight frenzy;
+    // above, the frenzy pins it to 1.
+    expect(near(enemy_midnight_factor(1.0F, 4000.0F, -60.0F, true), 0.85F) &&
+               near(enemy_midnight_factor(0.2F, 0.0F, 10.0F, true), 1.0F) &&
+               near(enemy_midnight_factor(0.2F, 0.0F, 10.0F, false), 0.0F),
+           "the midnight frenzy must pin the spawn factor to 1 above y -40 only");
 
-    // Loot: hell pays explosive powder, crash sites pay bars/diamond.
+    // Loot: crash sites pay bars/diamond. A hell enemy's Explosive Powder is
+    // overwritten by the ordinary table in BaseZombie.CreatePickup (the
+    // CRASHSITE test that follows the HELL block has no `else` before it), so
+    // a Felguard pays nothing half the time and cave loot otherwise.
     EnemyRng rng;
-    const EnemyLoot hell_loot = enemy_loot(enemy_felguard, 0.0F, 10.0F, rng);
-    expect(hell_loot.item_id == 108U && hell_loot.item_count >= 1U,
-           "felguards must always drop explosive powder");
+    bool hell_valid = true;
+    int hell_empty = 0;
+    for (int roll = 0; roll < 256; ++roll)
+    {
+        const EnemyLoot loot = enemy_loot(enemy_felguard, 0.0F, -50.0F, rng);
+        hell_empty += loot.item_count == 0U ? 1 : 0;
+        hell_valid = hell_valid && loot.item_id != 108U &&
+                     (loot.item_count == 0U ||
+                      (loot.item_count == 1U &&
+                       (loot.item_id == 16U || loot.item_id == 21U || loot.item_id == 20U ||
+                        loot.item_id == 18U || loot.item_id == 19U)));
+    }
+    expect(hell_valid && hell_empty > 96 && hell_empty < 160,
+           "a hell enemy must never drop explosive powder: half nothing, half the cave table");
     bool crash_valid = true;
     for (int roll = 0; roll < 32; ++roll)
     {
@@ -4739,9 +6160,13 @@ void dragon_attitude_and_spawn_heading_match_xna_flight()
     action_replica.extrapolate_network_replica(1.0F);
     const std::vector<DragonReplicaEvent> quick_events =
         action_replica.take_network_replica_events();
+    // The muzzle is the "Bip01_Ponytail1" bone of the pose held BEFORE this
+    // frame's move (measured against the original skeleton by the dragon
+    // parity probe), not an invented point four units ahead and one below.
     expect(quick_events.size() == 2U && quick_events[0].kind == DragonReplicaEventKind::fireball &&
-               quick_events[0].fireball_id == 123 && near(quick_events[0].position.y, 69.0F) &&
-               near(quick_events[0].position.z, -4.0F) &&
+               quick_events[0].fireball_id == 123 && near(quick_events[0].position.x, 0.021F) &&
+               near(quick_events[0].position.y, 70.453F) &&
+               near(quick_events[0].position.z, -6.833F) &&
                quick_events[1].kind == DragonReplicaEventKind::cry,
            "QUICKSHOOT and CRY must execute together only when interpolation crosses the action "
            "waypoint");
@@ -4813,6 +6238,450 @@ void enemy_network_identity_seed_and_target_authority_are_deterministic()
     expect(horde.kill_enemy({6U, 7U}, false) && horde.enemies()[1].state == EnemyState::die &&
                horde.enemies()[0].state != EnemyState::die && !horde.enemies()[1].loot_pending,
            "a remote kill must affect only the exact target pair and never create local loot");
+}
+
+// Three peers, the production host and client sessions, and the enemy traffic
+// of a real fight: a guest spawns its own horde, one enemy is killed by the
+// OTHER guest's grenade (so KillerID names neither the sender nor the target),
+// and every packet is duplicated and delivered out of order. All three peers
+// must end up with the same enemy set, and the loot must be rolled exactly
+// once by the peer the KillerID names.
+void enemy_replication_converges_over_an_impaired_link()
+{
+    using namespace openminerz::world;
+    using namespace openminerz::net;
+
+    for (const ProtocolVersion protocol :
+         {ProtocolVersion::classic_v3, ProtocolVersion::modern_v4})
+    {
+        const std::string label =
+            protocol == ProtocolVersion::classic_v3 ? "Classic" : "Modern";
+        HostSessionSettings settings;
+        settings.server_name = "OpenMinerZ Enemy Desync";
+        settings.server_message = "Enemy replication soak";
+        settings.protocol = protocol;
+        settings.maximum_players = 16;
+        settings.visibility = HostVisibility::public_lobby;
+        settings.mod_manifest.protocol = protocol;
+        LegacySteamHostSessionOptions host_options;
+        host_options.settings = settings;
+        host_options.game_mode = 1;
+        host_options.host_gamer = LegacyGamerIdentity{{9U, 9U}, "Host"};
+        LegacySteamHostSession host{host_options};
+
+        constexpr PeerId host_peer = 930U;
+        constexpr PeerId alice_peer = 931U;
+        constexpr PeerId bob_peer = 932U;
+        std::map<PeerId, LegacySteamClientSession> clients;
+        const auto join = [&](PeerId peer, std::uint8_t tag, std::string name) {
+            LegacySteamClientSessionOptions options;
+            options.protocol = protocol;
+            options.host_peer = host_peer;
+            options.expected_host_name = "Host";
+            options.session_properties = host.session_properties();
+            options.local_gamer = LegacyGamerIdentity{{tag, 1U}, std::move(name)};
+            auto &client = clients.emplace(peer, std::move(options)).first->second;
+            std::string error;
+            const auto request = client.begin(error);
+            if (!request.has_value())
+            {
+                expect(false, "the enemy soak could not build a stock admission request");
+                return;
+            }
+            const auto admission = host.process_wire_packet(peer, request->payload);
+            for (const LegacySteamNativeSend &send : admission.sends)
+                if (const auto found = clients.find(send.remote_peer); found != clients.end())
+                    static_cast<void>(found->second.process_native_packet(
+                        host_peer, send.p2p_channel, send.payload));
+            expect(client.connected(), label + ": the enemy soak peer must reach connected");
+        };
+        join(alice_peer, 11U, "Alice");
+        join(bob_peer, 12U, "Bob");
+        const std::uint8_t alice_gid = host.gid_for(alice_peer).value_or(0U);
+        const std::uint8_t bob_gid = host.gid_for(bob_peer).value_or(0U);
+        expect(alice_gid != 0U && bob_gid != 0U && alice_gid != bob_gid,
+               label + ": the enemy soak peers must hold distinct stock GIDs");
+
+        struct PeerState final
+        {
+            EnemyHorde horde;
+            std::uint8_t gid{};
+            int loot_rolls{};
+        };
+        std::map<std::uint8_t, PeerState> peers;
+        peers[0U].gid = 0U;
+        peers[alice_gid].gid = alice_gid;
+        peers[bob_gid].gid = bob_gid;
+
+        const EnemyInitialization initialization{2.5F, 6.0F, 1.0F, 5.0F, 45.0F};
+        const auto apply_enemy_packet = [&](PeerState &peer, std::uint8_t sender_gid,
+                                            const std::vector<std::uint8_t> &packet) {
+            DecodedPacket decoded;
+            PacketError packet_error{};
+            PayloadError payload_error{};
+            if (!decode_packet(protocol, packet, decoded, packet_error) ||
+                decoded.message == nullptr)
+            {
+                expect(false, label + ": a relayed enemy packet did not decode");
+                return;
+            }
+            if (decoded.message->name == "SpawnEnemyMessage")
+            {
+                SpawnEnemyPayload spawn;
+                if (!decode_spawn_enemy_payload(decoded.payload, protocol, spawn, payload_error))
+                {
+                    expect(false, label + ": a relayed SpawnEnemy did not decode");
+                    return;
+                }
+                const EnemyIdentity identity{sender_gid,
+                                             static_cast<std::uint32_t>(spawn.enemy_id)};
+                if (peer.horde.find_enemy(identity).has_value() || !peer.horde.accept_remote_spawn())
+                    return;
+                static_cast<void>(peer.horde.spawn_networked(
+                    static_cast<int>(spawn.enemy_type),
+                    {spawn.spawn_position.x, spawn.spawn_position.y, spawn.spawn_position.z},
+                    initialization, identity.enemy_id, spawn.random_seed, sender_gid));
+                return;
+            }
+            if (decoded.message->name == "KillEnemyMessage")
+            {
+                KillEnemyPayload kill;
+                if (!decode_kill_enemy_payload(decoded.payload, protocol, kill, payload_error))
+                {
+                    expect(false, label + ": a relayed KillEnemy did not decode");
+                    return;
+                }
+                const EnemyIdentity identity{static_cast<std::uint8_t>(kill.target_id),
+                                             static_cast<std::uint32_t>(kill.enemy_id)};
+                const bool mine = kill.killer_id == peer.gid;
+                if (peer.horde.kill_enemy(identity, mine) && mine)
+                    ++peer.loot_rolls;
+                return;
+            }
+            EnemyTargetPayload order;
+            if (!decode_enemy_target_payload(decoded.payload, order, payload_error))
+            {
+                expect(false, label + ": a relayed enemy order did not decode");
+                return;
+            }
+            const EnemyIdentity identity{static_cast<std::uint8_t>(order.target_id),
+                                         static_cast<std::uint32_t>(order.enemy_id)};
+            if (decoded.message->name == "SpeedUpEnemyMessage")
+                static_cast<void>(peer.horde.speed_up_enemy(identity));
+            else
+                static_cast<void>(peer.horde.give_up_enemy(identity));
+        };
+
+        // Every client packet is relayed through the production host session and
+        // delivered twice, newest first, so duplication and reordering both hit
+        // the application path.
+        const auto broadcast_from = [&](PeerId origin, std::uint8_t origin_gid,
+                                        std::string_view message,
+                                        const std::vector<std::uint8_t> &payload) {
+            const MessageDescriptor *descriptor = message_by_name(protocol, message);
+            PacketError packet_error{};
+            const auto packet =
+                descriptor != nullptr
+                    ? encode_packet(protocol, descriptor->id, payload, packet_error)
+                    : std::optional<std::vector<std::uint8_t>>{};
+            if (!packet.has_value())
+            {
+                expect(false, label + ": the enemy soak could not frame a stock packet");
+                return;
+            }
+            std::string error;
+            const auto wire = clients.at(origin).create_outbound(
+                std::nullopt, *packet, MessageDeliveryPolicy::reliable_unordered, error);
+            if (!wire.has_value())
+            {
+                expect(false, label + ": the production client refused a stock enemy broadcast");
+                return;
+            }
+            std::vector<std::vector<std::uint8_t>> host_copies;
+            for (int copy = 0; copy < 2; ++copy)
+            {
+                const auto result = host.process_wire_packet(origin, wire->payload);
+                expect(!result.audit.has_value(),
+                       label + ": the production host session refused a stock enemy packet");
+                for (const LegacySteamHostInbound &inbound : result.inbound)
+                {
+                    host_copies.push_back(inbound.payload);
+                    LegacySteamOutbound relay;
+                    relay.application_packet = inbound.payload;
+                    relay.delivery = inbound.delivery;
+                    relay.channel = inbound.channel;
+                    relay.sender_gid = inbound.sender_gid;
+                    relay.recipient_gid = inbound.recipient_gid;
+                    relay.client_relay = true;
+                    std::string relay_error;
+                    const auto sends = host.create_outbound(relay, relay_error);
+                    expect(sends.has_value(),
+                           label + ": the production host session must relay enemy traffic");
+                    if (!sends.has_value())
+                        continue;
+                    for (const LegacySteamNativeSend &send : *sends)
+                    {
+                        if (send.remote_peer == origin)
+                        {
+                            expect(false, label + ": a broadcast must not echo to its sender");
+                            continue;
+                        }
+                        const std::uint8_t recipient_gid =
+                            send.remote_peer == alice_peer ? alice_gid : bob_gid;
+                        const auto delivered = clients.at(send.remote_peer)
+                                                   .process_native_packet(host_peer,
+                                                                          send.p2p_channel,
+                                                                          send.payload);
+                        expect(!delivered.audit.has_value(),
+                               label + ": a relayed enemy packet must satisfy the stock client");
+                        for (const LegacySteamClientInbound &arrival : delivered.inbound)
+                            if (arrival.kind == LegacySteamClientInboundKind::gameplay)
+                                apply_enemy_packet(peers.at(recipient_gid), origin_gid,
+                                                   arrival.payload);
+                    }
+                }
+            }
+            // The host applies its own copies last: a reordered arrival must not
+            // change the outcome.
+            for (auto copy = host_copies.rbegin(); copy != host_copies.rend(); ++copy)
+                apply_enemy_packet(peers.at(0U), origin_gid, *copy);
+        };
+
+        // Alice announces four of her own enemies, then the three fates an enemy
+        // can meet: killed by Alice, killed by Bob's grenade but credited to
+        // Alice (KillerID != sender), and enraged then released.
+        PayloadError payload_error{};
+        for (std::int32_t id = 1; id <= 4; ++id)
+        {
+            SpawnEnemyPayload spawn;
+            spawn.spawn_position = {4.0F + static_cast<float>(id), 1.0F, 8.0F};
+            spawn.enemy_type = 0U;
+            spawn.enemy_id = id;
+            spawn.random_seed = 100 + id;
+            spawn.initialization = {2'500, 6'000, 1'000, 5'000, 45'000};
+            if (protocol == ProtocolVersion::modern_v4)
+            {
+                spawn.spawner_position = spawn.spawn_position;
+                spawn.player_name = "Alice";
+            }
+            const auto payload = encode_spawn_enemy_payload(spawn, protocol, payload_error);
+            expect(payload.has_value(), label + ": the soak could not encode a stock SpawnEnemy");
+            if (payload.has_value())
+                broadcast_from(alice_peer, alice_gid, "SpawnEnemyMessage", *payload);
+            // Alice's own copy is created eagerly by her local spawn, exactly as
+            // the original creates it from its own echo.
+            PeerState &alice = peers.at(alice_gid);
+            if (alice.horde.find_enemy({alice_gid, static_cast<std::uint32_t>(id)}))
+                continue;
+            static_cast<void>(alice.horde.spawn_networked(
+                0, {spawn.spawn_position.x, spawn.spawn_position.y, spawn.spawn_position.z},
+                initialization, static_cast<std::uint32_t>(id), spawn.random_seed, alice_gid));
+        }
+        for (auto &[gid, peer] : peers)
+            expect(peer.horde.enemies().size() == 4U,
+                   label + ": every peer must hold the announced horde");
+
+        const auto kill_from = [&](PeerId origin, std::uint8_t origin_gid, std::int32_t enemy_id,
+                                   std::uint8_t killer_gid) {
+            KillEnemyPayload kill;
+            kill.enemy_id = enemy_id;
+            kill.target_id = static_cast<std::int32_t>(alice_gid);
+            kill.weapon_id = 50;
+            kill.killer_id = killer_gid;
+            const auto payload = encode_kill_enemy_payload(kill, protocol, payload_error);
+            expect(payload.has_value(), label + ": the soak could not encode a stock KillEnemy");
+            if (!payload.has_value())
+                return;
+            broadcast_from(origin, origin_gid, "KillEnemyMessage", *payload);
+            // The sender consumes its own kill locally.
+            PeerState &sender = peers.at(origin_gid);
+            if (sender.horde.kill_enemy({alice_gid, static_cast<std::uint32_t>(enemy_id)},
+                                        killer_gid == origin_gid) &&
+                killer_gid == origin_gid)
+                ++sender.loot_rolls;
+        };
+        kill_from(alice_peer, alice_gid, 1, alice_gid);
+        // Bob's grenade killed Alice's zombie first in Bob's simulation, so Bob
+        // sends the kill and Alice owns the loot.
+        kill_from(bob_peer, bob_gid, 2, alice_gid);
+        // ...and the reverse: Alice's simulation noticed Bob's rocket kill.
+        kill_from(alice_peer, alice_gid, 3, bob_gid);
+
+        const auto order_from = [&](std::string_view message, std::int32_t enemy_id) {
+            const auto payload = encode_enemy_target_payload(
+                {enemy_id, static_cast<std::int32_t>(alice_gid)}, payload_error);
+            expect(payload.has_value(), label + ": the soak could not encode a stock enemy order");
+            if (!payload.has_value())
+                return;
+            broadcast_from(alice_peer, alice_gid, message, *payload);
+            PeerState &alice = peers.at(alice_gid);
+            if (message == "SpeedUpEnemyMessage")
+                static_cast<void>(
+                    alice.horde.speed_up_enemy({alice_gid, static_cast<std::uint32_t>(enemy_id)}));
+            else
+                static_cast<void>(
+                    alice.horde.give_up_enemy({alice_gid, static_cast<std::uint32_t>(enemy_id)}));
+        };
+        order_from("SpeedUpEnemyMessage", 4);
+        order_from("EnemyGiveUpMessage", 4);
+        // A kill that overtakes nothing but arrives after the corpse exists.
+        kill_from(bob_peer, bob_gid, 1, alice_gid);
+
+        openminerz::test::StateDigest host_digest{"host"};
+        openminerz::test::record_enemies(host_digest, peers.at(0U).horde);
+        openminerz::test::StateDigest alice_digest{"alice"};
+        openminerz::test::record_enemies(alice_digest, peers.at(alice_gid).horde);
+        openminerz::test::StateDigest bob_digest{"bob"};
+        openminerz::test::record_enemies(bob_digest, peers.at(bob_gid).horde);
+        const bool agreed = host_digest.hash() == alice_digest.hash() &&
+                            host_digest.hash() == bob_digest.hash();
+        if (!agreed)
+            std::cout << openminerz::test::describe_divergence(host_digest, alice_digest)
+                      << openminerz::test::describe_divergence(host_digest, bob_digest);
+        expect(agreed, label + ": the enemy set must agree on every peer after impaired delivery");
+        expect(peers.at(alice_gid).loot_rolls == 2 && peers.at(bob_gid).loot_rolls == 1 &&
+                   peers.at(0U).loot_rolls == 0,
+               label + ": each duplicated kill must roll loot exactly once, for its KillerID");
+    }
+}
+
+// EnemyManager's receipt semantics, which are what actually decide whether two
+// peers agree about an enemy. Every handler searches for a LIVE enemy and
+// returns silently when it finds none; the loot roll belongs to the peer named
+// by KillerID, not to the sender.
+void enemy_message_receipt_matches_the_original_handlers()
+{
+    using namespace openminerz::world;
+
+    WorldRegion region{0, 0, 1, 1};
+    for (int z = 0; z < 16; ++z)
+        for (int x = 0; x < 16; ++x)
+            region.set_block(x, 0, z, BlockType::rock);
+    PlayerState player;
+    player.position = {12.0F, 1.0F, 8.0F};
+
+    const EnemyInitialization initialization{2.0F, 6.0F, 1.0F, 5.0F, 45.0F};
+    EnemyHorde horde;
+    expect(horde.spawn_networked(0, {6.0F, 1.0F, 8.0F}, initialization, 11U, 7, 0U),
+           "the fixture enemy must spawn from its announced initialization package");
+    horde.enemies()[0].state = EnemyState::chase;
+
+    // SpeedUpEnemyMessage: `!IsMovingFast && !IsDead`. The original sends one
+    // per frame until the enraged state arrives and an impaired link duplicates
+    // them, so a repeat must not restart the walk clip.
+    expect(horde.speed_up_enemy({0U, 11U}) && horde.enemies()[0].running,
+           "the first SpeedUpEnemy must enrage the named enemy");
+    horde.enemies()[0].clip_time = 0.4F;
+    expect(!horde.speed_up_enemy({0U, 11U}) && near(horde.enemies()[0].clip_time, 0.4F),
+           "a duplicated SpeedUpEnemy must be a no-op rather than a clip restart");
+    expect(!horde.speed_up_enemy({1U, 11U}) && !horde.speed_up_enemy({0U, 12U}),
+           "enemy decisions must resolve the whole (target GID, enemy ID) pair");
+
+    // KillEnemyMessage arms exactly one CreatePickup, on the peer the KillerID
+    // names. A duplicated or reordered copy arriving after the roll must not
+    // drop a second stack.
+    expect(horde.kill_enemy({0U, 11U}, true) && horde.enemies()[0].state == EnemyState::die &&
+               horde.enemies()[0].loot_pending,
+           "a kill crediting this peer must arm the loot roll");
+    static_cast<void>(horde.update(region, player, 1.0F / 60.0F));
+    expect(!horde.enemies().empty() && !horde.enemies()[0].loot_pending,
+           "the loot roll must happen on the first fixed tick after the kill");
+    expect(!horde.kill_enemy({0U, 11U}, true) && !horde.enemies()[0].loot_pending,
+           "a repeated KillEnemyMessage must not re-arm the loot roll and drop a second stack");
+    expect(!horde.give_up_enemy({0U, 11U}),
+           "HandleEnemyGiveUpMessage skips dead enemies, so a corpse cannot start eating");
+
+    // A give-up is not IsDead in the original, so a kill still lands on it.
+    EnemyHorde fleeing;
+    expect(fleeing.spawn_networked(0, {6.0F, 1.0F, 8.0F}, initialization, 3U, 7, 0U),
+           "the give-up fixture must spawn");
+    fleeing.enemies()[0].state = EnemyState::chase;
+    expect(fleeing.give_up_enemy({0U, 3U}) && fleeing.enemies()[0].state == EnemyState::give_up,
+           "EnemyGiveUpMessage must enter the give-up state");
+    fleeing.enemies()[0].clip_time = 0.3F;
+    expect(!fleeing.give_up_enemy({0U, 3U}) && near(fleeing.enemies()[0].clip_time, 0.3F),
+           "BaseZombie.GiveUp is idempotent, so a duplicate must not restart the clip");
+    expect(fleeing.kill_enemy({0U, 3U}, false) && fleeing.enemies()[0].state == EnemyState::die,
+           "an enemy that is giving up is not IsDead and can still be killed");
+
+    // HandleSpawnEnemyMessage's admission quirk for another player's enemies:
+    // all below 45, one in four from 45 to 49, none from 50. Both stock
+    // generations share it, so OpenMinerZ must drop exactly the same tail.
+    EnemyHorde crowded;
+    for (std::uint32_t index = 0; index < 44U; ++index)
+        expect(crowded.accept_remote_spawn() &&
+                   crowded.spawn_networked(0, {1.0F, 1.0F, 1.0F}, initialization, index, 7, 4U),
+               "every announced enemy must be accepted below the 45-enemy threshold");
+    int accepted{};
+    for (std::uint32_t index = 44U; index < 64U; ++index)
+        if (crowded.accept_remote_spawn() &&
+            crowded.spawn_networked(0, {1.0F, 1.0F, 1.0F}, initialization, index, 7, 4U))
+            ++accepted;
+    expect(crowded.enemies().size() == 50U && accepted == 6,
+           "the 45-to-49 band must accept only every fourth enemy and 50 must be the ceiling");
+    expect(crowded.count_for_target(4U) == 50U && crowded.count_for_target(0U) == 0U,
+           "the per-target tally must ignore enemies that belong to another player");
+}
+
+// BaseZombie.OnUpdate gives up whenever its target is invalid or dead, on every
+// peer rather than only the owner. Without it an enemy whose target left the
+// session froze in place on the remaining screens forever.
+void enemy_horde_releases_orphaned_and_dead_targets()
+{
+    using namespace openminerz::world;
+
+    WorldRegion region{0, 0, 1, 1};
+    for (int z = 0; z < 16; ++z)
+        for (int x = 0; x < 16; ++x)
+            region.set_block(x, 0, z, BlockType::rock);
+    PlayerState local;
+    local.position = {12.0F, 1.0F, 8.0F};
+
+    const EnemyInitialization initialization{2.0F, 0.0F, 1.0F, 0.0F, 0.0F};
+    EnemyHorde horde;
+    expect(horde.spawn_networked(0, {4.0F, 1.0F, 8.0F}, initialization, 21U, 7, 6U) &&
+               horde.spawn_networked(0, {5.0F, 1.0F, 8.0F}, initialization, 22U, 7, 0U),
+           "the orphan fixture must hold one remote-targeted and one local enemy");
+    for (Enemy &enemy : horde.enemies())
+        enemy.state = EnemyState::chase;
+
+    bool guest_present = true;
+    const auto lookup = [&](std::uint8_t gid) -> std::optional<PlayerState> {
+        if (gid != 6U || !guest_present)
+            return std::nullopt;
+        PlayerState remote;
+        remote.position = {2.0F, 1.0F, 8.0F};
+        return remote;
+    };
+    static_cast<void>(horde.update(region, local, 0U, lookup, 1.0F / 60.0F));
+    const Vec3 before = horde.enemies()[0].position;
+    expect(horde.enemies()[0].velocity.x < 0.0F,
+           "a resolvable remote target must still be chased on this peer");
+
+    guest_present = false;
+    const EnemyEvents orphaned = horde.update(region, local, 0U, lookup, 1.0F / 60.0F);
+    expect(horde.enemies()[0].state == EnemyState::give_up,
+           "an enemy whose target left the session must give up instead of freezing");
+    expect(orphaned.give_up_requests.empty(),
+           "a give-up for somebody else's target must never be announced by this peer");
+    expect(std::abs(horde.enemies()[0].position.x - before.x) < 1.0F,
+           "the released enemy must stop where it stood rather than teleport");
+    bool removed = false;
+    for (int tick = 0; tick < 60 * 20 && !removed; ++tick)
+    {
+        static_cast<void>(horde.update(region, local, 0U, lookup, 1.0F / 60.0F));
+        removed = !horde.find_enemy({6U, 21U}).has_value();
+    }
+    expect(removed, "the orphaned enemy's give-up clip must run out and remove it");
+
+    // The targeted player's own copy announces the give-up, including the one
+    // its own death causes.
+    local.health = 0.0F;
+    const EnemyEvents dead_target = horde.update(region, local, 0U, lookup, 1.0F / 60.0F);
+    expect(horde.enemies()[0].state == EnemyState::give_up &&
+               dead_target.give_up_requests.size() == 1U &&
+               dead_target.give_up_requests.front() == EnemyIdentity{0U, 22U},
+           "a dead target must release its own enemies and announce it through ZombieGiveUp");
 }
 
 void enemy_horde_chases_attacks_and_dies()
@@ -5238,14 +7107,11 @@ void enemy_hit_and_corpse_states_match_authored_timing()
     PlayerState player;
     player.position = {12.0F, 1.0F, 8.0F};
 
+    // Timings below are frame counts recorded from the shipped client at 60 Hz
+    // (tools/OriginalClientInterop/SimulationParityProbe), with the shipped
+    // clip lengths the simulation carries.
+    constexpr float frame = 1.0F / 60.0F;
     EnemyHorde reactions;
-    reactions.set_clip_durations([](EnemyModelKind, std::string_view clip) {
-        if (clip == "hit_reaction1")
-            return 1.65F;
-        if (clip == "hit_reaction3")
-            return 1.65F;
-        return 1.0F;
-    });
     reactions.spawn(17, {4.0F, 1.0F, 8.0F}, 1.0F, 1U);
     Enemy &zombie = reactions.enemies().front();
     for (int strike = 0; strike < 12; ++strike)
@@ -5257,10 +7123,13 @@ void enemy_hit_and_corpse_states_match_authored_timing()
     }
     zombie.state = EnemyState::chase;
     reactions.damage_enemy(0U, 0.01F, DamageFlags::none, false);
-    (void)reactions.update(region, player, 0.69F);
+    // Both reaction clips are 1.6333 s played at HitAnimationSpeed 2, i.e. the
+    // clock advances 33 ms a frame; ZombieHit leaves 0.25 clip seconds early.
+    for (int update = 0; update < 42; ++update)
+        (void)reactions.update(region, player, frame);
     expect(zombie.state == EnemyState::hit,
            "hit reactions must remain active before the 0.25-second blend boundary");
-    (void)reactions.update(region, player, 0.02F);
+    (void)reactions.update(region, player, frame);
     expect(zombie.state == EnemyState::chase,
            "hit reactions must restart at the original near-animation-end boundary");
 
@@ -5281,30 +7150,27 @@ void enemy_hit_and_corpse_states_match_authored_timing()
            "the deterministic death sequence must exercise the restored high clips");
 
     EnemyHorde corpse;
-    corpse.set_clip_durations([](EnemyModelKind, std::string_view clip) {
-        if (clip == "death1")
-            return 2.0F;
-        if (clip == "death2")
-            return 2.333F;
-        if (clip == "death3")
-            return 2.667F;
-        return 1.0F;
-    });
     corpse.spawn(0, {4.0F, 1.0F, 8.0F}, 1.0F, 2U);
     corpse.damage_enemy(0U, 1000.0F, DamageFlags::none, false);
-    const float clip_seconds = corpse.enemies().front().clip == "death1"   ? 2.0F
-                               : corpse.enemies().front().clip == "death2" ? 2.333F
-                                                                           : 2.667F;
-    const EnemyEvents first_dead_tick = corpse.update(region, player, 0.01F);
+    // ZombieDie arms a five-second timer, but BaseZombie.ResolveCollsion
+    // drains the same FrustrationCount every frame the body lies still, from
+    // the first frame of the death clip, and ZombieDie.Update drains it again
+    // once the clip has finished. The shipped client removes the corpse 180,
+    // 185 or 190 frames after the kill for death1, death2 and death3.
+    const int corpse_frames = corpse.enemies().front().clip == "death1"   ? 180
+                              : corpse.enemies().front().clip == "death2" ? 185
+                                                                          : 190;
+    const EnemyEvents first_dead_tick = corpse.update(region, player, frame);
     expect(!corpse.enemies().front().loot_pending,
            "the local kill loot roll must run on the first simulation tick after death");
     (void)first_dead_tick;
-    (void)corpse.update(region, player, clip_seconds / 2.0F + 4.8F);
+    for (int update = 1; update < corpse_frames - 1; ++update)
+        (void)corpse.update(region, player, frame);
     expect(!corpse.enemies().empty(),
-           "the corpse must remain for five seconds after its scaled death clip finishes");
-    const EnemyEvents removed = corpse.update(region, player, 0.25F);
+           "the corpse must remain until the original's frustration timer has drained");
+    const EnemyEvents removed = corpse.update(region, player, frame);
     expect(removed.died == 1 && corpse.enemies().empty(),
-           "the corpse must despawn after the authored clip plus the five-second hold");
+           "the corpse must be removed on the frame the original removes it");
 }
 
 void enemy_melee_respects_the_locked_facing_cone()
@@ -5327,6 +7193,9 @@ void enemy_melee_respects_the_locked_facing_cone()
         enemy.clip = "attack1";
         enemy.clip_speed = 1.0F;
         enemy.attack_index = 0;
+        // 0.84 s into the 1.6333 s clip: just past attack1's 0.8333 s hit moment.
+        enemy.clip_ticks = 8'400'000;
+        enemy.clip_duration_ticks = 16'333'333;
         horde.enemies().push_back(enemy);
         return horde;
     };
@@ -5334,14 +7203,14 @@ void enemy_melee_respects_the_locked_facing_cone()
     PlayerState behind;
     behind.position = {8.0F, 1.0F, 9.0F};
     EnemyHorde missed = attacking_horde();
-    const EnemyEvents back_swing = missed.update(region, behind, 0.84F);
+    const EnemyEvents back_swing = missed.update(region, behind, 1.0F / 60.0F);
     expect(near(back_swing.player_damage, 0.0F),
            "a locked melee swing must not damage a player behind the enemy");
 
     PlayerState ahead;
     ahead.position = {8.0F, 1.0F, 7.0F};
     EnemyHorde landed = attacking_horde();
-    const EnemyEvents front_swing = landed.update(region, ahead, 0.84F);
+    const EnemyEvents front_swing = landed.update(region, ahead, 1.0F / 60.0F);
     expect(near(front_swing.player_damage, 0.4F),
            "the same melee swing must land inside the original 0.7 facing cone");
 }
@@ -5375,46 +7244,52 @@ void enemy_animation_states_use_authored_clips_and_timing()
     expect(skeletons.enemies().front().state == EnemyState::chase,
            "ordinary cave skeletons must enter Chase directly without a bind-pose emerge tick");
 
+    // Frame counts below were recorded from the shipped client at 60 Hz, where
+    // a speed-1 clip's clock advances 17 ms a frame (AnimationPlayer rounds
+    // every step to whole milliseconds).
+    constexpr float frame = 1.0F / 60.0F;
     EnemyHorde archer;
-    archer.set_clip_durations([](EnemyModelKind, std::string_view clip) {
-        if (clip == "standup")
-            return 2.15F;
-        if (clip == "standup2")
-            return 3.5F;
-        if (clip == "atack_archer1")
-            return 1.667F;
-        if (clip == "idle-archer1")
-            return 3.317F;
-        if (clip == "enraged")
-            return 3.667F;
-        return 1.0F;
-    });
     archer.spawn(18, {4.0F, 1.0F, 8.0F}, 1.0F, 2U);
     Enemy &enemy = archer.enemies().front();
     expect(enemy.state == EnemyState::emerge &&
                (enemy.clip == "standup" || enemy.clip == "standup2") && enemy.swing_count >= 5 &&
                enemy.swing_count <= 9,
            "archers must roll a 5..9-shot budget and play one of both stand-up clips");
-    const float emerge_duration = enemy.clip == "standup" ? 2.15F : 3.5F;
-    (void)archer.update(region, player, emerge_duration - 0.3F);
+    // standup is 2.1333 s and standup2 3.4667 s; ZombieEmerge leaves 0.25 clip
+    // seconds before the end, on the 112th and the 191st frame.
+    const int emerge_frames = enemy.clip == "standup" ? 112 : 191;
+    for (int update = 1; update < emerge_frames; ++update)
+        (void)archer.update(region, player, frame);
     expect(enemy.state == EnemyState::emerge,
            "archer emergence must not skip the authored stand-up animation");
-    (void)archer.update(region, player, 0.06F);
+    (void)archer.update(region, player, frame);
     expect(enemy.state == EnemyState::chase,
            "archer emergence must transition at the original 0.25-second blend boundary");
 
+    // A clear line of sight inside 35 blocks: the very next frame draws the bow.
     enemy.swing_count = 1;
-    (void)archer.update(region, player, 0.01F);
+    (void)archer.update(region, player, frame);
     expect(enemy.state == EnemyState::attack && enemy.swing_count == 0 &&
                enemy.clip == "atack_archer1",
            "ArcherSkeletonTryAttack must consume, not reroll, its emergence shot budget");
-    const EnemyEvents arrow = archer.update(region, player, 1.2F);
-    expect(arrow.arrows_fired == 1,
-           "the archer must release exactly one arrow after 1.1 authored seconds");
-    (void)archer.update(region, player, 0.25F);
+    int arrows{};
+    for (int update = 1; update < 65; ++update)
+        arrows += archer.update(region, player, frame).arrows_fired;
+    expect(arrows == 0, "the archer must hold the arrow until 1.1 clip seconds have passed");
+    arrows += archer.update(region, player, frame).arrows_fired;
+    expect(arrows == 1, "the archer must release exactly one arrow after 1.1 authored seconds");
+    for (int update = 66; update < 82; ++update)
+        arrows += archer.update(region, player, frame).arrows_fired;
+    expect(arrows == 1 && enemy.state == EnemyState::attack,
+           "the draw must finish playing after the arrow has left");
+    (void)archer.update(region, player, frame);
     expect(enemy.state == EnemyState::give_up && enemy.clip == "enraged",
            "an exhausted archer must use the skeleton enraged give-up clip");
-    (void)archer.update(region, player, 3.7F);
+    // The 3.6333 s clip at 17 ms a frame.
+    for (int update = 1; update < 214; ++update)
+        (void)archer.update(region, player, frame);
+    expect(!archer.enemies().empty(), "the give-up clip must play to its end");
+    (void)archer.update(region, player, frame);
     expect(archer.enemies().empty(),
            "give-up enemies must be removed when their authored clip finishes");
 }
@@ -5441,46 +7316,71 @@ void enemy_digging_uses_block_hardness_fuses_and_door_ownership()
             enemy_dig_hardness(BlockType::bedrock) == 5,
         "enemy digging must compare against the original BlockType.Hardness table");
 
+    constexpr float frame = 1.0F / 60.0F;
     WorldRegion region{0, 0, 1, 1};
+    for (int z = 0; z < 16; ++z)
+        for (int x = 0; x < 16; ++x)
+            region.set_block(x, 0, z, BlockType::rock);
     region.set_block(6, 1, 5, BlockType::tnt);
     EnemyHorde horde;
+    horde.seed_dig_random(1);
+    // A zombie as ZombieDig.Enter leaves it: an attack clip at
+    // AttackAnimationSpeed 2 with the swing and miss counters cleared.
+    const auto begin_swing = [](Enemy &enemy, int swings_so_far) {
+        enemy.state = EnemyState::dig;
+        enemy.position = {5.5F, 1.0F, 5.5F};
+        enemy.velocity = {};
+        enemy.clip = "attack1";
+        enemy.clip_loops = false;
+        enemy.clip_speed = 2.0F;
+        enemy.clip_ticks = 0;
+        enemy.clip_duration_ticks = 16'333'333;
+        enemy.attack_index = 0;
+        enemy.hit_count = 0;
+        enemy.miss_count = 0;
+        enemy.swing_count = swings_so_far;
+    };
     Enemy digger;
     digger.type = 17; // DiggingMultiplier 1.0, max hardness 3.
-    digger.state = EnemyState::dig;
-    digger.position = {5.5F, 1.0F, 5.5F};
     digger.health = enemy_stats(digger.type).starting_health;
+    begin_swing(digger, 0);
     horde.enemies().push_back(digger);
     PlayerState player;
     player.position = {7.5F, 1.0F, 5.5F};
 
+    // attack1's hit moment (0.8333 s) is divided by the playback speed, so the
+    // swing lands once the 33 ms-a-frame clock passes 0.4167 s: frame 14.
     // First swing has hits == hardness, so EnemyBreakBlocks fails the strict
     // hits > hardness check and lights the explosive's normal fuse.
-    const EnemyEvents fuse = horde.update(region, player, 0.5F);
+    EnemyEvents fuse;
+    for (int update = 1; update < 14; ++update)
+        fuse = horde.update(region, player, frame);
+    expect(fuse.dug_blocks.empty() && fuse.fuse_blocks.empty() && fuse.dig_swings.empty(),
+           "a dig swing must not land before its authored hit moment");
+    fuse = horde.update(region, player, frame);
     expect(fuse.dug_blocks.empty() && fuse.fuse_blocks.size() == 1U &&
-               fuse.fuse_blocks.front() == std::array<int, 3>{6, 1, 5},
+               fuse.fuse_blocks.front() == std::array<int, 3>{6, 1, 5} &&
+               fuse.dig_swings.size() == 1U,
            "a failed zombie break roll against TNT/C4 must start its four-second fuse");
 
     region.set_block(6, 1, 5, BlockType::lower_door_closed_z);
     region.set_block(6, 2, 5, BlockType::upper_door_closed);
     Enemy &enemy = horde.enemies().front();
-    enemy.state = EnemyState::dig;
-    enemy.dig_valid = false;
-    enemy.dig_progress = 0.0F;
     bool lower_reported{};
     bool upper_reported{};
     for (int swing = 0; swing < 32 && !lower_reported; ++swing)
     {
-        // Keep this focused on the dig state; movement/collision has its own
-        // regression and a half-second test tick would otherwise fall farther
-        // than a normal fixed simulation step.
-        enemy.state = EnemyState::dig;
-        enemy.position = {5.5F, 1.0F, 5.5F};
-        enemy.velocity = {};
-        const EnemyEvents result = horde.update(region, player, 0.5F);
-        for (const std::array<int, 3> &cell : result.dug_blocks)
+        // The second and later swings have hits > the door's hardness of one,
+        // so each half gets its own coin flip.
+        begin_swing(enemy, 1 + swing);
+        for (int update = 0; update < 14; ++update)
         {
-            lower_reported = lower_reported || cell == std::array<int, 3>{6, 1, 5};
-            upper_reported = upper_reported || cell == std::array<int, 3>{6, 2, 5};
+            const EnemyEvents result = horde.update(region, player, frame);
+            for (const std::array<int, 3> &cell : result.dug_blocks)
+            {
+                lower_reported = lower_reported || cell == std::array<int, 3>{6, 1, 5};
+                upper_reported = upper_reported || cell == std::array<int, 3>{6, 2, 5};
+            }
         }
     }
     expect(lower_reported && !upper_reported,
@@ -5711,7 +7611,7 @@ void world_save_round_trips_crates_doors_and_navigation_payloads()
     expect(write_world_save(encoded, source), "a complete offline world must serialize");
     WorldSaveData restored;
     expect(read_world_save(encoded, restored), "a serialized offline world must deserialize");
-    expect(restored.version == 6 && restored.owner == source.owner &&
+    expect(restored.version == 9 && restored.owner == source.owner &&
                restored.saved_unix_seconds == source.saved_unix_seconds &&
                restored.seed == source.seed && restored.mode == GameMode::exploration &&
                restored.difficulty == GameDifficulty::no_enemies && restored.infinite_resources &&
@@ -5842,6 +7742,55 @@ void rocket_explosion_matches_original_damage_and_protection()
                near(wall_reflection.z, 3.0F) && near(floor_reflection.x, 1.2F) &&
                near(floor_reflection.y, 0.8F) && near(floor_reflection.z, 1.6F),
            "grenade wall/floor restitution must preserve the original tangent scaling");
+}
+
+// EnemyManager.OnUpdate asks BlockTerrain.GetSimpleSunlightAtPoint at the
+// player's chest every frame: above 0.01 lets the distance packs queue, at
+// most 0.4 (and not -1) runs the cave spawner. The spawner's per-tick lookup
+// (local_sunlight_at) must give the baked answer (simple_sunlight_at) without
+// baking a 33 x 33 column box each time.
+void spawn_sunlight_lookup_matches_the_baked_light()
+{
+    using namespace openminerz::world;
+    WorldRegion region{0, 0, 2, 2};
+    // A rock slab from y 0 to 20 with a room and a long corridor inside it,
+    // open to the sky through one shaft.
+    for (int z = 0; z < 32; ++z)
+        for (int x = 0; x < 32; ++x)
+            for (int y = 0; y <= 20; ++y)
+                region.set_block(x, y, z, BlockType::rock);
+    for (int y = 6; y <= 20; ++y)
+        region.set_block(4, y, 16, BlockType::empty); // the shaft
+    for (int x = 4; x <= 28; ++x)
+        for (int y = 6; y <= 7; ++y)
+            region.set_block(x, y, 16, BlockType::empty); // the corridor
+    for (int z = 12; z <= 20; ++z)
+        for (int x = 22; x <= 28; ++x)
+            for (int y = 6; y <= 9; ++y)
+                region.set_block(x, y, z, BlockType::empty); // the room
+    int compared{};
+    for (int x = 2; x <= 29; ++x)
+        for (const int y : {6, 7, 9, 12, 21, 30})
+            for (const int z : {12, 14, 16, 18})
+            {
+                const float baked = simple_sunlight_at(region, x, y, z);
+                const float local = local_sunlight_at(region, x, y, z);
+                expect(near(baked, local),
+                       std::format("sunlight at {} {} {}: baked {} but the spawner reads {}", x, y, z,
+                                   baked, local));
+                ++compared;
+            }
+    expect(compared == 28 * 6 * 4, "the sunlight comparison did not cover the scene");
+    // The thresholds the spawner tests: open sky is 1; the foot of the shaft
+    // still 1; nine steps along the corridor is 6/15 = 0.4 (the cave spawner
+    // starts); beyond fourteen there is none (no distance pack is queued).
+    expect(near(local_sunlight_at(region, 4, 30, 16), 1.0F) &&
+               near(local_sunlight_at(region, 4, 6, 16), 1.0F) &&
+               near(local_sunlight_at(region, 13, 6, 16), 6.0F / 15.0F) &&
+               near(local_sunlight_at(region, 12, 6, 16), 7.0F / 15.0F) &&
+               near(local_sunlight_at(region, 19, 6, 16), 0.0F) &&
+               near(local_sunlight_at(region, 10, 3, 16), -1.0F),
+           "the spawner's sunlight thresholds moved");
 }
 
 void world_start_matches_original_respawn_contract()
@@ -6025,7 +7974,11 @@ void legacy_steam_transport_codecs_match_deployed_wire_and_fail_closed()
     expect(!encode_legacy_connected_response(mismatched, error).has_value() &&
                error == LegacySteamCodecError::out_of_range,
            "mismatched peer/GID arrays must never reach a stock client");
-    expect(uses_unreliable_native_send(SteamDeliveryMethod::unknown) &&
+    // SteamWorks.SendPacket picks unreliable with an unsigned
+    // `deliveryMethod - Unreliable <= 1`, so Unknown (zero) underflows and is
+    // sent reliably. SendDataOptions.Chat maps to Unknown, which is how the
+    // original keeps chat and voice packets from being dropped.
+    expect(!uses_unreliable_native_send(SteamDeliveryMethod::unknown) &&
                uses_unreliable_native_send(SteamDeliveryMethod::unreliable) &&
                uses_unreliable_native_send(SteamDeliveryMethod::unreliable_sequenced) &&
                !uses_unreliable_native_send(SteamDeliveryMethod::reliable_unordered) &&
@@ -6132,13 +8085,23 @@ void legacy_steam_host_session_admits_routes_and_relays_only_valid_stock_traffic
                announced_gid == 2U && announced_gamer.gamer_tag == "Bob",
            "existing peers must see the newly approved identity before gameplay");
 
-    const LegacySteamHostSessionResult duplicate_name = submit_approval(session, 303U, "Alice");
+    // Alice and Bob above present the same Gamer.PlayerID blob, exactly as two
+    // Wi-Fi-only stock clients do (MD5 of an absent Ethernet MAC); both were
+    // admitted. The only duplicate is a Steam account that is already playing.
+    const LegacySteamHostSessionResult duplicate_account =
+        submit_approval(session, alice, "Alice Again");
     expect(
-        duplicate_name.rejection_reason == std::optional<std::string>{"GamerAlreadyConnected"} &&
-            duplicate_name.sends.size() == 1U && duplicate_name.sends[0].p2p_channel == 1U &&
-            duplicate_name.sends[0].payload.front() == 0U &&
-            duplicate_name.sends[0].payload.back() == 0U && !session.connected(303U),
-        "duplicate gamer tags must receive the stock null-delimited denial on native channel one");
+        duplicate_account.rejection_reason ==
+                std::optional<std::string>{"GamerAlreadyConnected"} &&
+            duplicate_account.sends.size() == 1U && duplicate_account.sends[0].p2p_channel == 1U &&
+            duplicate_account.sends[0].payload.front() == 0U &&
+            duplicate_account.sends[0].payload.back() == 0U && duplicate_account.inbound.empty() &&
+            duplicate_account.audit.has_value() &&
+            duplicate_account.audit->gamer_tag == "Alice Again" && session.connected(alice) &&
+            session.gid_for(alice) == std::optional<std::uint8_t>{std::uint8_t{1}} &&
+            session.connected_peer_count() == 2U,
+        "an already-connected Steam account must receive the stock null-delimited denial on "
+        "native channel one without disturbing its live session");
     const LegacySteamHostSessionResult old_version = submit_approval(session, 404U, "Old", 3);
     expect(old_version.rejection_reason == std::optional<std::string>{"ServerHasNewerVersion"} &&
                !session.connected(404U),
@@ -6210,10 +8173,14 @@ void legacy_steam_host_session_admits_routes_and_relays_only_valid_stock_traffic
     accepted_relay.recipient_gid = received_chat.inbound[0].recipient_gid;
     accepted_relay.client_relay = true;
     const auto relay = session.create_outbound(accepted_relay, outbound_error);
+    // Chat keeps the original's Unknown Lidgren class, which SteamWorks sends
+    // reliably because its unsigned `deliveryMethod - Unreliable <= 1` test
+    // underflows at zero.
     expect(relay.has_value() && relay->size() == 1U && (*relay)[0].remote_peer == bob &&
                (*relay)[0].delivery == SteamDeliveryMethod::unknown &&
-               uses_unreliable_native_send((*relay)[0].delivery),
-           "only an authority-accepted chat may relay to other peers using native unreliable send");
+               !uses_unreliable_native_send((*relay)[0].delivery),
+           "only an authority-accepted chat may relay to other peers, on the original's "
+           "reliable native send");
     LegacySteamWirePacket relayed_wire;
     LegacyDirectDataFrame relayed_direct;
     expect(decode_legacy_steam_wire((*relay)[0].payload, relayed_wire, codec_error) &&
@@ -6315,10 +8282,34 @@ void legacy_steam_host_session_admits_routes_and_relays_only_valid_stock_traffic
     modded_options.settings.mod_manifest.mods.push_back(
         {"openminerz.entities", "1.0", digest, ModScope::server});
     LegacySteamHostSession modded_session{modded_options};
-    expect(submit_approval(modded_session, 707U, "Stock").rejection_reason ==
-                   std::optional<std::string>{"ConnectionDenied"} &&
+    // (Network, Authority) The stock client reads the retail "ConnectionDenied"
+    // ("Connection failed: ConnectionDenied"); the host's log names the reason.
+    const auto stock_refusal = submit_approval(modded_session, 707U, "Stock");
+    const auto retail_denial = [](const LegacySteamHostSessionResult &result) {
+        return result.sends.size() == 1U && result.sends.front().p2p_channel == 1U &&
+               result.sends.front().payload ==
+                   std::vector<std::uint8_t>{0U, 'C', 'o', 'n', 'n', 'e', 'c', 't', 'i', 'o', 'n',
+                                             'D', 'e', 'n', 'i', 'e', 'd', 0U};
+    };
+    expect(stock_refusal.rejection_reason ==
+                   std::optional<std::string>{std::string{legacy_openminerz_required_reason}} &&
+               retail_denial(stock_refusal) && legacy_modded_session_denial == "ConnectionDenied" &&
                !modded_session.connected(707U),
-           "a stock client must never enter a server/core-modded session without negotiation");
+           "a stock client must never enter a server/core-modded session without negotiation, "
+           "and is told so with the retail ConnectionDenied");
+    // The host's "OpenMinerZ players only" refuses a stock client the same way
+    // with no mod at all.
+    LegacySteamHostSessionOptions exclusive_options = make_options();
+    exclusive_options.settings.mod_manifest.openminerz_only = true;
+    LegacySteamHostSession exclusive_session{exclusive_options};
+    const auto exclusive_refusal = submit_approval(exclusive_session, 709U, "Stock");
+    expect(exclusive_refusal.rejection_reason ==
+                   std::optional<std::string>{std::string{legacy_openminerz_required_reason}} &&
+               retail_denial(exclusive_refusal) && !exclusive_session.connected(709U),
+           "an OpenMinerZ-only session refuses a stock client with the retail ConnectionDenied");
+    expect(exclusive_session.authorize_extension(710U) &&
+               !submit_approval(exclusive_session, 710U, "OpenMinerZ").rejection_reason.has_value(),
+           "an OpenMinerZ-only session admits an OpenMinerZ peer that negotiated");
     expect(modded_session.authorize_extension(708U) && !modded_session.authorize_extension(708U) &&
                !submit_approval(modded_session, 708U, "OpenMinerZ").rejection_reason.has_value() &&
                modded_session.connected(708U),
@@ -6738,10 +8729,13 @@ void legacy_steam_client_session_completes_admission_and_rejects_spoofed_routes(
                fresh_gameplay.inbound[0].payload == *chat_packet,
            "the newly announced GID must resume validated gameplay without stale aliasing");
 
+    // Identity is the Steam account. A second request from an account that is
+    // already playing is the duplicate; the same display tag from a different
+    // account is a different player and is covered by the host-session test.
     LegacySteamClientSession duplicate{alice_options};
     const auto duplicate_approval = duplicate.begin(error);
     const LegacySteamHostSessionResult denied =
-        host.process_wire_packet(903U, duplicate_approval->payload);
+        host.process_wire_packet(alice_peer, duplicate_approval->payload);
     expect(denied.sends.size() == 1U && denied.sends[0].p2p_channel == 1U,
            "a duplicate identity must use the source raw native-channel-one denial");
     const LegacySteamClientSessionResult denial = duplicate.process_native_packet(
@@ -6770,7 +8764,7 @@ void steam_bridge_protocol_is_framed_bounded_and_corruption_safe()
     expect(encoded_frame.has_value() && error == SteamBridgeProtocolError::none &&
                encoded_frame->size() == steam_bridge_header_size + frame_payload.size() &&
                std::equal(encoded_frame->begin(), encoded_frame->begin() + 16,
-                          bytes_from_hex("4F4D5342020002000300000012345678").begin()),
+                          bytes_from_hex("4F4D5342030002000300000012345678").begin()),
            "bridge frames must expose the fixed OMSB/version/type/length/sequence header");
     SteamBridgeFrame decoded_frame;
     expect(decode_steam_bridge_frame(*encoded_frame, decoded_frame, error) &&
@@ -6790,7 +8784,7 @@ void steam_bridge_protocol_is_framed_bounded_and_corruption_safe()
                error == SteamBridgeProtocolError::wrong_magic,
            "foreign named-pipe traffic must fail before payload parsing");
     auto bad_version = *encoded_frame;
-    bad_version[4] = 3U;
+    bad_version[4] = 2U;
     expect(!decode_steam_bridge_frame(bad_version, decoded_frame, error) &&
                error == SteamBridgeProtocolError::unsupported_version,
            "an unsupported IPC protocol version must fail closed");
@@ -7110,8 +9104,41 @@ void steam_bridge_x64_x86_pipe_is_secured_supervised_and_sequenced()
                host_config.join_policy == SteamBridgeJoinPolicy::anyone &&
                host_config.password_protected && host_config.maximum_players == 12U &&
                host_config.session_properties ==
-                   make_session_properties(host_options.settings, true, 4, 2, true),
+                   make_session_properties(host_options.settings, false, 4, 2, true),
            "runtime host settings must map to the exact live Steam lobby contract");
+    for (const auto protocol : {ProtocolVersion::classic_v3, ProtocolVersion::modern_v4})
+    {
+        auto running = host_options;
+        running.settings.protocol = protocol;
+        running.settings.mod_manifest.protocol = protocol;
+        running.game_mode = 1;
+        SteamBridgeHostConfig advertised;
+        expect(make_steam_bridge_host_config(running, advertised, error) &&
+                   advertised.session_properties[0] == static_cast<int>(protocol) &&
+                   advertised.session_properties[1] == 0,
+               "original server browsers require protocol slot 0 and join-open slot 1 == 0");
+        LegacySteamHostSessionOptions admission;
+        admission.settings = running.settings;
+        admission.game_mode = running.game_mode;
+        admission.difficulty = running.difficulty;
+        admission.infinite_resources = running.infinite_resources;
+        LegacySteamHostSession session{admission};
+        expect(session.session_properties() == advertised.session_properties,
+               "Steam discovery and the join approval must advertise identical open properties");
+        DiscoveredSession found;
+        found.session_id = 1;
+        found.server_name = "Public host";
+        found.host_name = "Host";
+        found.maximum_players = 8;
+        found.current_players = 1;
+        found.properties = advertised.session_properties;
+        expect(assess_join(found, running.settings.mod_manifest, true).joinable(),
+               "running original-compatible public host is not joinable");
+        found.properties[1] = 1;
+        expect(assess_join(found, running.settings.mod_manifest, true).status ==
+                   JoinCompatibility::session_closed,
+               "closed original sessions must not offer a join action");
+    }
     host_options.settings.visibility = HostVisibility::friends_only;
     expect(make_steam_bridge_host_config(host_options, host_config, error) &&
                host_config.join_policy == SteamBridgeJoinPolicy::friends_only,
@@ -7333,14 +9360,26 @@ int main()
         {"canvas_normalizes_resolutions_and_fonts", canvas_normalizes_resolutions_and_fonts},
         {"pointer_input_contract_never_routes_secondary_to_jump_or_drop",
          pointer_input_contract_never_routes_secondary_to_jump_or_drop},
+        {"pause_contract_freezes_only_a_private_game", pause_contract_freezes_only_a_private_game},
+        {"in_game_menu_matches_the_shipped_binaries", in_game_menu_matches_the_shipped_binaries},
+        {"released_controls_stop_input_but_not_physics",
+         released_controls_stop_input_but_not_physics},
+        {"frozen_or_stalled_time_never_fast_forwards", frozen_or_stalled_time_never_fast_forwards},
         {"dynamic_radiance_is_world_anchored_colored_and_occlusion_safe",
          dynamic_radiance_is_world_anchored_colored_and_occlusion_safe},
         {"biome_atmospheres_are_distinct_bounded_and_reversible",
          biome_atmospheres_are_distinct_bounded_and_reversible},
+        {"atmosphere_transitions_follow_world_and_sun",
+         atmosphere_transitions_follow_world_and_sun},
         {"settings_clamp_and_round_trip", settings_clamp_and_round_trip},
         {"advanced_settings_have_live_adjustments", advanced_settings_have_live_adjustments},
+        {"ui_preferences_survive_restart_and_legacy_settings",
+         ui_preferences_survive_restart_and_legacy_settings},
         {"main_menu_routes_without_scrolling_or_dead_actions",
          main_menu_routes_without_scrolling_or_dead_actions},
+        {"menu_rows_are_worded_as_the_shipped_menus_are",
+         menu_rows_are_worded_as_the_shipped_menus_are},
+        {"menu_look_arithmetic_holds", menu_look_arithmetic_holds},
         {"settings_navigation_is_bounded_across_tabs", settings_navigation_is_bounded_across_tabs},
         {"host_menu_exposes_full_preflight_and_preserves_flow_origin",
          host_menu_exposes_full_preflight_and_preserves_flow_origin},
@@ -7402,6 +9441,10 @@ int main()
          client_gameplay_authority_is_route_strict_and_identity_bound},
         {"player_replication_packs_original_angles_half_velocity_and_delivery",
          player_replication_packs_original_angles_half_velocity_and_delivery},
+        {"remote_prediction_preserves_packets_and_bounds_discontinuities",
+         remote_prediction_preserves_packets_and_bounds_discontinuities},
+        {"peer_inventory_survives_host_restart_and_rejects_corruption",
+         peer_inventory_survives_host_restart_and_rejects_corruption},
         {"paired_loopback_runs_admission_channels_typed_validation_and_delivery",
          paired_loopback_runs_admission_channels_typed_validation_and_delivery},
         {"legacy_random_and_atlas_match_original_contracts",
@@ -7411,6 +9454,10 @@ int main()
         {"day_night_cycle_preserves_original_timing", day_night_cycle_preserves_original_timing},
         {"terrain_vertices_carry_original_style_lighting",
          terrain_vertices_carry_original_style_lighting},
+        {"lava_light_reaches_surfaces_and_updates_across_chunks",
+         lava_light_reaches_surfaces_and_updates_across_chunks},
+        {"hell_fill_and_lightning_are_bounded_and_independent",
+         hell_fill_and_lightning_are_bounded_and_independent},
         {"directional_indirect_light_bakes_color_and_emissive_bounce",
          directional_indirect_light_bakes_color_and_emissive_bounce},
         {"player_physics_and_block_interaction_are_voxel_deterministic",
@@ -7426,6 +9473,12 @@ int main()
          dragon_attitude_and_spawn_heading_match_xna_flight},
         {"enemy_network_identity_seed_and_target_authority_are_deterministic",
          enemy_network_identity_seed_and_target_authority_are_deterministic},
+        {"enemy_message_receipt_matches_the_original_handlers",
+         enemy_message_receipt_matches_the_original_handlers},
+        {"enemy_horde_releases_orphaned_and_dead_targets",
+         enemy_horde_releases_orphaned_and_dead_targets},
+        {"enemy_replication_converges_over_an_impaired_link",
+         enemy_replication_converges_over_an_impaired_link},
         {"modern_loot_blocks_match_owned_catalog_and_rng_transcripts",
          modern_loot_blocks_match_owned_catalog_and_rng_transcripts},
         {"modern_spawner_catalog_and_initialization_match_owned_reference_vectors",
@@ -7455,6 +9508,8 @@ int main()
          rocket_explosion_matches_original_damage_and_protection},
         {"world_start_matches_original_respawn_contract",
          world_start_matches_original_respawn_contract},
+        {"spawn_sunlight_lookup_matches_the_baked_light",
+         spawn_sunlight_lookup_matches_the_baked_light},
     };
 
     std::size_t failures{};

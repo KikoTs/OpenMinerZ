@@ -1,5 +1,8 @@
 #include "enemy_renderer.hpp"
 
+#include "modding/graphics/mod_surfaces.hpp"
+
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -7,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 namespace openminerz
 {
@@ -227,10 +231,17 @@ class EnemyModelLibrary::Impl final
                 SDL_Log("Enemy model %s failed: %s", model_files[model], error.what());
             }
         }
+        derived_ = derived;
+        load_textures();
+    }
+
+    void load_textures()
+    {
         for (std::size_t texture = 0; texture < textures_.size(); ++texture)
         {
-            const auto path = derived / ("enemy_texture_" + std::to_string(texture) + ".bmp");
-            SDL_Surface *surface = SDL_LoadBMP(path.string().c_str());
+            const auto path = derived_ / ("enemy_texture_" + std::to_string(texture) + ".bmp");
+            // (Graphics area) a texture pack may replace it.
+            SDL_Surface *surface = load_content_surface(path, ContentKind::entities);
             if (surface == nullptr)
                 continue;
             textures_[texture] = SDL_CreateTextureFromSurface(renderer_, surface);
@@ -240,8 +251,8 @@ class EnemyModelLibrary::Impl final
         }
         for (std::size_t texture = 0; texture < dragon_textures_.size(); ++texture)
         {
-            const auto path = derived / ("dragon_texture_" + std::to_string(texture) + ".bmp");
-            SDL_Surface *surface = SDL_LoadBMP(path.string().c_str());
+            const auto path = derived_ / ("dragon_texture_" + std::to_string(texture) + ".bmp");
+            SDL_Surface *surface = load_content_surface(path, ContentKind::entities);
             if (surface == nullptr)
                 continue;
             dragon_textures_[texture] = SDL_CreateTextureFromSurface(renderer_, surface);
@@ -249,6 +260,19 @@ class EnemyModelLibrary::Impl final
             if (dragon_textures_[texture] != nullptr)
                 SDL_SetTextureScaleMode(dragon_textures_[texture], SDL_SCALEMODE_LINEAR);
         }
+    }
+
+    // (Visuals) the skins again, through the packs installed now.
+    std::vector<SDL_Texture *> reload_textures()
+    {
+        std::vector<SDL_Texture *> old;
+        for (SDL_Texture *&texture : textures_)
+            old.push_back(std::exchange(texture, nullptr));
+        for (SDL_Texture *&texture : dragon_textures_)
+            old.push_back(std::exchange(texture, nullptr));
+        load_textures();
+        std::erase(old, nullptr);
+        return old;
     }
 
     ~Impl()
@@ -374,18 +398,19 @@ class EnemyModelLibrary::Impl final
     }
 
     void append_enemy(EntityBatch &batch, const world::Enemy &enemy, float sun_light,
-                      float torch_light, const std::array<float, 3> &sun_color, float daylight)
+                      float torch_light, const std::array<float, 3> &sun_color, float daylight,
+                      bool enhanced)
     {
         const world::EnemyStats &stats = world::enemy_stats(enemy.type);
         const float suppressed = torch_light * (1.0F - sun_light * daylight * 0.85F);
         append_skinned(batch, model(stats.model), textures_[stats.texture_index], enemy.clip,
                        enemy.clip_time, enemy.clip_loops, enemy.position, enemy.yaw, sun_light,
                        sun_color, {suppressed, suppressed * 0.92F, suppressed * 0.75F},
-                       torch_light);
+                       torch_light, 1.0F, {0.0F, 0.0F, 0.0F}, 0.0F, 0.0F, false, false, enhanced);
     }
 
     void append_dragon(EntityBatch &batch, const world::Dragon &dragon,
-                       const std::array<float, 3> &sun_color)
+                       const std::array<float, 3> &sun_color, bool enhanced)
     {
         const auto texture_index = std::min<std::size_t>(static_cast<std::size_t>(dragon.kind),
                                                          dragon_textures_.size() - 1U);
@@ -395,7 +420,7 @@ class EnemyModelLibrary::Impl final
         append_skinned(batch, models_[7], dragon_textures_[texture_index], dragon.clip,
                        dragon.clip_time, true, dragon.position, dragon.yaw, 1.0F, sun_color,
                        {0.0F, 0.0F, 0.0F}, 0.0F, 0.5F, {0.0F, -11.75F, 2.0F}, dragon.pitch,
-                       dragon.roll, true, true);
+                       dragon.roll, true, true, enhanced);
     }
 
     void append_skinned(EntityBatch &batch, const SkinnedModel &skinned, SDL_Texture *skin,
@@ -406,7 +431,7 @@ class EnemyModelLibrary::Impl final
                         float model_scale = 1.0F,
                         std::array<float, 3> model_offset = {0.0F, 0.0F, 0.0F}, float pitch = 0.0F,
                         float roll = 0.0F, bool flip_forward = false,
-                        bool source_dragon_attitude = false)
+                        bool source_dragon_attitude = false, bool albedo = false)
     {
         if (!skinned.loaded)
             return;
@@ -560,9 +585,12 @@ class EnemyModelLibrary::Impl final
                 vertex.z = skinned_position[2];
                 vertex.u = source.uv[0];
                 vertex.v = source.uv[1];
-                vertex.red = std::min(1.0F, sun_color[0] * sun_gain + torch_add[0]);
-                vertex.green = std::min(1.0F, sun_color[1] * sun_gain + torch_add[1]);
-                vertex.blue = std::min(1.0F, sun_color[2] * sun_gain + torch_add[2]);
+                // The Original presentation's light, baked; the Enhanced
+                // shader lights the albedo (white) from sky_light and
+                // torch_light below instead.
+                vertex.red = albedo ? 1.0F : std::min(1.0F, sun_color[0] * sun_gain + torch_add[0]);
+                vertex.green = albedo ? 1.0F : std::min(1.0F, sun_color[1] * sun_gain + torch_add[1]);
+                vertex.blue = albedo ? 1.0F : std::min(1.0F, sun_color[2] * sun_gain + torch_add[2]);
                 if (normal_length > 0.0001F)
                 {
                     vertex.normal_x = normal[0] / normal_length;
@@ -588,6 +616,7 @@ class EnemyModelLibrary::Impl final
     }
 
     SDL_Renderer *renderer_{};
+    std::filesystem::path derived_;
     std::array<SkinnedModel, 8> models_{};
     std::array<SDL_Texture *, 14> textures_{};
     std::array<SDL_Texture *, 5> dragon_textures_{};
@@ -618,15 +647,20 @@ float EnemyModelLibrary::clip_duration(world::EnemyModelKind model,
 
 void EnemyModelLibrary::append_enemy(EntityBatch &batch, const world::Enemy &enemy, float sun_light,
                                      float torch_light, const std::array<float, 3> &sun_color,
-                                     float daylight)
+                                     float daylight, bool enhanced)
 {
-    impl_->append_enemy(batch, enemy, sun_light, torch_light, sun_color, daylight);
+    impl_->append_enemy(batch, enemy, sun_light, torch_light, sun_color, daylight, enhanced);
 }
 
 void EnemyModelLibrary::append_dragon(EntityBatch &batch, const world::Dragon &dragon,
-                                      const std::array<float, 3> &sun_color)
+                                      const std::array<float, 3> &sun_color, bool enhanced)
 {
-    impl_->append_dragon(batch, dragon, sun_color);
+    impl_->append_dragon(batch, dragon, sun_color, enhanced);
+}
+
+std::vector<SDL_Texture *> EnemyModelLibrary::reload_textures()
+{
+    return impl_->reload_textures();
 }
 
 } // namespace openminerz

@@ -56,7 +56,7 @@ struct ExtensionAdmissionResult final
 class HostAdmissionGate final
 {
   public:
-    HostAdmissionGate(HostSessionSettings settings, bool game_begun, std::int32_t game_mode,
+    HostAdmissionGate(HostSessionSettings settings, bool join_closed, std::int32_t game_mode,
                       std::int32_t difficulty, bool infinite_resources,
                       bool host_occupies_player_slot = true);
 
@@ -64,6 +64,15 @@ class HostAdmissionGate final
     [[nodiscard]] ExtensionAdmissionResult receive_extension(PeerId peer,
                                                              std::span<const std::uint8_t> packet);
     [[nodiscard]] bool may_forward_gameplay(PeerId peer) const noexcept;
+    // (Network/mod channel) The session carries a server/core mod, so mod
+    // channel frames exist at all.
+    [[nodiscard]] bool mod_channel_enabled() const noexcept;
+    // Mod channel frames may flow with this peer: the session has a mod
+    // channel and the peer was admitted through the extension hello.
+    [[nodiscard]] bool may_exchange_mod_frames(PeerId peer) const noexcept;
+    // Download frames may come from a peer that advertised the extension and
+    // has not finished its hello yet (or finished it).
+    [[nodiscard]] bool may_download_mods(PeerId peer) const noexcept;
     [[nodiscard]] AdmissionStatus status(PeerId peer) const noexcept;
     void disconnect(PeerId peer) noexcept;
 
@@ -78,6 +87,8 @@ class HostAdmissionGate final
     struct PeerState final
     {
         AdmissionStatus status{AdmissionStatus::disconnected};
+        // Admitted through the extension hello (never true for a stock peer).
+        bool extension{};
     };
 
     [[nodiscard]] ExtensionAdmissionResult reject_extension(PeerId peer, std::uint64_t nonce,

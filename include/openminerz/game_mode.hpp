@@ -27,6 +27,43 @@ enum class GameDifficulty : int
     hardcore = 3
 };
 
+// Exploration preserves resources but still requires finding the crafting materials.
+[[nodiscard]] constexpr bool has_unrestricted_resources(GameMode mode, bool infinite) noexcept
+{
+    return infinite && mode != GameMode::exploration;
+}
+
+// Stock InGameHUD.ApplyDamage is `if (!LocalPlayer.Dead) { ... PlayerHealth -=
+// damageAmount; ... }` in BOTH shipped generations (Classic 1.6.3.8 and Modern
+// 1.9.9.8): InfiniteResourceMode never makes a player immune, online or
+// offline. The `!InfiniteResourceMode || (SessionProperties[0].Value == 3 &&
+// IsOnlineGame)` guard this function used to model, and the matching guards on
+// ammunition, resources and enemy blocking, exist only in the OpenClassic
+// mod's source. Following the mod made a Creative OpenMinerZ player in a
+// Modern session unkillable next to stock players who were not.
+//
+// The parameters are kept so call sites state what they know; none of them
+// changes the answer.
+[[nodiscard]] constexpr bool creative_damage_immunity(GameMode mode, bool infinite, bool online,
+                                                      bool classic_network_version) noexcept
+{
+    static_cast<void>(mode);
+    static_cast<void>(infinite);
+    static_cast<void>(online);
+    static_cast<void>(classic_network_version);
+    return false;
+}
+
+// InGameHUD.RespawnPlayer reaches RestartLevelMessage - the clock reset, the
+// music restart and the distance record - only through
+//     GameMode <= Endurance && no living remote player && IsHost && !IsOnlineGame
+// and offline there are never any remote players. Inside a session the day is
+// the host's to broadcast, so a respawn must leave it alone.
+[[nodiscard]] constexpr bool respawn_restarts_level(GameMode mode, bool online) noexcept
+{
+    return mode == GameMode::endurance && !online;
+}
+
 // EnemyManager.GetMinEnemySpawnTime's branch selector: Endurance and Dragon
 // Endurance always use the fast table, otherwise Normal/Hardcore do.
 [[nodiscard]] constexpr bool hard_spawn_branch(GameMode mode, GameDifficulty difficulty) noexcept

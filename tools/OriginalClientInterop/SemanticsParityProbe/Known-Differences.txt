@@ -1,0 +1,22 @@
+# Differences between the native client and the owned original that
+# Test-SemanticsParity.ps1 found and that are NOT fixed. Each line is
+#
+#   <network version> <regular expression over the fact key> <why it is still different>
+#
+# A line here keeps the test green, so it is a debt, not a waiver: every one of
+# them is something a stock player and an OpenMinerZ player can see differently
+# in the same session. Remove the line when the difference is closed; a
+# difference that is not listed fails the test.
+
+# --- Classic 1.6.3.8 (network version 3) ------------------------------------
+# (none. Surface lava is solid again: the pass-through rule is now the
+# default-off "Sinking lava" enhancement in include/openminerz/retail_parity.hpp,
+# which is never in effect in a session. See docs/retail-parity.md.)
+
+# --- Modern 1.9.9.8 (network version 4) -------------------------------------
+# The native item, enemy and block tables hold ONE generation's numbers
+# (Classic's). Every entry below is a value Modern changed.
+4 ^enemy\.count$ Modern has 53 enemy types: HELL_LORD is inserted at 51 and ALIEN moves to 52. The wire id is translated (world::enemy_type_from_wire) but the Hell Lord has no native type and is shown as a Felguard.
+4 ^enemy\.50\.(health|bullet_chance)$ Modern Felguard has 150 health and a certain bullet strike; the native table keeps Classic's 140 and 0.6, so this peer's copy dies 10 health early and reports the kill.
+4 ^enemy\.51\. Index 51 is the Hell Lord in Modern (300 health boss Felguard) and the Alien natively; compared by index, so every field differs. See enemy.count.
+4 ^item\.\d+\.gun\.recoil$ Modern retuned view recoil per weapon family. Recoil only moves the firing player's own camera and is not replicated.

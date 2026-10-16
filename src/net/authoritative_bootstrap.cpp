@@ -1,5 +1,6 @@
 #include "openminerz/net/authoritative_bootstrap.hpp"
 #include "openminerz/net/combat_codec.hpp"
+#include "openminerz/net/peer_inventory_store.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -95,6 +96,7 @@ bool inventory_slot_from_stack(const openminerz::PlayerInventory::Slot &slot,
 bool player_inventory_from_save(const openminerz::PlayerInventory &source, ProtocolVersion protocol,
                                 PlayerInventoryPayload &result)
 {
+    if (!source.valid_travel_destinations()) return false;
     PlayerInventoryPayload converted = make_empty_player_inventory(protocol);
     for (std::size_t index{}; index < source.storage().size(); ++index)
         if (!inventory_slot_from_stack(source.storage()[index], protocol, converted.storage[index]))
@@ -104,6 +106,18 @@ bool player_inventory_from_save(const openminerz::PlayerInventory &source, Proto
             if (!inventory_slot_from_stack(source.tray(tray_index)[index], protocol,
                                            converted.trays[tray_index][index]))
                 return false;
+    if (protocol == ProtocolVersion::modern_v4)
+    {
+        if (source.teleport_stations().size() > maximum_teleport_stations ||
+            !inventory_slot_from_stack(source.spawn_point(), protocol, converted.spawn_point))
+            return false;
+        for (const auto &station : source.teleport_stations())
+        {
+            InventoryItemPayload item;
+            if (!inventory_item_from_stack(station, protocol, item)) return false;
+            converted.teleport_stations.push_back(std::move(item));
+        }
+    }
     result = std::move(converted);
     return true;
 }
@@ -277,6 +291,17 @@ bool inventory_item_to_wire(openminerz::InventoryItemId item, ProtocolVersion pr
                             std::int16_t &wire_item) noexcept
 {
     const auto value = static_cast<std::uint16_t>(item);
+    // InventoryItem.Create reads the id and indexes AllItems with it. An id
+    // that generation's Initalize never registered (SpaceKnife in both, a
+    // dozen Modern enum members) makes a stock peer throw while it is still
+    // reading the message, so such an item must never be written.
+    if (!openminerz::item_registered(item, protocol == ProtocolVersion::modern_v4
+                                               ? openminerz::InventoryProfile::modern
+                                               : openminerz::InventoryProfile::classic))
+    {
+        wire_item = 0;
+        return false;
+    }
     if (value <= 122U)
     {
         wire_item = static_cast<std::int16_t>(value);
@@ -301,19 +326,23 @@ bool inventory_item_from_wire(std::int16_t wire_item, ProtocolVersion protocol,
     if (wire_item < 0)
         return false;
     const auto value = static_cast<std::uint16_t>(wire_item);
+    openminerz::InventoryItemId candidate{};
     if (value <= 122U)
-    {
-        item = static_cast<openminerz::InventoryItemId>(value);
-        return true;
-    }
-    if (protocol == ProtocolVersion::modern_v4 && value <= 154U)
-    {
-        item = static_cast<openminerz::InventoryItemId>(
+        candidate = static_cast<openminerz::InventoryItemId>(value);
+    else if (protocol == ProtocolVersion::modern_v4 && value <= 154U)
+        candidate = static_cast<openminerz::InventoryItemId>(
             static_cast<std::uint16_t>(openminerz::InventoryItemId::modern_chainsaw_1) + value -
             123U);
-        return true;
-    }
-    return false;
+    else
+        return false;
+    // Only ids the matching generation registers are items at all; a stock
+    // peer cannot produce the others (it would throw creating them).
+    if (!openminerz::item_registered(candidate, protocol == ProtocolVersion::modern_v4
+                                                    ? openminerz::InventoryProfile::modern
+                                                    : openminerz::InventoryProfile::classic))
+        return false;
+    item = candidate;
+    return true;
 }
 
 bool inventory_slot_to_stack(const InventorySlotPayload &source, ProtocolVersion protocol,
@@ -489,8 +518,10 @@ bool make_authoritative_bootstrap_snapshot(const openminerz::WorldSaveData &save
 }
 
 AuthoritativeBootstrapHost::AuthoritativeBootstrapHost(ProtocolVersion protocol,
-                                                       AuthoritativeBootstrapSnapshot snapshot)
-    : protocol_{protocol}, snapshot_{std::move(snapshot)}
+                                                       AuthoritativeBootstrapSnapshot snapshot,
+                                                       std::filesystem::path inventory_directory)
+    : protocol_{protocol}, inventory_directory_{std::move(inventory_directory)},
+      snapshot_{std::move(snapshot)}
 {
 }
 
@@ -498,6 +529,18 @@ bool AuthoritativeBootstrapHost::register_peer(PeerId peer, std::uint8_t player_
 {
     if (peer == 0U || peers_.contains(peer))
         return false;
+    if (!inventory_directory_.empty() && !stored_inventories_.contains(peer))
+    {
+        std::optional<PlayerInventoryPayload> stored;
+        if (!read_peer_inventory(inventory_directory_, protocol_, peer, stored))
+            return false;
+        if (stored.has_value())
+        {
+            if (stored_inventories_.size() >= 4096U)
+                return false;
+            stored_inventories_.emplace(peer, std::move(*stored));
+        }
+    }
     const auto stored = stored_inventories_.find(peer);
     const bool has_stored_inventory = stored != stored_inventories_.end();
     PlayerInventoryPayload inventory = has_stored_inventory ? stored->second : snapshot_.inventory;
@@ -525,6 +568,10 @@ bool AuthoritativeBootstrapHost::store_peer_inventory(PeerId peer,
     constexpr std::size_t maximum_stored_peer_inventories = 4096U;
     if (!stored_inventories_.contains(peer) &&
         stored_inventories_.size() >= maximum_stored_peer_inventories)
+        return false;
+    // Do not acknowledge an inventory that exists only in host memory.
+    if (!inventory_directory_.empty() &&
+        !write_peer_inventory(inventory_directory_, protocol_, peer, inventory))
         return false;
     found->second.inventory = inventory;
     found->second.inventory_is_default = false;
@@ -630,6 +677,14 @@ bool AuthoritativeBootstrapHost::update_spawner(IntVector3 location, bool starte
     return true;
 }
 
+bool AuthoritativeBootstrapHost::update_hell_boss_progress(std::uint32_t spawned, std::uint32_t maximum)
+{
+    if (protocol_ != ProtocolVersion::modern_v4 || spawned > maximum || maximum > 1000) return false;
+    snapshot_.world.hell_bosses_spawned = static_cast<std::int32_t>(spawned);
+    snapshot_.world.max_hell_boss_spawns = static_cast<std::int32_t>(maximum);
+    return true;
+}
+
 bool AuthoritativeBootstrapHost::apply_block_edit(IntVector3 position, std::uint8_t block_type)
 {
     const std::array positions{position};
@@ -676,8 +731,13 @@ bool AuthoritativeBootstrapHost::apply_block_replacements(std::span<const IntVec
 
 bool AuthoritativeBootstrapHost::apply_block_removals(std::span<const IntVector3> positions)
 {
-    return !positions.empty() && positions.size() <= maximum_remove_blocks &&
+    return !positions.empty() && positions.size() <= maximum_received_remove_blocks &&
            apply_block_replacements(positions, 0U);
+}
+
+const AuthoritativeBootstrapSnapshot &AuthoritativeBootstrapHost::snapshot() const noexcept
+{
+    return snapshot_;
 }
 
 std::optional<PeerBootstrapStatus> AuthoritativeBootstrapHost::status(PeerId peer) const noexcept
@@ -841,7 +901,9 @@ BootstrapHandleResult AuthoritativeBootstrapHost::handle_packet(
     {
         if (!session_broadcast)
             return {BootstrapPumpError::malformed_frame, input, {}, {}};
-        if (!state.status.player_announced || state.status.inventory_sent)
+        // The original accepts later inventory requests too. They provide a
+        // reliable read-after-store barrier during a graceful disconnect.
+        if (!state.status.player_announced)
             return {BootstrapPumpError::out_of_order, input, {}, {}};
         const auto payload = encode_inventory_retrieve_payload(
             {state.inventory, state.player_gid, state.inventory_is_default}, protocol_,
@@ -884,7 +946,14 @@ BootstrapHandleResult AuthoritativeBootstrapHost::handle_packet(
     {
         if (!direct_to_host)
             return {BootstrapPumpError::malformed_frame, input, {}, {}};
-        if (!state.status.player_announced || state.status.delta_list_sent)
+        // The stock client announces chunk readiness from BlockTerrain.Init, as
+        // soon as WorldInfo arrives: ChunkCache.BECOMECLIENT calls
+        // BroadcastThatWereReady() while the terrain is still loading, and
+        // StartGame() sends PlayerExists only after that load has finished.
+        // Requiring presence first therefore deadlocks every stock joiner on its
+        // loading screen. The original host answers this request whenever it
+        // arrives, including again after a client-side terrain reset.
+        if (!state.status.world_info_sent)
             return {BootstrapPumpError::out_of_order, input, {}, {}};
         std::vector<std::int32_t> chunk_ids;
         chunk_ids.reserve(snapshot_.chunk_deltas.size());
@@ -907,7 +976,12 @@ BootstrapHandleResult AuthoritativeBootstrapHost::handle_packet(
     {
         if (!direct_to_host)
             return {BootstrapPumpError::malformed_frame, input, {}, {}};
-        if (!state.status.delta_list_sent)
+        // Until its delta list arrives (_remoteChunks == null) the stock
+        // ChunkCache asks the terrain server for every chunk it loads, so chunk
+        // requests legitimately precede both the delta list and PlayerExists.
+        // They are read-only and already limited to an admitted peer that has
+        // been sent WorldInfo.
+        if (!state.status.world_info_sent)
             return {BootstrapPumpError::out_of_order, input, {}, {}};
         RequestChunkPayload request;
         if (!decode_request_chunk_payload(decoded.payload, request, payload_error) ||
@@ -1033,6 +1107,9 @@ bool AuthoritativeBootstrapClient::install_world(const WorldInfoPayload &world)
 {
     openminerz::WorldSaveData converted;
     converted.seed = world.seed;
+    converted.encounters.hell_bosses_spawned = static_cast<std::uint32_t>(world.hell_bosses_spawned);
+    converted.encounters.max_hell_boss_spawns = static_cast<std::uint32_t>(world.max_hell_boss_spawns);
+    converted.encounters.hell_countdown = world::hell_boss_interval(converted.encounters.hell_bosses_spawned);
     converted.infinite_resources = world.infinite_resource_mode;
     converted.has_player = true;
     converted.player_position = {world.last_position.x, world.last_position.y,
@@ -1103,6 +1180,15 @@ bool AuthoritativeBootstrapClient::install_inventory(const PlayerInventoryPayloa
             if (!save_slot_from_payload(inventory.trays[tray_index][index], options_.protocol,
                                         converted.tray(tray_index)[index]))
                 return false;
+    if (!save_slot_from_payload(inventory.spawn_point, options_.protocol, converted.spawn_point()))
+        return false;
+    for (const auto &station : inventory.teleport_stations)
+    {
+        openminerz::PlayerInventory::Slot slot;
+        if (!save_slot_from_payload(station, options_.protocol, slot)) return false;
+        if (slot) converted.teleport_stations().push_back(std::move(*slot));
+    }
+    if (!converted.valid_travel_destinations()) return false;
     staged_save_.inventory = std::move(converted);
     return true;
 }
@@ -1186,10 +1272,11 @@ BootstrapClientHandleResult AuthoritativeBootstrapClient::handle_packet(
     }
     if (input == "ItemCrateMessage")
     {
-        if (state_ != State::awaiting_presence)
-            return fail(BootstrapClientError::out_of_order, input);
-        if (sender_gid != 0U)
-            return fail(BootstrapClientError::unexpected_sender, input);
+        // Only this part of the host transcript is initial crate replay. A
+        // player's live crate edit can arrive at any other bootstrap stage;
+        // the caller retains it for ordered application after installation.
+        if (state_ != State::awaiting_presence || sender_gid != 0U)
+            return {BootstrapClientError::unexpected_message, input, {}, false};
         ItemCratePayload crate;
         if (!decode_item_crate_payload(decoded.payload, options_.protocol, crate, payload_error) ||
             !apply_crate_item(crate))
@@ -1200,12 +1287,18 @@ BootstrapClientHandleResult AuthoritativeBootstrapClient::handle_packet(
     {
         if (sender_gid != options_.local_gid)
             return {BootstrapClientError::unexpected_message, input, {}, false};
-        if (state_ != State::awaiting_presence)
+        if (state_ == State::awaiting_world)
             return fail(BootstrapClientError::out_of_order, input);
         PlayerExistsPayload echo;
         if (!decode_player_exists_payload(decoded.payload, echo, payload_error) ||
             echo != presence_)
             return fail(BootstrapClientError::invalid_presence_echo, input);
+        // The application performs DNA's synchronous local broadcast echo.
+        // Native hosts also return that announcement over the network. Accept
+        // only the identical repeat after the local echo advanced bootstrap;
+        // requesting inventory again would restart the ordered transcript.
+        if (state_ != State::awaiting_presence)
+            return {BootstrapClientError::none, input, {}, false};
         auto request = make_send("RequestInventoryMessage", {},
                                  MessageDeliveryPolicy::reliable_ordered, std::nullopt);
         if (!request.has_value())

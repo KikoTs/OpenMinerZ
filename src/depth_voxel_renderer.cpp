@@ -1,14 +1,28 @@
 #include "depth_voxel_renderer.hpp"
 
+#include "far_terrain_renderer.hpp"
+#include "hell_atmosphere.hpp"
+#include "modding/graphics/mod_light_gpu.hpp"
+#include "modding/graphics/mod_output.hpp"
+#include "vfx/vfx_renderer.hpp"
+#include "post_processing.hpp"
+
+#include "openminerz/view_projection.hpp"
 #include "openminerz/world/biome_atmosphere.hpp"
+#include "openminerz/world/hell_atmosphere.hpp"
+#include "openminerz/world/liquid.hpp" // mod-liquid
+#include "openminerz/world/shadow_cascade.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <format>
+#include <functional>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <string>
@@ -21,6 +35,8 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
+
+#include "shader_cache.hpp"
 #endif
 
 namespace openminerz
@@ -28,6 +44,299 @@ namespace openminerz
 namespace
 {
 constexpr std::size_t maximum_crater_masks = 32U;
+
+// The vertex layout and its packing live at file scope, outside the D3D11
+// guard, so a mesh worker can build a section's payload without a device.
+struct GpuVertex final
+{
+    float x{};
+    float y{};
+    float z{};
+    float u{};
+    float v{};
+    float normal_x{};
+    float normal_y{};
+    float normal_z{};
+    float ambient_occlusion{};
+    float sky_light{};
+    float emission{};
+    float torch_light{};
+    std::uint32_t material{};
+    std::uint32_t indirect_light{};
+    std::uint32_t block_light_lobe{};
+};
+static_assert(sizeof(GpuVertex) == 60U,
+              "packed material and lighting data must keep the voxel vertex at 60 bytes");
+
+[[nodiscard]] std::array<float, 3> face_normal(world::FaceDirection direction) noexcept
+{
+    switch (direction)
+    {
+    case world::FaceDirection::positive_x:
+        return {1.0F, 0.0F, 0.0F};
+    case world::FaceDirection::negative_z:
+        return {0.0F, 0.0F, -1.0F};
+    case world::FaceDirection::negative_x:
+        return {-1.0F, 0.0F, 0.0F};
+    case world::FaceDirection::positive_z:
+        return {0.0F, 0.0F, 1.0F};
+    case world::FaceDirection::positive_y:
+        return {0.0F, 1.0F, 0.0F};
+    case world::FaceDirection::negative_y:
+        return {0.0F, -1.0F, 0.0F};
+    }
+    return {0.0F, 1.0F, 0.0F};
+}
+
+// Foliage sways in the vertex shader; everything else stays rigid.
+[[nodiscard]] float block_wave(world::BlockType type) noexcept
+{
+    return type == world::BlockType::leaves ? 1.0F : 0.0F;
+}
+
+// Snow sparkles and ice reflects: per-vertex gloss lifts the authored material
+// response for those surfaces without touching the derived texture atlases.
+[[nodiscard]] float block_gloss(world::BlockType type) noexcept
+{
+    switch (type)
+    {
+    case world::BlockType::ice:
+        return 0.85F;
+    case world::BlockType::snow:
+        return 0.55F;
+    case world::BlockType::diamond_wall:
+        return 0.6F;
+    default:
+        return 0.0F;
+    }
+}
+
+[[nodiscard]] bool is_torch_block(world::BlockType type) noexcept
+{
+    return type >= world::BlockType::torch && type <= world::BlockType::torch_neg_y;
+}
+
+[[nodiscard]] std::uint32_t pack_unorm8(const std::array<std::uint8_t, 4> &light) noexcept
+{
+    return static_cast<std::uint32_t>(light[0]) | static_cast<std::uint32_t>(light[1]) << 8U |
+           static_cast<std::uint32_t>(light[2]) << 16U |
+           static_cast<std::uint32_t>(light[3]) << 24U;
+}
+
+[[nodiscard]] std::uint32_t pack_material(float gloss, float wave, std::uint8_t tile,
+                                          std::uint8_t lava) noexcept
+{
+    const auto unorm = [](float value) {
+        return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0F, 1.0F) * 255.0F));
+    };
+    return static_cast<std::uint32_t>(unorm(gloss)) |
+           static_cast<std::uint32_t>(unorm(wave)) << 8U |
+           static_cast<std::uint32_t>(tile) << 16U | static_cast<std::uint32_t>(lava) << 24U;
+}
+
+[[nodiscard]] std::vector<GpuVertex> build_vertices(const std::vector<world::WorldFace> &faces)
+{
+    std::vector<GpuVertex> vertices;
+    vertices.reserve(faces.size() * 6U);
+    constexpr std::array<int, 6> triangle_order{0, 1, 2, 0, 2, 3};
+    for (const world::WorldFace &face : faces)
+    {
+        // Torch blocks render as the real torch prop through the entity
+        // pass now — never as voxel geometry. (mod-liquid) Liquid faces are
+        // drawn translucent, after everything opaque (build_liquid_vertices).
+        if (is_torch_block(face.block) || face.liquid != 0U)
+        {
+            continue;
+        }
+        const float x = static_cast<float>(face.x);
+        const float y = static_cast<float>(face.y);
+        const float z = static_cast<float>(face.z);
+        std::array<std::array<float, 3>, 4> corners{};
+        switch (face.direction)
+        {
+        case world::FaceDirection::positive_x:
+            corners = {{{{x + 1.0F, y, z}},
+                        {{x + 1.0F, y + 1.0F, z}},
+                        {{x + 1.0F, y + 1.0F, z + 1.0F}},
+                        {{x + 1.0F, y, z + 1.0F}}}};
+            break;
+        case world::FaceDirection::negative_z:
+            corners = {{{{x + 1.0F, y, z}},
+                        {{x, y, z}},
+                        {{x, y + 1.0F, z}},
+                        {{x + 1.0F, y + 1.0F, z}}}};
+            break;
+        case world::FaceDirection::negative_x:
+            corners = {{{{x, y, z + 1.0F}},
+                        {{x, y + 1.0F, z + 1.0F}},
+                        {{x, y + 1.0F, z}},
+                        {{x, y, z}}}};
+            break;
+        case world::FaceDirection::positive_z:
+            corners = {{{{x, y, z + 1.0F}},
+                        {{x + 1.0F, y, z + 1.0F}},
+                        {{x + 1.0F, y + 1.0F, z + 1.0F}},
+                        {{x, y + 1.0F, z + 1.0F}}}};
+            break;
+        case world::FaceDirection::positive_y:
+            corners = {{{{x, y + 1.0F, z}},
+                        {{x + 1.0F, y + 1.0F, z}},
+                        {{x + 1.0F, y + 1.0F, z + 1.0F}},
+                        {{x, y + 1.0F, z + 1.0F}}}};
+            break;
+        case world::FaceDirection::negative_y:
+            corners = {{{{x, y, z + 1.0F}},
+                        {{x + 1.0F, y, z + 1.0F}},
+                        {{x + 1.0F, y, z}},
+                        {{x, y, z}}}};
+            break;
+        }
+
+        // Per-tile array slices: local 0..1 coordinates, the slice index
+        // rides its own vertex channel.  No inset needed — the array clamp
+        // keeps neighbouring tiles from ever bleeding, at any mip.
+        const auto texture_coordinates =
+            world::atlas_uv_corners(face.direction, 0.0F, 0.0F, 1.0F, 1.0F);
+        const auto normal = face_normal(face.direction);
+        const float gloss = block_gloss(face.block);
+        const float wave = block_wave(face.block);
+        for (const int corner : triangle_order)
+        {
+            const auto index = static_cast<std::size_t>(corner);
+            vertices.push_back({corners[index][0], corners[index][1], corners[index][2],
+                                texture_coordinates[index][0], texture_coordinates[index][1],
+                                normal[0], normal[1], normal[2],
+                                static_cast<float>(face.ambient_occlusion[index]) / 255.0F,
+                                static_cast<float>(face.sky_light[index]) / 255.0F,
+                                static_cast<float>(face.emission) / 255.0F,
+                                static_cast<float>(face.block_light[index]) / 255.0F,
+                                // (The whole byte: mod block tiles are 64..255.)
+                                pack_material(gloss, wave, face.tile, face.lava_light[index]),
+                                pack_unorm8(face.indirect_light),
+                                pack_unorm8(face.block_light_lobe)});
+        }
+    }
+    return vertices;
+}
+
+// (mod-liquid) The faces of liquid cells (WorldFace::liquid), for the
+// translucent pass: a cell with no liquid above it has its top face, and the
+// upper edge of its sides, at the lowered surface. Emission -2 marks them for
+// the terrain shader's liquid branch (-1 is the Lagoon's sea).
+[[nodiscard]] std::vector<GpuVertex> build_liquid_vertices(const std::vector<world::WorldFace> &faces)
+{
+    std::vector<GpuVertex> vertices;
+    constexpr std::array<int, 6> triangle_order{0, 1, 2, 0, 2, 3};
+    for (const world::WorldFace &face : faces)
+    {
+        if (face.liquid == 0U)
+            continue;
+        const float x = static_cast<float>(face.x);
+        const float y = static_cast<float>(face.y);
+        const float z = static_cast<float>(face.z);
+        const float top = y + 1.0F - (face.liquid == 2U ? world::liquid_surface_drop : 0.0F);
+        std::array<std::array<float, 3>, 4> corners{};
+        switch (face.direction)
+        {
+        case world::FaceDirection::positive_x:
+            corners = {{{{x + 1.0F, y, z}}, {{x + 1.0F, top, z}}, {{x + 1.0F, top, z + 1.0F}},
+                        {{x + 1.0F, y, z + 1.0F}}}};
+            break;
+        case world::FaceDirection::negative_z:
+            corners = {{{{x + 1.0F, y, z}}, {{x, y, z}}, {{x, top, z}}, {{x + 1.0F, top, z}}}};
+            break;
+        case world::FaceDirection::negative_x:
+            corners = {{{{x, y, z + 1.0F}}, {{x, top, z + 1.0F}}, {{x, top, z}}, {{x, y, z}}}};
+            break;
+        case world::FaceDirection::positive_z:
+            corners = {{{{x, y, z + 1.0F}}, {{x + 1.0F, y, z + 1.0F}}, {{x + 1.0F, top, z + 1.0F}},
+                        {{x, top, z + 1.0F}}}};
+            break;
+        case world::FaceDirection::positive_y:
+            corners = {{{{x, top, z}}, {{x + 1.0F, top, z}}, {{x + 1.0F, top, z + 1.0F}},
+                        {{x, top, z + 1.0F}}}};
+            break;
+        case world::FaceDirection::negative_y:
+            corners = {{{{x, y, z + 1.0F}}, {{x + 1.0F, y, z + 1.0F}}, {{x + 1.0F, y, z}}, {{x, y, z}}}};
+            break;
+        }
+        const auto texture_coordinates =
+            world::atlas_uv_corners(face.direction, 0.0F, 0.0F, 1.0F, 1.0F);
+        const auto normal = face_normal(face.direction);
+        for (const int corner : triangle_order)
+        {
+            const auto index = static_cast<std::size_t>(corner);
+            vertices.push_back({corners[index][0], corners[index][1], corners[index][2],
+                                texture_coordinates[index][0], texture_coordinates[index][1],
+                                normal[0], normal[1], normal[2],
+                                static_cast<float>(face.ambient_occlusion[index]) / 255.0F,
+                                static_cast<float>(face.sky_light[index]) / 255.0F, -2.0F,
+                                static_cast<float>(face.block_light[index]) / 255.0F,
+                                pack_material(0.0F, 0.0F, face.tile, face.lava_light[index]),
+                                pack_unorm8(face.indirect_light),
+                                pack_unorm8(face.block_light_lobe)});
+        }
+    }
+    return vertices;
+}
+
+[[nodiscard]] std::vector<std::array<int, 2>> scan_crash_site_columns(
+    const std::vector<world::WorldFace> &faces)
+{
+    std::vector<std::array<int, 2>> columns;
+    for (const world::WorldFace &face : faces)
+    {
+        if (face.block == world::BlockType::space_rock ||
+            face.block == world::BlockType::space_rock_inventory)
+            columns.push_back({face.x, face.z});
+    }
+    std::sort(columns.begin(), columns.end());
+    columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
+    return columns;
+}
+
+// OPENMINERZ_DEEP_UNDERGROUND_SHADERS=0 compiles the terrain and creature
+// shaders without the deep underground's blocks (hell_atmosphere.hpp): text
+// for text the shaders they were before it existed. Diagnostic only; it is how
+// the Original presentation is shown, pixel for pixel, to be untouched by it.
+[[nodiscard]] bool deep_underground_shaders_wanted() noexcept
+{
+    const char *value = SDL_getenv("OPENMINERZ_DEEP_UNDERGROUND_SHADERS");
+    return value == nullptr || std::string_view{value} != "0";
+}
+
+// OPENMINERZ_DIAGNOSTIC_RENDER_CLOCK=SECONDS draws every frame of the run as
+// if the world clock stood at that moment. Diagnostic only: everything a
+// shader animates (flicker, pulses, drift, haze, embers) is then the same in
+// two runs, so two stills can be compared pixel for pixel, and a sequence of
+// runs a fraction of a second apart is a motion sequence.
+[[nodiscard]] float diagnostic_render_clock(float elapsed_seconds) noexcept
+{
+    static const float pinned = [] {
+        const char *value = SDL_getenv("OPENMINERZ_DIAGNOSTIC_RENDER_CLOCK");
+        return value != nullptr ? static_cast<float>(std::atof(value)) : -1.0F;
+    }();
+    return pinned >= 0.0F ? pinned : elapsed_seconds;
+}
+} // namespace
+
+PackedChunkMesh DepthVoxelRenderer::pack_chunk(const world::ChunkFaceBatch &batch)
+{
+    PackedChunkMesh packed;
+    packed.coordinate = batch.coordinate;
+    packed.vertex_stride = static_cast<std::uint32_t>(sizeof(GpuVertex));
+    packed.crash_columns = scan_crash_site_columns(batch.faces);
+    packed.lava_columns = scan_lava_columns(batch.faces);
+    std::vector<GpuVertex> vertices = build_vertices(batch.faces);
+    packed.vertex_count = static_cast<std::uint32_t>(vertices.size());
+    // (mod-liquid) Liquid faces after the opaque ones, in the same buffer.
+    const std::vector<GpuVertex> liquid = build_liquid_vertices(batch.faces);
+    packed.liquid_vertex_count = static_cast<std::uint32_t>(liquid.size());
+    vertices.insert(vertices.end(), liquid.begin(), liquid.end());
+    packed.vertices.resize(vertices.size() * sizeof(GpuVertex));
+    if (!vertices.empty())
+        std::memcpy(packed.vertices.data(), vertices.data(), packed.vertices.size());
+    return packed;
 }
 
 class DepthVoxelRenderer::Impl final
@@ -99,6 +408,22 @@ class DepthVoxelRenderer::Impl final
         {
             return;
         }
+        // Compiled here, with the rest of the pipeline, so switching to the
+        // Enhanced presentation or turning an effect on never compiles a
+        // shader during play. Optional: without it the Enhanced presentation
+        // falls back to the chain above.
+        post_processor_ = std::make_unique<PostProcessor>(device_.Get(), context_.Get());
+        // The deep underground's lava map, air pass and embers, compiled at
+        // load like everything else. Optional in the same way.
+        hell_ = std::make_unique<HellAtmosphere>(device_.Get(), context_.Get());
+        // The far landscape and the surface air that goes with it
+        // (far_terrain_renderer.hpp). Optional in the same way: without it the
+        // Enhanced presentation ends at the detailed window, as before.
+        far_terrain_ = std::make_unique<FarTerrainRenderer>(device_.Get(), context_.Get());
+        // The Enhanced presentation's effects (vfx/vfx_renderer.hpp): shaders
+        // compiled and flipbooks baked here, at load. Optional in the same way:
+        // without it the older particle path draws every effect.
+        vfx_ = std::make_unique<VfxRenderer>(device_.Get(), context_.Get());
         available_ = true;
 #else
         (void)atlas;
@@ -140,6 +465,7 @@ class DepthVoxelRenderer::Impl final
         }
         crash_site_columns_.clear();
         track_crash_site_faces(std::tuple{0, 0, 0}, faces);
+        track_lava_faces(faces);
         std::vector<GpuVertex> vertices = build_vertices(faces);
         vertex_count_ = static_cast<UINT>(vertices.size());
         const float x0 = static_cast<float>(minimum_x);
@@ -202,6 +528,8 @@ class DepthVoxelRenderer::Impl final
         chunk_meshes_.clear();
         crash_site_columns_.clear();
         crater_masks_dirty_ = true;
+        if (hell_ != nullptr)
+            hell_->lava().clear();
         for (const auto &batch : batches)
         {
             replace_chunk(batch);
@@ -229,14 +557,25 @@ class DepthVoxelRenderer::Impl final
         }
         const auto key = std::tuple{batch.coordinate.x, batch.coordinate.z, batch.coordinate.y};
         track_crash_site_faces(key, batch.faces);
+        if (hell_ != nullptr)
+            hell_->lava().set_section(key, scan_lava_columns(batch.faces));
         if (batch.faces.empty())
         {
             chunk_meshes_.erase(key);
             return;
         }
-        const auto vertices = build_vertices(batch.faces);
+        auto vertices = build_vertices(batch.faces);
         GpuChunkMesh mesh{};
         mesh.vertex_count = static_cast<UINT>(vertices.size());
+        // (mod-liquid) Liquid faces after the opaque ones.
+        const auto liquid = build_liquid_vertices(batch.faces);
+        mesh.liquid_count = static_cast<UINT>(liquid.size());
+        vertices.insert(vertices.end(), liquid.begin(), liquid.end());
+        if (vertices.empty())
+        {
+            chunk_meshes_.erase(key);
+            return;
+        }
         if (!create_vertex_buffer(vertices, mesh.vertex_buffer))
         {
             available_ = false;
@@ -246,6 +585,46 @@ class DepthVoxelRenderer::Impl final
         chunk_meshes_.insert_or_assign(key, std::move(mesh));
 #else
         (void)batch;
+#endif
+    }
+
+    // Everything replace_chunk does that needs no device has already run on the
+    // mesh worker; all that is left here is the buffer upload.
+    void install_packed_chunk(PackedChunkMesh packed)
+    {
+#if defined(_WIN32)
+        if (!available_)
+        {
+            return;
+        }
+        const auto key = std::tuple{packed.coordinate.x, packed.coordinate.z, packed.coordinate.y};
+        track_crash_site_columns(key, std::move(packed.crash_columns));
+        if (hell_ != nullptr)
+            hell_->lava().set_section(key, std::move(packed.lava_columns));
+        if (packed.vertex_count == 0U && packed.liquid_vertex_count == 0U)
+        {
+            chunk_meshes_.erase(key);
+            return;
+        }
+        GpuChunkMesh mesh{};
+        mesh.vertex_count = static_cast<UINT>(packed.vertex_count);
+        mesh.liquid_count = static_cast<UINT>(packed.liquid_vertex_count); // (mod-liquid)
+        const D3D11_BUFFER_DESC description{static_cast<UINT>(packed.vertices.size()),
+                                            D3D11_USAGE_IMMUTABLE,
+                                            D3D11_BIND_VERTEX_BUFFER,
+                                            0U,
+                                            0U,
+                                            packed.vertex_stride};
+        const D3D11_SUBRESOURCE_DATA data{packed.vertices.data(), 0U, 0U};
+        if (FAILED(device_->CreateBuffer(&description, &data, &mesh.vertex_buffer)))
+        {
+            available_ = false;
+            failure_reason_ = "failed to upload a chunk-local voxel mesh";
+            return;
+        }
+        chunk_meshes_.insert_or_assign(key, std::move(mesh));
+#else
+        (void)packed;
 #endif
     }
 
@@ -268,6 +647,9 @@ class DepthVoxelRenderer::Impl final
         });
         crater_masks_dirty_ =
             crater_masks_dirty_ || crash_site_columns_.size() != previous_crash_chunks;
+        if (hell_ != nullptr)
+            hell_->lava().retain(minimum_chunk_x, minimum_chunk_z, maximum_chunk_x,
+                                 maximum_chunk_z);
 #else
         (void)minimum_chunk_x;
         (void)minimum_chunk_z;
@@ -281,9 +663,383 @@ class DepthVoxelRenderer::Impl final
         entity_batch_ = std::move(batch);
     }
 
+    void forget_entity_texture(SDL_Texture *texture) noexcept
+    {
+        entity_srv_cache_.erase(texture);
+        // A batch still held from an earlier frame must not name it either.
+        std::erase_if(entity_batch_.spans,
+                      [texture](const EntitySpan &span) { return span.texture == texture; });
+    }
+
     void submit_dynamic_radiance(world::DynamicRadianceVolume volume)
     {
         dynamic_radiance_volume_ = std::move(volume);
+    }
+
+    // --- Enhanced presentation: the effects layer (vfx/vfx_renderer.hpp).
+    [[nodiscard]] bool vfx_available() const noexcept
+    {
+#if defined(_WIN32)
+        return vfx_ != nullptr && vfx_->ready() && post_processor_ != nullptr &&
+               post_processor_->ready();
+#else
+        return false;
+#endif
+    }
+
+    void submit_vfx(vfx::Frame &frame, const VfxOptions &options)
+    {
+#if defined(_WIN32)
+        if (vfx_ != nullptr && vfx_->ready())
+            vfx_->submit(frame, options);
+#else
+        (void)frame;
+        (void)options;
+#endif
+    }
+
+    // --- Mod graphics area (openminerz/modding/graphics.hpp). ---
+    void submit_mod_lights(const modding::graphics::LightFrame &frame)
+    {
+#if defined(_WIN32)
+        if (!available_)
+            return;
+        // Nothing is created until a mod has a light.
+        if (mod_lights_ == nullptr)
+        {
+            if (frame.empty())
+                return;
+            mod_lights_ = std::make_unique<ModLightGpu>(device_.Get(), context_.Get());
+        }
+        mod_lights_->submit(frame);
+#else
+        (void)frame;
+#endif
+    }
+
+    [[nodiscard]] modding::graphics::LightClusterStats mod_light_statistics()
+    {
+#if defined(_WIN32)
+        if (mod_lights_ != nullptr)
+            return mod_lights_->statistics();
+#endif
+        return {};
+    }
+
+    void set_mod_atmosphere(const modding::graphics::AtmosphereStack *stack) noexcept
+    {
+        mod_atmosphere_ = stack;
+    }
+
+    void set_mod_grade(const modding::graphics::Image *lut, std::string_view name, float strength)
+    {
+        mod_grade_lut_ = strength > 0.001F ? lut : nullptr;
+        mod_grade_name_ = name;
+        mod_grade_strength_ = strength;
+    }
+
+    // (mod-liquid)
+    void set_liquid_view(bool inside, std::array<float, 3> color) noexcept
+    {
+        liquid_view_inside_ = inside;
+        liquid_view_color_ = color;
+    }
+
+#if defined(_WIN32)
+    // The lit pixel shaders of this draw: their mod-light variants while it
+    // has mod lights, otherwise exactly the shaders compiled at load.
+    [[nodiscard]] ID3D11PixelShader *lit_terrain_shader()
+    {
+        return mod_lights_active_
+                   ? mod_lights_->variant(ModLightGpu::Variant::terrain, terrain_pixel_text_)
+                   : pixel_shader_.Get();
+    }
+    [[nodiscard]] ID3D11PixelShader *lit_entity_shader()
+    {
+        return mod_lights_active_
+                   ? mod_lights_->variant(ModLightGpu::Variant::entity, entity_pixel_text_)
+                   : entity_pixel_shader_.Get();
+    }
+    [[nodiscard]] ID3D11PixelShader *lit_entity_alpha_shader()
+    {
+        return mod_lights_active_ ? mod_lights_->variant(ModLightGpu::Variant::entity_alpha_lit,
+                                                         entity_alpha_lit_text_)
+                                  : entity_alpha_lit_pixel_shader_.Get();
+    }
+#endif
+
+    // A texture pack changed under a live world: the three atlases again, as
+    // the constructor takes them (mod tiles are installed again after).
+    void replace_atlases(SDL_Texture *atlas, SDL_Texture *normal_spec_atlas,
+                         SDL_Texture *metal_light_atlas)
+    {
+#if defined(_WIN32)
+        if (!available_ || atlas == nullptr || normal_spec_atlas == nullptr ||
+            metal_light_atlas == nullptr)
+            return;
+        const auto resource_of = [](SDL_Texture *texture) {
+            return static_cast<ID3D11Texture2D *>(SDL_GetPointerProperty(
+                SDL_GetTextureProperties(texture), SDL_PROP_TEXTURE_D3D11_TEXTURE_POINTER, nullptr));
+        };
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> atlas_view;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> normal_spec_view;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> metal_light_view;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> atlas_array;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> normal_spec_array;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> metal_light_array;
+        ID3D11Texture2D *atlas_resource = resource_of(atlas);
+        ID3D11Texture2D *normal_spec_resource = resource_of(normal_spec_atlas);
+        ID3D11Texture2D *metal_light_resource = resource_of(metal_light_atlas);
+        if (atlas_resource == nullptr || normal_spec_resource == nullptr ||
+            metal_light_resource == nullptr ||
+            FAILED(device_->CreateShaderResourceView(atlas_resource, nullptr, &atlas_view)) ||
+            FAILED(device_->CreateShaderResourceView(normal_spec_resource, nullptr,
+                                                     &normal_spec_view)) ||
+            FAILED(device_->CreateShaderResourceView(metal_light_resource, nullptr,
+                                                     &metal_light_view)) ||
+            !build_tile_array(atlas_resource, atlas_array) ||
+            !build_tile_array(normal_spec_resource, normal_spec_array) ||
+            !build_tile_array(metal_light_resource, metal_light_array))
+        {
+            std::cerr << "Texture pack: the terrain atlases could not be replaced\n";
+            return;
+        }
+        atlas_view_ = atlas_view;
+        normal_spec_view_ = normal_spec_view;
+        metal_light_view_ = metal_light_view;
+        atlas_array_view_ = atlas_array;
+        normal_spec_array_view_ = normal_spec_array;
+        metal_light_array_view_ = metal_light_array;
+#else
+        (void)atlas;
+        (void)normal_spec_atlas;
+        (void)metal_light_atlas;
+#endif
+    }
+
+    // Rebuilds the three tile arrays with the mod slices after the retail 64:
+    // the diffuse tiles as given, and a flat, matte material for each.
+    void install_mod_tiles(const std::vector<modding::graphics::Image> &tiles)
+    {
+#if defined(_WIN32)
+        if (!available_ || tiles.empty())
+            return;
+        const auto rebuild = [&](Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> &view,
+                                 const std::function<std::array<std::uint8_t, 4>(
+                                     std::size_t, int, int, int)> &texel) {
+            Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+            view->GetResource(&resource);
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> old;
+            if (FAILED(resource.As(&old)))
+                return false;
+            D3D11_TEXTURE2D_DESC description{};
+            old->GetDesc(&description);
+            const UINT retail = 64U;
+            const UINT slices = retail + static_cast<UINT>(std::min<std::size_t>(tiles.size(), 192U));
+            D3D11_TEXTURE2D_DESC grown = description;
+            grown.ArraySize = slices;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> array;
+            if (FAILED(device_->CreateTexture2D(&grown, nullptr, &array)))
+                return false;
+            for (UINT slice = 0U; slice < retail; ++slice)
+                context_->CopySubresourceRegion(
+                    array.Get(), D3D11CalcSubresource(0U, slice, grown.MipLevels), 0U, 0U, 0U,
+                    old.Get(), D3D11CalcSubresource(0U, slice, description.MipLevels), nullptr);
+            // BGRA or RGBA, whichever the pack's atlas was created as.
+            const bool bgra = description.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                              description.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                              description.Format == DXGI_FORMAT_B8G8R8X8_UNORM;
+            const int side = static_cast<int>(description.Width);
+            std::vector<std::uint8_t> pixels(static_cast<std::size_t>(side) * side * 4U);
+            for (UINT slice = retail; slice < slices; ++slice)
+            {
+                const std::size_t tile = slice - retail;
+                for (int y = 0; y < side; ++y)
+                    for (int x = 0; x < side; ++x)
+                    {
+                        std::array<std::uint8_t, 4> value = texel(tile, x, y, side);
+                        if (bgra)
+                            std::swap(value[0], value[2]);
+                        std::memcpy(&pixels[(static_cast<std::size_t>(y) * side + x) * 4U],
+                                    value.data(), 4U);
+                    }
+                context_->UpdateSubresource(array.Get(),
+                                            D3D11CalcSubresource(0U, slice, grown.MipLevels),
+                                            nullptr, pixels.data(), static_cast<UINT>(side) * 4U,
+                                            0U);
+            }
+            Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> grown_view;
+            if (FAILED(device_->CreateShaderResourceView(array.Get(), nullptr, &grown_view)))
+                return false;
+            context_->GenerateMips(grown_view.Get());
+            view = grown_view;
+            tile_array_textures_.push_back(std::move(array));
+            return true;
+        };
+        // Resampled once to the pack's tile size.
+        D3D11_TEXTURE2D_DESC atlas_description{};
+        {
+            Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+            atlas_array_view_->GetResource(&resource);
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+            if (FAILED(resource.As(&texture)))
+                return;
+            texture->GetDesc(&atlas_description);
+        }
+        const int side = static_cast<int>(atlas_description.Width);
+        std::vector<modding::graphics::Image> sized;
+        sized.reserve(tiles.size());
+        for (const modding::graphics::Image &tile : tiles)
+            sized.push_back(modding::graphics::resample(tile, side, side));
+        const auto diffuse = [&](std::size_t tile, int x, int y, int) {
+            const modding::graphics::Image &image = sized[tile];
+            if (image.empty())
+                return std::array<std::uint8_t, 4>{255U, 0U, 255U, 255U};
+            const std::size_t at = (static_cast<std::size_t>(y) * image.width + x) * 4U;
+            return std::array<std::uint8_t, 4>{image.rgba[at], image.rgba[at + 1U],
+                                               image.rgba[at + 2U], image.rgba[at + 3U]};
+        };
+        const auto flat = [](std::size_t, int, int, int) {
+            return modding::graphics::flat_normal_spec;
+        };
+        const auto matte = [](std::size_t, int, int, int) {
+            return modding::graphics::matte_metal_light;
+        };
+        if (!rebuild(atlas_array_view_, diffuse) || !rebuild(normal_spec_array_view_, flat) ||
+            !rebuild(metal_light_array_view_, matte))
+            std::cerr << "Mod block tiles could not be added to the terrain arrays\n";
+#else
+        (void)tiles;
+#endif
+    }
+
+    // --- Enhanced presentation: the far landscape (far_terrain_renderer.hpp).
+    void submit_far_terrain(world::FarTerrainFrame frame)
+    {
+#if defined(_WIN32)
+        if (far_terrain_ != nullptr)
+            far_terrain_->submit(std::move(frame));
+#else
+        (void)frame;
+#endif
+    }
+
+    // mod-world
+    void set_far_mod_palette(const world::ModPaletteLooks &looks,
+                             std::span<const world::BlockType> fallbacks,
+                             std::span<const world::FarSurfaceProfile> profiles)
+    {
+#if defined(_WIN32)
+        if (far_terrain_ != nullptr)
+            far_terrain_->set_mod_palette(looks, fallbacks, profiles);
+#else
+        (void)looks;
+        (void)fallbacks;
+        (void)profiles;
+#endif
+    }
+
+    [[nodiscard]] FarTerrainGpuStats far_terrain_stats() const noexcept
+    {
+#if defined(_WIN32)
+        if (far_terrain_ != nullptr)
+            return far_terrain_->stats();
+#endif
+        return {};
+    }
+
+    // --- Enhanced presentation: sky and post-processing (post_processing.hpp).
+    void set_post_effects(const PostEffects &effects) noexcept
+    {
+        post_effects_ = effects;
+        apply_post_effect_overrides(post_effects_);
+    }
+
+    void set_post_view(const PostView &view) noexcept
+    {
+        post_view_ = view;
+    }
+
+    void set_sky_plates(const std::array<SDL_Texture *, 6> &first,
+                        const std::array<SDL_Texture *, 6> &second, float second_weight) noexcept
+    {
+        sky_plate_first_ = first;
+        sky_plate_second_ = second;
+        sky_plate_second_weight_ = std::clamp(second_weight, 0.0F, 1.0F);
+    }
+
+    [[nodiscard]] bool draws_sky() const noexcept
+    {
+        return drew_sky_;
+    }
+
+    [[nodiscard]] bool deep_light_model() const noexcept
+    {
+#if defined(_WIN32)
+        return hell_frame_.model;
+#else
+        return false;
+#endif
+    }
+
+    [[nodiscard]] float lava_light_at(float x, float y, float z, float normal_y) const noexcept
+    {
+#if defined(_WIN32)
+        return hell_ != nullptr && hell_frame_.model
+                   ? hell_->lava_light_at(x, y, z, normal_y) * hell_->pulse()
+                   : 0.0F;
+#else
+        (void)x;
+        (void)y;
+        (void)z;
+        (void)normal_y;
+        return 0.0F;
+#endif
+    }
+
+    void draw_lens(float elapsed_seconds)
+    {
+#if defined(_WIN32)
+        if (!drew_sky_ || post_processor_ == nullptr || !post_processor_->lens_needed())
+            return;
+        // Everything SDL has queued (the world image, the first-person body)
+        // must be on the target before it is read back and graded in place.
+        if (!SDL_FlushRenderer(renderer_))
+            return;
+        const D3DStateBackup previous_state{context_.Get()};
+        post_processor_->lens(previous_state.render_target.Get(), elapsed_seconds);
+        previous_state.restore(context_.Get());
+        (void)SDL_FlushRenderer(renderer_);
+#else
+        (void)elapsed_seconds;
+#endif
+    }
+
+    // (Visuals) A mod's colour grade over the finished world AND the
+    // first-person body composited on it, in place on the target, both
+    // presentations; nothing without a LUT.
+    void draw_mod_grade()
+    {
+#if defined(_WIN32)
+        if (!available_ || mod_grade_lut_ == nullptr)
+            return;
+        if (!SDL_FlushRenderer(renderer_))
+            return;
+        const D3DStateBackup previous_state{context_.Get()};
+        Microsoft::WRL::ComPtr<ID3D11Resource> resource;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> target;
+        if (previous_state.render_target != nullptr)
+            previous_state.render_target->GetResource(&resource);
+        if (resource != nullptr && SUCCEEDED(resource.As(&target)))
+        {
+            if (mod_grade_pass_ == nullptr)
+                mod_grade_pass_ = std::make_unique<ModScreenPass>(renderer_);
+            mod_grade_pass_->grade(target.Get(), mod_grade_lut_, mod_grade_name_,
+                                   mod_grade_strength_);
+        }
+        previous_state.restore(context_.Get());
+        (void)SDL_FlushRenderer(renderer_);
+#endif
     }
 
     void set_grading(int tone_curve, bool auto_exposure, float exposure_compensation,
@@ -293,6 +1049,20 @@ class DepthVoxelRenderer::Impl final
         auto_exposure_enabled_ = auto_exposure;
         exposure_compensation_ = std::clamp(exposure_compensation, -2.0F, 2.0F);
         color_grading_ = std::clamp(color_grading, 0.0F, 1.5F);
+    }
+
+    // Values are stored here and turned into GPU resources at the start of
+    // the next draw, where the device context is known to be usable.
+    void set_quality(int shadow_resolution, float shadow_distance, int anisotropy, bool fxaa,
+                     bool bloom, bool sun_shafts) noexcept
+    {
+        requested_shadow_resolution_ =
+            static_cast<unsigned>(std::clamp(shadow_resolution, 512, 4096));
+        shadow_distance_ = std::clamp(shadow_distance, 32.0F, 150.0F);
+        requested_anisotropy_ = static_cast<unsigned>(std::clamp(anisotropy, 1, 16));
+        fxaa_enabled_ = fxaa;
+        bloom_enabled_ = bloom;
+        sun_shafts_enabled_ = sun_shafts;
     }
 
     // What the world was exposed by this frame, so the separately drawn sky
@@ -323,15 +1093,18 @@ class DepthVoxelRenderer::Impl final
     [[nodiscard]] bool draw(const ui::UiMetrics &metrics, const world::SkyState &sky,
                             const world::PlayerState &player, float vertical_fov_degrees,
                             float render_scale, float elapsed_seconds, float visibility_distance,
-                            world::BiomeKind biome, bool water_enabled, bool enhanced_foliage,
-                            bool ambient_occlusion, bool ore_glow, float shadow_strength)
+                            [[maybe_unused]] world::BiomeKind biome, bool water_enabled,
+                            bool enhanced_foliage, bool ambient_occlusion, bool ore_glow,
+                            float shadow_strength)
     {
 #if defined(_WIN32)
         if (!available_ || (vertex_buffer_ == nullptr && chunk_meshes_.empty()))
         {
             return false;
         }
+        elapsed_seconds = diagnostic_render_clock(elapsed_seconds);
         rebuild_crater_masks_if_needed();
+        apply_quality_resources();
         const float requested_scale = std::clamp(render_scale, 0.5F, 2.0F);
         const std::uint64_t requested_pixels =
             static_cast<std::uint64_t>(static_cast<double>(metrics.output_width) *
@@ -355,10 +1128,34 @@ class DepthVoxelRenderer::Impl final
             failure_reason_ = SDL_GetError();
             return false;
         }
+        // The Enhanced presentation's own sky and post-processing chain. It
+        // needs the half-float scene and every one of its targets; if anything
+        // is missing the frame is drawn exactly as before it existed. The
+        // Original presentation never takes this path.
+        bool enhanced_post = false;
+        if (enhanced_foliage && post_effects_.enabled && post_ready_ && hdr_scene_ &&
+            post_resource_ != nullptr)
+        {
+            D3D11_TEXTURE2D_DESC post_description{};
+            post_resource_->GetDesc(&post_description);
+            if (post_processor_ != nullptr)
+                post_processor_->set_effects(post_effects_);
+            enhanced_post = post_processor_ != nullptr && post_processor_->ready() &&
+                            post_processor_->resize(target_width, target_height,
+                                                    post_description.Format);
+        }
+        drew_sky_ = enhanced_post;
         const D3DStateBackup previous_state{context_.Get()};
         const bool dynamic_radiance_ready = upload_dynamic_radiance();
         constexpr float pi = 3.14159265358979323846F;
-        const float vertical_fov = std::clamp(vertical_fov_degrees, 50.0F, 105.0F) * pi / 180.0F;
+        // The frame's own world angle: the player's "Field of view" setting,
+        // already narrowed by any shoulder zoom (openminerz/view_projection.hpp).
+        // Vertical, Hor+: x follows the target's aspect ratio. The sky, the
+        // overlay camera and every other world pass sanitise the same way, so
+        // they all agree; nothing here may clamp tighter (an old 50-degree
+        // floor used to cut every zoom above 1.5x short).
+        const float vertical_fov =
+            view::sanitized_fov_degrees(vertical_fov_degrees) * pi / 180.0F;
         const float aspect = static_cast<float>(target_width) / static_cast<float>(target_height);
         const float sine_yaw = std::sin(player.yaw);
         const float cosine_yaw = std::cos(player.yaw);
@@ -373,8 +1170,34 @@ class DepthVoxelRenderer::Impl final
         SceneConstants constants{};
         const bool hell_atmosphere_enabled =
             enhanced_foliage && SDL_getenv("OPENMINERZ_LEGACY_HELL_ATMOSPHERE") == nullptr;
+        // The Enhanced presentation's deep underground (hell_atmosphere.hpp):
+        // follow the eye with the lava map and fix this frame's constants. For
+        // the Original presentation, and without the post-processing chain,
+        // every one of them is zero and nothing below changes.
+        hell_frame_ = {};
+        if (hell_ != nullptr)
+        {
+            HellFrameInput hell_input;
+            hell_input.enhanced =
+                enhanced_post && hell_atmosphere_enabled && deep_underground_terrain_ &&
+                deep_underground_creatures_;
+            hell_input.eye = {player.position.x,
+                              player.position.y + world::PlayerSimulation::eye_height,
+                              player.position.z};
+            hell_input.eye_presence = sky.hell;
+            hell_input.eye_sky_light = post_view_.eye_sky_light;
+            hell_input.daylight = sky.daylight;
+            hell_input.elapsed_seconds = elapsed_seconds;
+            hell_input.width = target_width;
+            hell_input.height = target_height;
+            hell_input.effects = post_effects_;
+            hell_frame_ = hell_->begin_frame(hell_input);
+        }
+        // w selects the older flat red fill of the lit shaders; the model above
+        // replaces it whenever it runs.
         constants.eye = {player.position.x, player.position.y + world::PlayerSimulation::eye_height,
-                         player.position.z, hell_atmosphere_enabled ? 1.0F : 0.0F};
+                         player.position.z,
+                         hell_atmosphere_enabled && !hell_frame_.model ? 1.0F : 0.0F};
         constants.right = {cosine_yaw, 0.0F, sine_yaw, 0.0F};
         constants.up = {-sine_yaw * sine_pitch, cosine_pitch, cosine_yaw * sine_pitch, 0.0F};
         constants.forward = {sine_yaw * cosine_pitch, sine_pitch, -cosine_yaw * cosine_pitch, 0.0F};
@@ -388,13 +1211,53 @@ class DepthVoxelRenderer::Impl final
         const bool biome_atmosphere_enabled =
             enhanced_foliage && SDL_getenv("OPENMINERZ_DISABLE_BIOME_ATMOSPHERE") == nullptr;
         const world::BiomeAtmosphere biome_atmosphere =
-            biome_atmosphere_enabled ? world::biome_atmosphere(biome) : world::BiomeAtmosphere{};
+            biome_atmosphere_enabled
+                ? world::biome_atmosphere_at(player.position.x, player.position.z)
+                : world::BiomeAtmosphere{};
         const float fog_end = std::clamp(visibility_distance - 10.0F, 24.0F, 118.0F);
         // Fog is a band near the draw limit, not an atmosphere-wide soup: the
         // original's distance haze only bites in the last stretch before the
         // chunk edge (the desert used to drown in orange from 24 blocks out).
-        const float fog_start = std::max(biome_atmosphere_enabled ? 18.0F : 24.0F,
-                                         fog_end * biome_atmosphere.fog_start_ratio);
+        float fog_start =
+            std::max(biome_atmosphere_enabled ? 18.0F : 24.0F,
+                     fog_end * std::lerp(biome_atmosphere.fog_start_ratio, 0.72F, sky.hell));
+        // --- The Enhanced atmosphere and far terrain (far_terrain_renderer.hpp,
+        // atmosphere_shader.hpp). Above ground the air is one function applied
+        // to every pixel after this pass, so the fade below is no longer fog:
+        //   * with far terrain drawn it is where the detailed window hands
+        //     over to the far landscape standing in the same place, and it
+        //     starts as late as the window allows;
+        //   * with none it slides out of reach, and the atmosphere's own
+        //     density buries the window's edge.
+        // Underground there is no sky's air and it is the cave fog it always
+        // was: in full where no skylight reaches the eye, and in Hell.
+        // (mod-liquid) Inside a liquid there is no air and no far landscape:
+        // the liquid's own fog is the distance (and fills the background).
+        const bool atmosphere_active =
+            enhanced_post && far_terrain_ != nullptr && far_terrain_->ready() && !liquid_view_inside_;
+        const bool far_terrain_active = atmosphere_active && far_terrain_->active();
+        float fade_end = fog_end;
+        if (far_terrain_active)
+            fog_start = std::lerp(world::far_handover(visibility_distance).start, fog_start,
+                                  std::clamp(sky.hell, 0.0F, 1.0F));
+        else if (atmosphere_active)
+        {
+            const float open_air = std::clamp(post_view_.eye_sky_light, 0.0F, 1.0F) *
+                                   (1.0F - std::clamp(sky.hell, 0.0F, 1.0F));
+            fog_start += open_air * 4096.0F;
+            fade_end += open_air * 4096.0F;
+        }
+        // Mod atmosphere layers (graphics area) blend their fog band over the
+        // one above; without a layer that sets one nothing changes.
+        if (mod_atmosphere_ != nullptr)
+            (void)mod_atmosphere_->fog_band(fog_start, fade_end);
+        // (mod-liquid) Inside a liquid the distance fogs into its colour
+        // within a few blocks (the colour itself is set below).
+        if (liquid_view_inside_)
+        {
+            fog_start = 0.0F;
+            fade_end = 16.0F;
+        }
         // SunlightColor and AmbientSunColor stay separate all the way to the
         // pixel shader, exactly like the original terrain effect parameters.
         constants.light_and_fog_start = {sky.direct.red, sky.direct.green, sky.direct.blue,
@@ -420,9 +1283,32 @@ class DepthVoxelRenderer::Impl final
             presentation_fog = {presentation_fog.red * presentation_fog.red,
                                 presentation_fog.green * presentation_fog.green,
                                 presentation_fog.blue * presentation_fog.blue};
+            // The deep underground's model lights the distance with the
+            // lava's glow in the air; what lies beyond is the cavern's dark.
+            if (hell_frame_.model)
+            {
+                const float deep = std::clamp(sky.hell, 0.0F, 1.0F);
+                presentation_fog = {
+                    std::lerp(presentation_fog.red, world::hell_far_haze.red, deep),
+                    std::lerp(presentation_fog.green, world::hell_far_haze.green, deep),
+                    std::lerp(presentation_fog.blue, world::hell_far_haze.blue, deep)};
+            }
         }
+        if (liquid_view_inside_)
+        {
+            // (mod-liquid) The liquid's own colour, deeper and darker than its
+            // texture, dimmed at night like the rest of the world.
+            const float shade = 0.55F * (0.2F + 0.8F * sky.daylight);
+            presentation_fog = {liquid_view_color_[0] * shade, liquid_view_color_[1] * shade,
+                                liquid_view_color_[2] * shade};
+            if (enhanced_foliage)
+                presentation_fog = {presentation_fog.red * presentation_fog.red,
+                                    presentation_fog.green * presentation_fog.green,
+                                    presentation_fog.blue * presentation_fog.blue};
+        }
+        constants.liquid_view = {liquid_view_inside_ ? 1.0F : 0.0F, 0.0F, 0.0F, 0.0F};
         constants.fog_and_end = {presentation_fog.red, presentation_fog.green,
-                                 presentation_fog.blue, fog_end};
+                                 presentation_fog.blue, fade_end};
         const bool eye_in_dry_crater =
             std::any_of(crater_masks_.begin(), crater_masks_.end(), [&](const auto &mask) {
                 return mask[3] > 0.5F && std::hypot(player.position.x - mask[0],
@@ -445,7 +1331,9 @@ class DepthVoxelRenderer::Impl final
                                       (3.0F - 2.0F * solar_shadow_visibility);
         }
         const float effective_shadow_strength =
-            sun_shadows_disabled ? 0.0F : quality_shadow_strength * solar_shadow_visibility;
+            sun_shadows_disabled
+                ? 0.0F
+                : quality_shadow_strength * solar_shadow_visibility * (1.0F - sky.hell);
         constants.render_options = {effective_shadow_strength, sky.specular.red, sky.specular.green,
                                     sky.specular.blue};
         // BlockTerrain.TorchColor (255, 235, 190); w lights the area around a held torch.
@@ -465,8 +1353,11 @@ class DepthVoxelRenderer::Impl final
         // off-camera mountains consume most of the map and cast one coarse slab
         // over the scene. Fitting each slice to what the camera can actually see
         // keeps contact shadows detailed while the far cascade remains stable.
-        constexpr float shadow_resolution = 2048.0F;
-        const float shadow_far = std::clamp(visibility_distance + 18.0F, 48.0F, 150.0F);
+        // Both follow the Shadows setting: the map size decides how sharp an
+        // edge is, the distance how many chunks every cascade has to draw.
+        const float shadow_resolution = static_cast<float>(shadow_resolution_);
+        const float shadow_far =
+            std::min(shadow_distance_, std::clamp(visibility_distance + 18.0F, 48.0F, 150.0F));
         const std::array<float, 3> shadow_splits{std::min(16.0F, shadow_far),
                                                  std::min(48.0F, shadow_far), shadow_far};
         const std::array<float, 3> shadow_starts{near_plane, shadow_splits[0], shadow_splits[1]};
@@ -507,12 +1398,11 @@ class DepthVoxelRenderer::Impl final
             std::array<CascadeTransform, 3> transforms{};
             for (std::size_t cascade = 0; cascade < transforms.size(); ++cascade)
             {
-                const float slice_near = shadow_starts[cascade];
+                const auto slice = world::shadow_slice(
+                    cascade == 0 ? near_plane : shadow_starts[cascade - 1], shadow_starts[cascade],
+                    shadow_splits[cascade], tangent_x, tangent_y);
+                const float slice_near = slice.near_depth;
                 const float slice_far = shadow_splits[cascade];
-                float minimum_u = std::numeric_limits<float>::max();
-                float maximum_u = std::numeric_limits<float>::lowest();
-                float minimum_v = std::numeric_limits<float>::max();
-                float maximum_v = std::numeric_limits<float>::lowest();
                 float minimum_d = std::numeric_limits<float>::max();
                 float maximum_d = std::numeric_limits<float>::lowest();
                 for (const float depth : {slice_near, slice_far})
@@ -531,28 +1421,22 @@ class DepthVoxelRenderer::Impl final
                             const float wz = constants.eye.z + constants.forward.z * depth +
                                              constants.right.z * half_x * side +
                                              constants.up.z * half_y * vertical;
-                            const float u = wx * rx + wy * ry + wz * rz;
-                            const float v = wx * ux + wy * uy + wz * uz;
                             const float d = -(wx * dx + wy * dy + wz * dz);
-                            minimum_u = std::min(minimum_u, u);
-                            maximum_u = std::max(maximum_u, u);
-                            minimum_v = std::min(minimum_v, v);
-                            maximum_v = std::max(maximum_v, v);
                             minimum_d = std::min(minimum_d, d);
                             maximum_d = std::max(maximum_d, d);
                         }
                 }
 
-                // A square footprint prevents resolution pumping when the camera
-                // turns. Padding grows with the cascade so filtered edges never
-                // expose the border.
+                // A fixed sphere radius, unlike a light-space bounding square,
+                // does not change texel size when the camera rotates.
                 const float padding = std::array{2.0F, 5.0F, 11.0F}[cascade];
-                const float extent = std::max({(maximum_u - minimum_u) * 0.5F,
-                                               (maximum_v - minimum_v) * 0.5F, 4.0F}) +
-                                     padding;
+                const float extent = std::max(slice.radius, 4.0F) + padding;
                 const float texel_world = (2.0F * extent) / shadow_resolution;
-                float center_u = (minimum_u + maximum_u) * 0.5F;
-                float center_v = (minimum_v + maximum_v) * 0.5F;
+                const float center_x = constants.eye.x + constants.forward.x * slice.center_depth;
+                const float center_y = constants.eye.y + constants.forward.y * slice.center_depth;
+                const float center_z = constants.eye.z + constants.forward.z * slice.center_depth;
+                float center_u = center_x * rx + center_y * ry + center_z * rz;
+                float center_v = center_x * ux + center_y * uy + center_z * uz;
                 center_u = std::floor(center_u / texel_world) * texel_world;
                 center_v = std::floor(center_v / texel_world) * texel_world;
 
@@ -571,7 +1455,8 @@ class DepthVoxelRenderer::Impl final
                                          0.5F + center_v * uv_scale};
                 transforms[cascade].z = {-dx * depth_scale, -dy * depth_scale, -dz * depth_scale,
                                          0.5F - center_d * depth_scale};
-                shadow_draw_radii[cascade] = slice_far + std::array{22.0F, 38.0F, 64.0F}[cascade];
+                shadow_draw_radii[cascade] =
+                    slice.center_depth + slice.radius + std::array{22.0F, 38.0F, 64.0F}[cascade];
             }
             constants.shadow_x = transforms[0].x;
             constants.shadow_y = transforms[0].y;
@@ -602,12 +1487,14 @@ class DepthVoxelRenderer::Impl final
             const float cz = sky.sun_x * constants.forward.x + sky.sun_y * constants.forward.y +
                              sky.sun_z * constants.forward.z;
             const float safe_z = std::max(cz, 0.0001F);
-            constants.post_sun = {0.5F + 0.5F * (cx / safe_z) * constants.projection.x,
-                                  0.5F - 0.5F * (cy / safe_z) * constants.projection.y,
-                                  enhanced_foliage && sky.sun_y <= -0.005F ? -1.0F : cz,
-                                  sky.daylight};
+            constants.post_sun = {
+                0.5F + 0.5F * (cx / safe_z) * constants.projection.x,
+                0.5F - 0.5F * (cy / safe_z) * constants.projection.y,
+                enhanced_foliage && (sky.sun_y <= -0.005F || sky.hell > 0.99F) ? -1.0F : cz,
+                sky.daylight};
         }
-        constants.post_params = {0.85F, 0.42F, static_cast<float>(tone_curve_), elapsed_seconds};
+        constants.post_params = {bloom_enabled_ ? 0.85F : 0.0F, sun_shafts_enabled_ ? 0.42F : 0.0F,
+                                 static_cast<float>(tone_curve_), elapsed_seconds};
         constants.target_size = {
             static_cast<float>(target_width), static_cast<float>(target_height),
             1.0F / static_cast<float>(target_width), 1.0F / static_cast<float>(target_height)};
@@ -615,9 +1502,14 @@ class DepthVoxelRenderer::Impl final
         // honest; the real curves expect scene light around middle grey.
         const float base_exposure = tone_curve_ == 0 ? 1.0F : 1.15F;
         // z scales the bloom's quadratic weight rather than thresholding it.
+        // w is zero for manual exposure and otherwise how far auto exposure
+        // may open: exactly one, except deep in the Enhanced presentation's
+        // Hell (world::hell_exposure_limit), which only its composite reads.
         constants.grade_params = {base_exposure * std::pow(2.0F, exposure_compensation_),
                                   color_grading_, 0.62F,
-                                  exposure_ready_ && auto_exposure_enabled_ ? 1.0F : 0.0F};
+                                  exposure_ready_ && auto_exposure_enabled_
+                                      ? hell_frame_.exposure_limit
+                                      : 0.0F};
         constants.dynamic_radiance_origin = {static_cast<float>(dynamic_radiance_volume_.origin_x),
                                              static_cast<float>(dynamic_radiance_volume_.origin_y),
                                              static_cast<float>(dynamic_radiance_volume_.origin_z),
@@ -630,10 +1522,16 @@ class DepthVoxelRenderer::Impl final
         constants.biome_tint = {
             biome_atmosphere.grade_multiplier.red, biome_atmosphere.grade_multiplier.green,
             biome_atmosphere.grade_multiplier.blue,
-            biome_atmosphere_enabled ? biome_atmosphere.grade_strength * atmosphere_presence
-                                     : 0.0F};
+            biome_atmosphere_enabled
+                ? biome_atmosphere.grade_strength * atmosphere_presence * (1.0F - sky.hell)
+                : 0.0F};
+        // z is the Enhanced sun-shadow penumbra scale (0.5 is the width this
+        // renderer always drew) and w switches the Enhanced torch flicker; the
+        // Original presentation receives the neutral pair and ignores both.
         constants.biome_params = {biome_atmosphere_enabled ? biome_atmosphere.saturation : 1.0F,
-                                  ore_glow ? 1.0F : 0.0F, 0.0F, 0.0F};
+                                  ore_glow ? 1.0F : 0.0F,
+                                  enhanced_post ? post_effects_.shadow_softness : 0.5F,
+                                  enhanced_post && !post_effects_.reduced_motion ? 1.0F : 0.0F};
         for (std::size_t index = 0U; index < crater_masks_.size(); ++index)
         {
             constants.crater_masks[index] = {crater_masks_[index][0], crater_masks_[index][1],
@@ -677,6 +1575,42 @@ class DepthVoxelRenderer::Impl final
                 context_->Draw(mesh.vertex_count, 0U);
             }
         };
+        // Mod graphics area: mod lights make the lit terrain shader dearer per
+        // pixel, so a frame with them draws the sections nearest first and the
+        // depth test rejects what is hidden before it is shaded. Opaque faces
+        // give the same image in any order. (Polish) Enhanced uses it on every
+        // frame (see below); Original frames without mod lights keep the
+        // order above.
+        const auto draw_world_geometry_nearest_first = [&](float draw_radius) {
+            thread_local std::vector<std::pair<float, const GpuChunkMesh *>> order;
+            order.clear();
+            const float draw_radius_squared = draw_radius * draw_radius;
+            for (const auto &[coordinate, mesh] : chunk_meshes_)
+            {
+                const float dx =
+                    (static_cast<float>(std::get<0>(coordinate)) + 0.5F) * world::chunk_width -
+                    player.position.x;
+                const float dz =
+                    (static_cast<float>(std::get<1>(coordinate)) + 0.5F) * world::chunk_depth -
+                    player.position.z;
+                if (dx * dx + dz * dz > draw_radius_squared)
+                    continue;
+                const float dy = static_cast<float>(world::world_min_y) +
+                                 (static_cast<float>(std::get<2>(coordinate)) + 0.5F) *
+                                     world::chunk_section_height -
+                                 constants.eye.y;
+                order.emplace_back(dx * dx + dy * dy + dz * dz, &mesh);
+            }
+            std::sort(order.begin(), order.end(),
+                      [](const auto &a, const auto &b) { return a.first < b.first; });
+            for (const auto &[distance, mesh] : order)
+            {
+                (void)distance;
+                ID3D11Buffer *chunk_buffer = mesh->vertex_buffer.Get();
+                context_->IASetVertexBuffers(0U, 1U, &chunk_buffer, &stride, &offset);
+                context_->Draw(mesh->vertex_count, 0U);
+            }
+        };
         const bool entity_buffer_ready =
             entity_ready_ && !entity_batch_.vertices.empty() && upload_entity_batch();
         const bool entity_shadow_casting =
@@ -689,6 +1623,53 @@ class DepthVoxelRenderer::Impl final
         context_->PSSetConstantBuffers(0U, 1U, &scene_buffer);
         ID3D11SamplerState *sampler = sampler_state_.Get();
         context_->PSSetSamplers(0U, 1U, &sampler);
+        // The deep underground's constants, lava map and noise, on registers
+        // of their own for the whole frame (all zero outside the Enhanced
+        // presentation, where no shader branch then reads them).
+        if (hell_ != nullptr)
+            hell_->bind();
+        // The lights of this frame's effects, likewise on a register of their
+        // own (none outside the Enhanced presentation's chain, where the lit
+        // shaders' loop over them then runs zero times).
+        if (vfx_ != nullptr)
+            vfx_->begin_frame(enhanced_post);
+        // Lighting props placed by mods (graphics area), likewise on registers
+        // of their own, in both presentations. The lit passes switch to the
+        // shaders' mod-light variants only for a frame that has such lights.
+        // Their cluster lists are built here, for this frame's camera.
+        mod_lights_active_ = false;
+        if (mod_lights_ != nullptr &&
+            mod_lights_->begin_frame(
+                {{constants.eye.x, constants.eye.y, constants.eye.z},
+                 {constants.right.x, constants.right.y, constants.right.z},
+                 {constants.up.x, constants.up.y, constants.up.z},
+                 {constants.forward.x, constants.forward.y, constants.forward.z},
+                 constants.projection.x,
+                 constants.projection.y,
+                 target_width,
+                 target_height}))
+        {
+            mod_lights_active_ =
+                mod_lights_->variant(ModLightGpu::Variant::terrain, terrain_pixel_text_) !=
+                    nullptr &&
+                mod_lights_->variant(ModLightGpu::Variant::entity, entity_pixel_text_) != nullptr &&
+                mod_lights_->variant(ModLightGpu::Variant::entity_alpha_lit,
+                                     entity_alpha_lit_text_) != nullptr;
+            if (!mod_lights_active_)
+                mod_lights_->unbind();
+        }
+        // Far terrain's shadow field for the lit pass, likewise on registers of
+        // its own (far_terrain_renderer.hpp). Zero constants, which switch the
+        // shader's term off, unless far terrain is drawn this frame.
+        if (far_terrain_ != nullptr)
+            far_terrain_->bind_near_shadow(
+                {static_cast<double>(constants.eye.x), static_cast<double>(constants.eye.y),
+                 static_cast<double>(constants.eye.z)},
+                elapsed_seconds,
+                far_terrain_active && constants.shadow_params.x > 0.0F
+                    ? std::lerp(0.70F, 0.94F, std::clamp(constants.shadow_params.x, 0.0F, 1.0F)) *
+                          std::clamp(constants.shadow_params.z, 0.0F, 1.0F) * (1.0F - sky.hell)
+                    : 0.0F);
 
         // 1) Depth-only shadow passes. Sunlight uses three fitted cascades;
         // the moving held torch uses a small six-face point map and therefore
@@ -715,7 +1696,8 @@ class DepthVoxelRenderer::Impl final
             context_->PSSetShaderResources(8U, 1U, &empty_shadow_transmission);
             if (sun_shadows_ready)
             {
-                const D3D11_VIEWPORT shadow_viewport{0.0F, 0.0F, 2048.0F, 2048.0F, 0.0F, 1.0F};
+                const D3D11_VIEWPORT shadow_viewport{0.0F, 0.0F, shadow_resolution,
+                                                     shadow_resolution, 0.0F, 1.0F};
                 context_->RSSetViewports(1U, &shadow_viewport);
                 context_->RSSetState(shadow_rasterizer_state_.Get());
                 context_->VSSetShader(shadow_vertex_shader_.Get(), nullptr, 0U);
@@ -807,21 +1789,108 @@ class DepthVoxelRenderer::Impl final
             context_->Unmap(scene_buffer_.Get(), 0U);
         }
 
+        // Enhanced only: everything the sky and post-processing chain is told
+        // about this frame, fixed before anything is drawn so the entity pass
+        // can read last frame's camera from the same constants.
+        PostFrame post_frame{};
+        if (enhanced_post)
+        {
+            post_frame.width = target_width;
+            post_frame.height = target_height;
+            post_frame.scene_resource = target_resource_.Get();
+            post_frame.scene_target = target_view_.Get();
+            post_frame.scene_view = target_srv_.Get();
+            post_frame.depth_readonly = depth_view_readonly_.Get();
+            post_frame.depth_view = depth_srv_.Get();
+            post_frame.scene_constants = scene_buffer_.Get();
+            post_frame.linear_sampler = sampler_state_.Get();
+            post_frame.shadow_sampler = shadow_sampler_.Get();
+            post_frame.shadow_view = sun_shadows_ready ? shadow_srv_.Get() : nullptr;
+            post_frame.shadow_transmission_view =
+                sun_shadows_ready && canopy_shadow_transmission_ready
+                    ? shadow_transmission_srv_.Get()
+                    : nullptr;
+            post_frame.output_target = post_rtv_.Get();
+            post_frame.eye = {constants.eye.x, constants.eye.y, constants.eye.z};
+            post_frame.right = {constants.right.x, constants.right.y, constants.right.z};
+            post_frame.up = {constants.up.x, constants.up.y, constants.up.z};
+            post_frame.forward = {constants.forward.x, constants.forward.y, constants.forward.z};
+            post_frame.projection = {constants.projection.x, constants.projection.y,
+                                     constants.projection.z, constants.projection.w};
+            post_frame.vertical_fov_degrees = vertical_fov * 180.0F / pi;
+            post_frame.elapsed_seconds = elapsed_seconds;
+            post_frame.delta_seconds =
+                post_last_seconds_ < 0.0F
+                    ? 1.0F / 60.0F
+                    : std::clamp(elapsed_seconds - post_last_seconds_, 0.0F, 0.25F);
+            post_last_seconds_ = elapsed_seconds;
+            post_frame.sky = sky;
+            post_frame.view = post_view_;
+            post_frame.shadow_far = shadow_far;
+            post_frame.fog_end = fog_end;
+            // (Pass 2b lays the one atmosphere over the scene; the resolve then
+            // has no fog of its own to re-aim, and the light-shaft pass only
+            // takes shadowed sunlight out of that atmosphere.)
+            // (mod-liquid) Inside a liquid its fog stays its fog: nothing is
+            // re-aimed at a sky the liquid hides.
+            post_frame.atmosphere = atmosphere_active || liquid_view_inside_;
+            post_frame.hell = hell_frame_.model ? hell_.get() : nullptr;
+            post_frame.deep_grade = hell_frame_.deep_grade;
+            post_frame.vfx = vfx_ != nullptr && vfx_->ready() ? vfx_.get() : nullptr;
+            std::array<ID3D11ShaderResourceView *, 12> plates{};
+            bool plates_bound = true;
+            for (std::size_t face = 0U; face < 6U; ++face)
+            {
+                plates[face] = entity_view(sky_plate_first_[face]);
+                plates[face + 6U] = entity_view(
+                    sky_plate_second_[face] != nullptr ? sky_plate_second_[face]
+                                                       : sky_plate_first_[face]);
+                plates_bound = plates_bound && plates[face] != nullptr;
+            }
+            post_processor_->set_sky_plates(plates, sky_plate_second_weight_, plates_bound);
+            post_processor_->begin_frame(post_frame);
+        }
+
         // 2) Main lit pass into the world colour target.
         constexpr std::array<float, 4> transparent{0.0F, 0.0F, 0.0F, 0.0F};
-        context_->ClearRenderTargetView(target_view_.Get(), transparent.data());
+        // (mod-liquid) Inside a liquid, what nothing covers is its fog, not sky.
+        const std::array<float, 4> liquid_background{constants.fog_and_end.x, constants.fog_and_end.y,
+                                                      constants.fog_and_end.z, 1.0F};
+        context_->ClearRenderTargetView(target_view_.Get(), liquid_view_inside_
+                                                                ? liquid_background.data()
+                                                                : transparent.data());
         context_->ClearDepthStencilView(depth_view_.Get(), D3D11_CLEAR_DEPTH, 1.0F, 0U);
         ID3D11RenderTargetView *render_target = target_view_.Get();
-        context_->OMSetRenderTargets(1U, &render_target, depth_view_.Get());
+        // Enhanced only: terrain and opaque entities also write what the
+        // post-processing chain needs to know about each surface (normal,
+        // baked occlusion, light shares, skylight). Blended passes below bind
+        // the colour target alone and leave that data untouched.
+        // The fourth target exists only while motion blur is on: entities
+        // write how far each of their pixels moved on screen. Terrain does not
+        // move, so its blend state masks that target and it keeps "use the
+        // camera's motion".
+        const std::array<ID3D11RenderTargetView *, 4> scene_targets{
+            render_target, enhanced_post ? post_processor_->surface_target(0U) : nullptr,
+            enhanced_post ? post_processor_->surface_target(1U) : nullptr,
+            enhanced_post ? post_processor_->surface_target(2U) : nullptr};
+        const bool motion_targets =
+            scene_targets[3] != nullptr && terrain_motion_blend_state_ != nullptr;
+        if (enhanced_post)
+            post_processor_->clear_surface_targets();
+        context_->OMSetRenderTargets(motion_targets ? 4U : (enhanced_post ? 3U : 1U),
+                                     scene_targets.data(), depth_view_.Get());
         context_->OMSetDepthStencilState(depth_state_.Get(), 0U);
-        context_->OMSetBlendState(blend_state_.Get(), nullptr, 0xFFFFFFFFU);
+        context_->OMSetBlendState(motion_targets ? terrain_motion_blend_state_.Get()
+                                                 : blend_state_.Get(),
+                                  nullptr, 0xFFFFFFFFU);
+        entity_motion_vectors_ = motion_targets;
         const D3D11_VIEWPORT viewport{
             0.0F, 0.0F, static_cast<float>(target_width), static_cast<float>(target_height),
             0.0F, 1.0F};
         context_->RSSetViewports(1U, &viewport);
         context_->RSSetState(rasterizer_state_.Get());
         context_->VSSetShader(vertex_shader_.Get(), nullptr, 0U);
-        context_->PSSetShader(pixel_shader_.Get(), nullptr, 0U);
+        context_->PSSetShader(lit_terrain_shader(), nullptr, 0U);
         const std::array material_views{
             atlas_array_view_.Get(),
             normal_spec_array_view_.Get(),
@@ -841,11 +1910,106 @@ class DepthVoxelRenderer::Impl final
         context_->PSSetSamplers(1U, 1U, &shadow_sampler);
         ID3D11SamplerState *aniso_sampler = aniso_sampler_state_.Get();
         context_->PSSetSamplers(2U, 1U, &aniso_sampler);
-        draw_world_geometry(visibility_distance + 24.0F);
+        // (Polish) Enhanced draws the sections nearest first on every frame:
+        // early depth rejects more of its dearer shading behind near walls
+        // (5120x1440 Ultra: a cave 5.22 -> 4.66 ms, a walk 7.58 -> 6.50 ms
+        // median; 1080p Default: no change), and the image is the same (0
+        // differing pixels in day, dusk, cave, underwater, foliage and far
+        // views). Original keeps the map order except on frames with mod
+        // lights. OPENMINERZ_DIAGNOSTIC_TERRAIN_ORDER=map|near forces one
+        // order, for such comparisons.
+        static const int terrain_order_override = [] {
+            const char *value = SDL_getenv("OPENMINERZ_DIAGNOSTIC_TERRAIN_ORDER");
+            if (value == nullptr)
+                return 0;
+            return std::string_view{value} == "near" ? 1 : std::string_view{value} == "map" ? -1 : 0;
+        }();
+        const bool nearest_first =
+            !chunk_meshes_.empty() &&
+            (terrain_order_override != 0 ? terrain_order_override > 0 : mod_lights_active_ || enhanced_foliage);
+        if (nearest_first)
+            draw_world_geometry_nearest_first(visibility_distance + 24.0F);
+        else
+            draw_world_geometry(visibility_distance + 24.0F);
 
         if (entity_buffer_ready)
         {
+            // Entities write every target, their own motion included.
+            if (motion_targets)
+                context_->OMSetBlendState(blend_state_.Get(), nullptr, 0xFFFFFFFFU);
             draw_entity_batch();
+        }
+
+        // (mod-liquid) Liquid faces over everything opaque, farthest section
+        // first, blended and depth-tested without writing depth; they read
+        // the scene's depth to see how much liquid lies before it.
+        {
+            thread_local std::vector<std::pair<float, const GpuChunkMesh *>> liquid_order;
+            liquid_order.clear();
+            const float liquid_radius = visibility_distance + 24.0F;
+            for (const auto &[coordinate, mesh] : chunk_meshes_)
+            {
+                if (mesh.liquid_count == 0U)
+                    continue;
+                const float dx = (static_cast<float>(std::get<0>(coordinate)) + 0.5F) * world::chunk_width -
+                                 constants.eye.x;
+                const float dz = (static_cast<float>(std::get<1>(coordinate)) + 0.5F) * world::chunk_depth -
+                                 constants.eye.z;
+                if (dx * dx + dz * dz > liquid_radius * liquid_radius)
+                    continue;
+                const float dy = static_cast<float>(world::world_min_y) +
+                                 (static_cast<float>(std::get<2>(coordinate)) + 0.5F) *
+                                     world::chunk_section_height -
+                                 constants.eye.y;
+                liquid_order.emplace_back(dx * dx + dy * dy + dz * dz, &mesh);
+            }
+            if (!liquid_order.empty())
+            {
+                std::sort(liquid_order.begin(), liquid_order.end(),
+                          [](const auto &a, const auto &b) { return a.first > b.first; });
+                context_->OMSetRenderTargets(1U, &render_target, depth_view_readonly_.Get());
+                context_->OMSetDepthStencilState(water_depth_state_.Get(), 0U);
+                context_->OMSetBlendState(water_blend_state_.Get(), nullptr, 0xFFFFFFFFU);
+                context_->IASetInputLayout(input_layout_.Get());
+                context_->VSSetShader(vertex_shader_.Get(), nullptr, 0U);
+                context_->PSSetShader(lit_terrain_shader(), nullptr, 0U);
+                ID3D11ShaderResourceView *scene_depth = depth_srv_.Get();
+                context_->PSSetShaderResources(5U, 1U, &scene_depth);
+                for (const auto &[distance, mesh] : liquid_order)
+                {
+                    (void)distance;
+                    ID3D11Buffer *chunk_buffer = mesh->vertex_buffer.Get();
+                    context_->IASetVertexBuffers(0U, 1U, &chunk_buffer, &stride, &offset);
+                    context_->Draw(mesh->liquid_count, mesh->vertex_count);
+                }
+                ID3D11ShaderResourceView *no_depth{};
+                context_->PSSetShaderResources(5U, 1U, &no_depth);
+                // Then the surface's depth (and, Enhanced, what the
+                // post-processing chain reads of a surface) without its
+                // colour, so what follows - the air, the far landscape and
+                // the hand-over between them, screen-space occlusion - reads
+                // the liquid where it is, not the bed seen through it.
+                const std::array<ID3D11RenderTargetView *, 3> surface_targets{
+                    nullptr, enhanced_post ? post_processor_->surface_target(0U) : nullptr,
+                    enhanced_post ? post_processor_->surface_target(1U) : nullptr};
+                context_->OMSetRenderTargets(enhanced_post ? 3U : 0U,
+                                             enhanced_post ? surface_targets.data() : nullptr,
+                                             depth_view_.Get());
+                context_->OMSetDepthStencilState(depth_state_.Get(), 0U);
+                context_->OMSetBlendState(blend_state_.Get(), nullptr, 0xFFFFFFFFU);
+                if (!enhanced_post)
+                    context_->PSSetShader(nullptr, nullptr, 0U);
+                for (const auto &[distance, mesh] : liquid_order)
+                {
+                    (void)distance;
+                    ID3D11Buffer *chunk_buffer = mesh->vertex_buffer.Get();
+                    context_->IASetVertexBuffers(0U, 1U, &chunk_buffer, &stride, &offset);
+                    context_->Draw(mesh->liquid_count, mesh->vertex_count);
+                }
+                context_->PSSetShader(lit_terrain_shader(), nullptr, 0U);
+                context_->OMSetRenderTargets(1U, &render_target, depth_view_.Get());
+                context_->OMSetBlendState(blend_state_.Get(), nullptr, 0xFFFFFFFFU);
+            }
         }
 
         if (water_enabled)
@@ -876,6 +2040,43 @@ class DepthVoxelRenderer::Impl final
         context_->PSSetShaderResources(0U, static_cast<UINT>(empty_views.size()),
                                        empty_views.data());
         context_->OMSetRenderTargets(0U, nullptr, nullptr);
+
+        // 2b) Enhanced only: the atmosphere over everything the scene holds,
+        // from each pixel's own depth, and the far landscape (when far terrain
+        // is on) with the open sky's air UNDER it where it holds no depth
+        // (far_terrain_renderer.hpp, atmosphere_shader.hpp).
+        if (atmosphere_active)
+        {
+            FarTerrainPass far_pass;
+            far_pass.width = target_width;
+            far_pass.height = target_height;
+            far_pass.scene_target = target_view_.Get();
+            far_pass.depth_view = depth_srv_.Get();
+            far_pass.surface_view = post_processor_->surface_view(1U);
+            far_pass.atlas_view = atlas_array_view_.Get();
+            far_pass.scene_constants = scene_buffer_.Get();
+            far_pass.eye = {static_cast<double>(constants.eye.x),
+                            static_cast<double>(constants.eye.y),
+                            static_cast<double>(constants.eye.z)};
+            far_pass.sky = sky;
+            far_pass.storminess = post_view_.storminess;
+            far_pass.eye_sky_light = post_view_.eye_sky_light;
+            far_pass.elapsed_seconds = elapsed_seconds;
+            far_pass.visibility = visibility_distance;
+            far_pass.shadow_opacity =
+                constants.shadow_params.x > 0.0F
+                    ? std::lerp(0.70F, 0.94F, std::clamp(constants.shadow_params.x, 0.0F, 1.0F)) *
+                          std::clamp(constants.shadow_params.z, 0.0F, 1.0F) * (1.0F - sky.hell)
+                    : 0.0F;
+            far_terrain_->draw(far_pass);
+        }
+
+        // 2c) Enhanced only: the sky, composed UNDER everything the scene
+        // already holds (and so behind the atmosphere's share of each pixel),
+        // which makes the frame opaque from here on.
+        // (mod-liquid) Not from inside a liquid: its fog is the background.
+        if (enhanced_post && !liquid_view_inside_)
+            post_processor_->draw_sky(post_frame);
 
         // 3) Post-processing: bloom bright/blur at quarter resolution, then the
         //    composite pass adds god rays and the sun glow.
@@ -954,7 +2155,8 @@ class DepthVoxelRenderer::Impl final
                     if (std::isfinite(adapted))
                     {
                         const float average = std::exp(adapted);
-                        const float maximum_exposure = enhanced_foliage ? 1.0F : 1.414F;
+                        const float maximum_exposure =
+                            enhanced_foliage ? hell_frame_.exposure_limit : 1.414F;
                         readback_exposure_ = std::clamp(0.20F / std::max(average, 0.0008F), 0.354F,
                                                         maximum_exposure);
                     }
@@ -964,6 +2166,20 @@ class DepthVoxelRenderer::Impl final
             ID3D11ShaderResourceView *adapted_view =
                 auto_exposure ? adapt_srv_[adapt_index_].Get() : nullptr;
 
+            if (enhanced_post)
+            {
+                // 3b) Enhanced: occlusion, volumetric light, motion blur, depth
+                // of field, bloom, the display transform, edge smoothing and
+                // sharpening (post_processing.hpp). The first-person body and
+                // held item are composited after this returns, so none of it
+                // can touch them, and the 2D interface is drawn after that.
+                post_frame.adapted_view = adapted_view;
+                post_processor_->run(post_frame);
+            }
+            else
+            {
+            // 3c) The original chain, unchanged (and deliberately left at its
+            // indentation): the Original presentation always runs this.
             const D3D11_VIEWPORT bloom_viewport{
                 0.0F, 0.0F, static_cast<float>(bloom_width_), static_cast<float>(bloom_height_),
                 0.0F, 1.0F};
@@ -974,7 +2190,9 @@ class DepthVoxelRenderer::Impl final
             const std::array bright_views{target_srv_.Get(), adapted_view};
             context_->PSSetShaderResources(0U, static_cast<UINT>(bright_views.size()),
                                            bright_views.data());
-            context_->Draw(3U, 0U);
+            // Bloom off (a player setting) skips the bright pass and both blurs.
+            if (bloom_enabled_)
+                context_->Draw(3U, 0U);
 
             const auto blur_pass = [&](ID3D11RenderTargetView *destination,
                                        ID3D11ShaderResourceView *source, float direction_x,
@@ -999,26 +2217,51 @@ class DepthVoxelRenderer::Impl final
                 context_->PSSetShaderResources(0U, 1U, &cleared);
                 context_->OMSetRenderTargets(0U, nullptr, nullptr);
             };
-            blur_pass(bloom_b_rtv_.Get(), bloom_a_srv_.Get(), 1.0F, 0.0F);
-            blur_pass(bloom_a_rtv_.Get(), bloom_b_srv_.Get(), 0.0F, 1.0F);
+            if (bloom_enabled_)
+            {
+                blur_pass(bloom_b_rtv_.Get(), bloom_a_srv_.Get(), 1.0F, 0.0F);
+                blur_pass(bloom_a_rtv_.Get(), bloom_b_srv_.Get(), 0.0F, 1.0F);
+            }
+            else
+            {
+                // The bright-pass state set above must not leak into the composite.
+                ID3D11ShaderResourceView *cleared = nullptr;
+                context_->PSSetShaderResources(0U, 1U, &cleared);
+                context_->OMSetRenderTargets(0U, nullptr, nullptr);
+            }
 
             context_->RSSetViewports(1U, &viewport);
             ID3D11RenderTargetView *post_target = post_rtv_.Get();
             context_->OMSetRenderTargets(1U, &post_target, nullptr);
-            context_->PSSetShader(composite_pixel_shader_.Get(), nullptr, 0U);
-            const std::array composite_views{target_srv_.Get(), bloom_a_srv_.Get(), adapted_view};
+            context_->PSSetShader(composite_shader(), nullptr, 0U);
+            // An unbound texture samples as zero, so a stale bloom image from
+            // before the option was switched off can never reach the screen.
+            ID3D11ShaderResourceView *bloom_view = bloom_enabled_ ? bloom_a_srv_.Get() : nullptr;
+            const std::array composite_views{target_srv_.Get(), bloom_view, adapted_view};
             context_->PSSetShaderResources(0U, static_cast<UINT>(composite_views.size()),
                                            composite_views.data());
             context_->Draw(3U, 0U);
             context_->PSSetShaderResources(0U, static_cast<UINT>(empty_views.size()),
                                            empty_views.data());
             context_->OMSetRenderTargets(0U, nullptr, nullptr);
+            }
             context_->CopyResource(presentation_resource_.Get(), post_resource_.Get());
         }
         else
         {
             context_->CopyResource(presentation_resource_.Get(), target_resource_.Get());
         }
+        // (Graphics area) a mod's colour grade is drawn later, by
+        // draw_mod_grade, over this image and the first-person body together.
+        retire_entity_batch();
+        if (hell_ != nullptr)
+            hell_->unbind();
+        if (vfx_ != nullptr)
+            vfx_->unbind();
+        if (mod_lights_ != nullptr)
+            mod_lights_->unbind();
+        if (far_terrain_ != nullptr)
+            far_terrain_->unbind_near_shadow();
         previous_state.restore(context_.Get());
         // SDL's second external-rendering boundary invalidates its D3D11 state cache.
         if (!SDL_FlushRenderer(renderer_))
@@ -1049,176 +2292,42 @@ class DepthVoxelRenderer::Impl final
 
   private:
 #if defined(_WIN32)
-    struct GpuVertex final
-    {
-        float x{};
-        float y{};
-        float z{};
-        float u{};
-        float v{};
-        float normal_x{};
-        float normal_y{};
-        float normal_z{};
-        float ambient_occlusion{};
-        float sky_light{};
-        float emission{};
-        float torch_light{};
-        std::uint32_t material{};
-        std::uint32_t indirect_light{};
-        std::uint32_t block_light_lobe{};
-    };
-    static_assert(sizeof(GpuVertex) == 60U,
-                  "packed material and lighting data must keep the voxel vertex at 60 bytes");
-
-    // Foliage sways in the vertex shader; everything else stays rigid.
-    [[nodiscard]] static float block_wave(world::BlockType type) noexcept
-    {
-        return type == world::BlockType::leaves ? 1.0F : 0.0F;
-    }
-
-    // Snow sparkles and ice reflects: per-vertex gloss lifts the authored material
-    // response for those surfaces without touching the derived texture atlases.
-    [[nodiscard]] static float block_gloss(world::BlockType type) noexcept
-    {
-        switch (type)
-        {
-        case world::BlockType::ice:
-            return 0.85F;
-        case world::BlockType::snow:
-            return 0.55F;
-        case world::BlockType::diamond_wall:
-            return 0.6F;
-        default:
-            return 0.0F;
-        }
-    }
-
-    [[nodiscard]] static bool is_torch_block(world::BlockType type) noexcept
-    {
-        return type >= world::BlockType::torch && type <= world::BlockType::torch_neg_y;
-    }
-
-    [[nodiscard]] static std::uint32_t pack_unorm8(
-        const std::array<std::uint8_t, 4> &light) noexcept
-    {
-        return static_cast<std::uint32_t>(light[0]) | static_cast<std::uint32_t>(light[1]) << 8U |
-               static_cast<std::uint32_t>(light[2]) << 16U |
-               static_cast<std::uint32_t>(light[3]) << 24U;
-    }
-
-    [[nodiscard]] static std::uint32_t pack_material(float gloss, float wave,
-                                                     std::uint8_t tile) noexcept
-    {
-        const auto unorm = [](float value) {
-            return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0F, 1.0F) * 255.0F));
-        };
-        return static_cast<std::uint32_t>(unorm(gloss)) |
-               static_cast<std::uint32_t>(unorm(wave)) << 8U |
-               static_cast<std::uint32_t>(tile) << 16U;
-    }
-
     struct GpuChunkMesh final
     {
         Microsoft::WRL::ComPtr<ID3D11Buffer> vertex_buffer;
         UINT vertex_count{};
+        // (mod-liquid) Translucent liquid faces after the opaque ones.
+        UINT liquid_count{};
     };
-
-    [[nodiscard]] std::vector<GpuVertex> build_vertices(
-        const std::vector<world::WorldFace> &faces) const
-    {
-        std::vector<GpuVertex> vertices;
-        vertices.reserve(faces.size() * 6U);
-        constexpr std::array<int, 6> triangle_order{0, 1, 2, 0, 2, 3};
-        for (const world::WorldFace &face : faces)
-        {
-            // Torch blocks render as the real torch prop through the entity
-            // pass now — never as voxel geometry.
-            if (is_torch_block(face.block))
-            {
-                continue;
-            }
-            const float x = static_cast<float>(face.x);
-            const float y = static_cast<float>(face.y);
-            const float z = static_cast<float>(face.z);
-            std::array<std::array<float, 3>, 4> corners{};
-            switch (face.direction)
-            {
-            case world::FaceDirection::positive_x:
-                corners = {{{{x + 1.0F, y, z}},
-                            {{x + 1.0F, y + 1.0F, z}},
-                            {{x + 1.0F, y + 1.0F, z + 1.0F}},
-                            {{x + 1.0F, y, z + 1.0F}}}};
-                break;
-            case world::FaceDirection::negative_z:
-                corners = {{{{x + 1.0F, y, z}},
-                            {{x, y, z}},
-                            {{x, y + 1.0F, z}},
-                            {{x + 1.0F, y + 1.0F, z}}}};
-                break;
-            case world::FaceDirection::negative_x:
-                corners = {{{{x, y, z + 1.0F}},
-                            {{x, y + 1.0F, z + 1.0F}},
-                            {{x, y + 1.0F, z}},
-                            {{x, y, z}}}};
-                break;
-            case world::FaceDirection::positive_z:
-                corners = {{{{x, y, z + 1.0F}},
-                            {{x + 1.0F, y, z + 1.0F}},
-                            {{x + 1.0F, y + 1.0F, z + 1.0F}},
-                            {{x, y + 1.0F, z + 1.0F}}}};
-                break;
-            case world::FaceDirection::positive_y:
-                corners = {{{{x, y + 1.0F, z}},
-                            {{x + 1.0F, y + 1.0F, z}},
-                            {{x + 1.0F, y + 1.0F, z + 1.0F}},
-                            {{x, y + 1.0F, z + 1.0F}}}};
-                break;
-            case world::FaceDirection::negative_y:
-                corners = {{{{x, y, z + 1.0F}},
-                            {{x + 1.0F, y, z + 1.0F}},
-                            {{x + 1.0F, y, z}},
-                            {{x, y, z}}}};
-                break;
-            }
-
-            // Per-tile array slices: local 0..1 coordinates, the slice index
-            // rides its own vertex channel.  No inset needed — the array clamp
-            // keeps neighbouring tiles from ever bleeding, at any mip.
-            const auto texture_coordinates =
-                world::atlas_uv_corners(face.direction, 0.0F, 0.0F, 1.0F, 1.0F);
-            const auto normal = face_normal(face.direction);
-            const float gloss = block_gloss(face.block);
-            const float wave = block_wave(face.block);
-            for (const int corner : triangle_order)
-            {
-                const auto index = static_cast<std::size_t>(corner);
-                vertices.push_back({corners[index][0], corners[index][1], corners[index][2],
-                                    texture_coordinates[index][0], texture_coordinates[index][1],
-                                    normal[0], normal[1], normal[2],
-                                    static_cast<float>(face.ambient_occlusion[index]) / 255.0F,
-                                    static_cast<float>(face.sky_light[index]) / 255.0F,
-                                    static_cast<float>(face.emission) / 255.0F,
-                                    static_cast<float>(face.block_light[index]) / 255.0F,
-                                    pack_material(gloss, wave, face.tile & 63U),
-                                    pack_unorm8(face.indirect_light),
-                                    pack_unorm8(face.block_light_lobe)});
-            }
-        }
-        return vertices;
-    }
 
     void track_crash_site_faces(const std::tuple<int, int, int> &key,
                                 const std::vector<world::WorldFace> &faces)
     {
-        std::vector<std::array<int, 2>> columns;
-        for (const world::WorldFace &face : faces)
-        {
-            if (face.block == world::BlockType::space_rock ||
-                face.block == world::BlockType::space_rock_inventory)
-                columns.push_back({face.x, face.z});
-        }
-        std::sort(columns.begin(), columns.end());
-        columns.erase(std::unique(columns.begin(), columns.end()), columns.end());
+        track_crash_site_columns(key, scan_crash_site_columns(faces));
+    }
+
+    // The single-mesh path hands over every face at once: file its lava under
+    // the chunk each column stands in, as the chunked path does.
+    void track_lava_faces(const std::vector<world::WorldFace> &faces)
+    {
+        if (hell_ == nullptr)
+            return;
+        world::LavaField &lava = hell_->lava();
+        lava.clear();
+        std::map<std::tuple<int, int, int>, std::vector<world::LavaColumn>> chunks;
+        const auto chunk_of = [](int block) {
+            return block >= 0 ? block / world::lava_field_chunk
+                              : -((-block + world::lava_field_chunk - 1) / world::lava_field_chunk);
+        };
+        for (const world::LavaColumn &column : scan_lava_columns(faces))
+            chunks[std::tuple{chunk_of(column.x), chunk_of(column.z), 0}].push_back(column);
+        for (auto &[key, columns] : chunks)
+            lava.set_section(key, std::move(columns));
+    }
+
+    void track_crash_site_columns(const std::tuple<int, int, int> &key,
+                                  std::vector<std::array<int, 2>> columns)
+    {
         if (columns.empty())
             crash_site_columns_.erase(key);
         else
@@ -1420,6 +2529,9 @@ class DepthVoxelRenderer::Impl final
         // xy = crash-site centre, z = dry radius, w = active. Lagoon water is
         // clipped around authored meteor impacts instead of flooding them.
         std::array<Float4, maximum_crater_masks> crater_masks;
+        // (mod-liquid) x = 1 while the camera is inside a mod liquid. Last,
+        // so every shader that declares less of this buffer reads it as before.
+        Float4 liquid_view;
     };
 
     struct D3DStateBackup final
@@ -1508,26 +2620,6 @@ class DepthVoxelRenderer::Impl final
         D3D11_PRIMITIVE_TOPOLOGY topology{};
     };
 
-    [[nodiscard]] static std::array<float, 3> face_normal(world::FaceDirection direction) noexcept
-    {
-        switch (direction)
-        {
-        case world::FaceDirection::positive_x:
-            return {1.0F, 0.0F, 0.0F};
-        case world::FaceDirection::negative_z:
-            return {0.0F, 0.0F, -1.0F};
-        case world::FaceDirection::negative_x:
-            return {-1.0F, 0.0F, 0.0F};
-        case world::FaceDirection::positive_z:
-            return {0.0F, 0.0F, 1.0F};
-        case world::FaceDirection::positive_y:
-            return {0.0F, 1.0F, 0.0F};
-        case world::FaceDirection::negative_y:
-            return {0.0F, -1.0F, 0.0F};
-        }
-        return {0.0F, 1.0F, 0.0F};
-    }
-
     // Copies each of the 64 atlas tiles into its own array slice and generates
     // a full mip chain per slice on the GPU.
     [[nodiscard]] bool build_tile_array(ID3D11Texture2D *source,
@@ -1578,15 +2670,160 @@ class DepthVoxelRenderer::Impl final
         return true;
     }
 
+    // Bring the GPU objects in line with set_quality(). A request the driver
+    // refuses is dropped and the previous object stays in use, so a failed
+    // 4096-square shadow allocation falls back instead of losing shadows.
+    void apply_quality_resources()
+    {
+        // "Texture detail" (Enhanced only): crisper is a negative mip bias.
+        // The Original presentation resolves to zero, the sampler it always had.
+        const float requested_mip_bias =
+            post_effects_.enabled ? -0.75F * std::clamp(post_effects_.texture_detail, -1.0F, 1.0F)
+                                  : 0.0F;
+        if (requested_anisotropy_ != anisotropy_ || requested_mip_bias != mip_bias_)
+        {
+            D3D11_SAMPLER_DESC description{};
+            description.Filter = requested_anisotropy_ > 1U ? D3D11_FILTER_ANISOTROPIC
+                                                            : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            description.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+            description.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+            description.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            description.MaxAnisotropy = requested_anisotropy_;
+            description.MipLODBias = requested_mip_bias;
+            description.MinLOD = 0.0F;
+            description.MaxLOD = D3D11_FLOAT32_MAX;
+            Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;
+            if (SUCCEEDED(device_->CreateSamplerState(&description, &sampler)))
+                aniso_sampler_state_ = std::move(sampler);
+            anisotropy_ = requested_anisotropy_;
+            mip_bias_ = requested_mip_bias;
+        }
+        if (requested_shadow_resolution_ != shadow_resolution_)
+        {
+            if (!resize_sun_shadow_targets(requested_shadow_resolution_))
+                requested_shadow_resolution_ = shadow_resolution_;
+        }
+    }
+
+    // Replace the three sun cascades (depth plus the leaf-transmission channel)
+    // with a different square size. Everything is created first and swapped in
+    // only when complete; the lit pass reads the texel size from a constant.
+    [[nodiscard]] bool resize_sun_shadow_targets(UINT resolution)
+    {
+        if (shadow_texture_ == nullptr || shadow_srv_ == nullptr)
+            return false;
+        D3D11_TEXTURE2D_DESC depth_description{};
+        shadow_texture_->GetDesc(&depth_description);
+        depth_description.Width = resolution;
+        depth_description.Height = resolution;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> depth_texture;
+        if (FAILED(device_->CreateTexture2D(&depth_description, nullptr, &depth_texture)))
+            return false;
+        D3D11_DEPTH_STENCIL_VIEW_DESC depth_view_description{};
+        shadow_views_[0]->GetDesc(&depth_view_description);
+        D3D11_SHADER_RESOURCE_VIEW_DESC depth_resource_description{};
+        shadow_srv_->GetDesc(&depth_resource_description);
+        std::array<Microsoft::WRL::ComPtr<ID3D11DepthStencilView>, 3> depth_views;
+        for (std::size_t cascade = 0; cascade < depth_views.size(); ++cascade)
+        {
+            depth_view_description.Texture2DArray.FirstArraySlice = static_cast<UINT>(cascade);
+            if (FAILED(device_->CreateDepthStencilView(depth_texture.Get(), &depth_view_description,
+                                                       &depth_views[cascade])))
+                return false;
+        }
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> depth_resource;
+        if (FAILED(device_->CreateShaderResourceView(depth_texture.Get(),
+                                                     &depth_resource_description, &depth_resource)))
+            return false;
+
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> transmission_texture;
+        std::array<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>, 3> transmission_views;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> transmission_resource;
+        if (shadow_transmission_texture_ != nullptr && shadow_transmission_srv_ != nullptr &&
+            shadow_transmission_views_[0] != nullptr)
+        {
+            D3D11_TEXTURE2D_DESC transmission_description{};
+            shadow_transmission_texture_->GetDesc(&transmission_description);
+            transmission_description.Width = resolution;
+            transmission_description.Height = resolution;
+            D3D11_RENDER_TARGET_VIEW_DESC transmission_view_description{};
+            shadow_transmission_views_[0]->GetDesc(&transmission_view_description);
+            D3D11_SHADER_RESOURCE_VIEW_DESC transmission_resource_description{};
+            shadow_transmission_srv_->GetDesc(&transmission_resource_description);
+            if (FAILED(device_->CreateTexture2D(&transmission_description, nullptr,
+                                                &transmission_texture)))
+                return false;
+            for (std::size_t cascade = 0; cascade < transmission_views.size(); ++cascade)
+            {
+                transmission_view_description.Texture2DArray.FirstArraySlice =
+                    static_cast<UINT>(cascade);
+                if (FAILED(device_->CreateRenderTargetView(transmission_texture.Get(),
+                                                           &transmission_view_description,
+                                                           &transmission_views[cascade])))
+                    return false;
+            }
+            if (FAILED(device_->CreateShaderResourceView(transmission_texture.Get(),
+                                                         &transmission_resource_description,
+                                                         &transmission_resource)))
+                return false;
+        }
+
+        shadow_texture_ = std::move(depth_texture);
+        shadow_views_ = std::move(depth_views);
+        shadow_srv_ = std::move(depth_resource);
+        if (transmission_texture != nullptr)
+        {
+            shadow_transmission_texture_ = std::move(transmission_texture);
+            shadow_transmission_views_ = std::move(transmission_views);
+            shadow_transmission_srv_ = std::move(transmission_resource);
+        }
+        shadow_resolution_ = resolution;
+        return true;
+    }
+
+    // The composite pass, optionally compiled without edge smoothing and/or
+    // sun shafts. A reduced variant is built the first time a player turns one
+    // of them off, so the default configuration costs nothing extra at start.
+    [[nodiscard]] ID3D11PixelShader *composite_shader()
+    {
+        const std::size_t variant = (fxaa_enabled_ ? 0U : 1U) | (sun_shafts_enabled_ ? 0U : 2U);
+        if (variant == 0U || composite_source_ == nullptr)
+            return composite_pixel_shader_.Get();
+        auto &shader = composite_variants_[variant];
+        if (shader == nullptr && !composite_variant_failed_[variant])
+        {
+            std::string source;
+            if ((variant & 1U) != 0U)
+                source += "#define OPENMINERZ_POST_NO_FXAA 1\n";
+            if ((variant & 2U) != 0U)
+                source += "#define OPENMINERZ_POST_NO_SHAFTS 1\n";
+            source += composite_source_;
+            // An optional variant failing must not mark the renderer broken.
+            const std::string previous_failure = failure_reason_;
+            const auto blob = compile_shader(source.c_str(), "main", "ps_4_0");
+            if (blob == nullptr ||
+                FAILED(device_->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                                  nullptr, &shader)))
+            {
+                composite_variant_failed_[variant] = true;
+                failure_reason_ = previous_failure;
+                shader.Reset();
+            }
+        }
+        return shader != nullptr ? shader.Get() : composite_pixel_shader_.Get();
+    }
+
     [[nodiscard]] Microsoft::WRL::ComPtr<ID3DBlob> compile_shader(const char *source,
                                                                   const char *entry,
                                                                   const char *target)
     {
         Microsoft::WRL::ComPtr<ID3DBlob> shader;
         Microsoft::WRL::ComPtr<ID3DBlob> errors;
-        const HRESULT result =
-            D3DCompile(source, std::char_traits<char>::length(source), nullptr, nullptr, nullptr,
-                       entry, target, D3DCOMPILE_ENABLE_STRICTNESS, 0U, &shader, &errors);
+        // Cached for the process (shader_cache.hpp): a world entry builds this
+        // renderer again and must not compile every pipeline a second time.
+        const HRESULT result = compile_hlsl_cached(
+            source, std::char_traits<char>::length(source), nullptr, nullptr, nullptr, entry,
+            target, D3DCOMPILE_ENABLE_STRICTNESS, 0U, &shader, &errors);
         if (FAILED(result))
         {
             failure_reason_ =
@@ -1626,7 +2863,7 @@ struct VertexInput
     float sky_light : TEXCOORD2;
     float emission : TEXCOORD3;
     float torch_light : TEXCOORD4;
-    // r = gloss, g = foliage wave, b * 255 = texture-array slice.
+    // r = gloss, g = foliage wave, b * 255 = texture slice, a = lava light.
     float4 material : TEXCOORD5;
     float4 indirect_light : TEXCOORD6;
     float4 block_light_lobe : TEXCOORD7;
@@ -1646,6 +2883,7 @@ struct PixelInput
     float tile : TEXCOORD7;
     float4 indirect_light : TEXCOORD8;
     float4 block_light_lobe : TEXCOORD9;
+    float lava_light : TEXCOORD10;
 };
 
 float3 swayed_position(float3 position, float wave, float time)
@@ -1678,6 +2916,7 @@ PixelInput main(VertexInput input)
     output.tile = input.material.b * 255.0f;
     output.indirect_light = input.indirect_light;
     output.block_light_lobe = input.block_light_lobe;
+    output.lava_light = input.material.a;
     return output;
 }
 )hlsl";
@@ -1716,6 +2955,7 @@ cbuffer Scene : register(b0)
     float4 BiomeTint;
     float4 BiomeParams;
     float4 CraterMasks[32];
+    float4 LiquidView;
 };
 
 Texture2DArray DiffuseAtlas : register(t0);
@@ -1745,6 +2985,7 @@ struct PixelInput
     float tile : TEXCOORD7;
     float4 indirect_light : TEXCOORD8;
     float4 block_light_lobe : TEXCOORD9;
+    float lava_light : TEXCOORD10;
     bool front_face : SV_IsFrontFace;
 };
 
@@ -1763,6 +3004,37 @@ float4 dynamic_radiance_cell(float3 world_position)
 float3 dynamic_radiance_seed(float3 world_position)
 {
     return dynamic_radiance_cell(world_position).rgb;
+}
+
+// Point lights thrown by this frame's effects (vfx/vfx_renderer.hpp): an
+// explosion, a flame. Bound only by the Enhanced presentation's chain; the
+// count reads as zero everywhere else and the loop does not run.
+cbuffer VfxLights : register(b9)
+{
+    float4 VfxLightCount;
+    float4 VfxLightPosRadius[16];
+    float4 VfxLightColor[16];
+};
+
+float3 vfx_point_lights(float3 world_position, float3 normal)
+{
+    float3 light = 0.0f.xxx;
+    int count = (int)VfxLightCount.x;
+    [loop]
+    for (int index = 0; index < count; ++index)
+    {
+        float3 offset = VfxLightPosRadius[index].xyz - world_position;
+        float radius = VfxLightPosRadius[index].w;
+        float range_squared = dot(offset, offset);
+        if (range_squared < radius * radius)
+        {
+            float range = sqrt(range_squared);
+            float share = saturate(1.0f - range / radius);
+            float facing = saturate(dot(normal, offset / max(range, 0.001f)) * 0.82f + 0.18f);
+            light += VfxLightColor[index].rgb * (share * share * facing);
+        }
+    }
+    return light;
 }
 
 float3 dynamic_radiance_gather(float3 world_position, float3 normal,
@@ -1817,14 +3089,14 @@ float cascade_visibility(int cascade, float3 world_position, float3 geometric_no
     if (facing_sun <= 0.05f)
         return 1.0f;
     float slope = 1.0f - saturate(facing_sun);
-    float3 biased = world_position + geometric_normal * texel_world * (1.15f + 2.4f * slope) +
+    float3 biased = world_position + geometric_normal * texel_world * (0.55f + 1.2f * slope) +
                     sun_direction_n * texel_world * 0.35f;
     float2 uv = float2(dot(biased, sx.xyz) + sx.w, dot(biased, sy.xyz) + sy.w);
     float depth = dot(biased, sz.xyz) + sz.w;
     if (any(uv < 0.002f) || any(uv > 0.998f))
         return 1.0f;
     float texel = ShadowParams.y;
-    float compare_bias = length(sz.xyz) * texel_world * (0.65f + slope * 1.35f);
+    float compare_bias = length(sz.xyz) * texel_world * (0.30f + slope * 0.65f);
     float receiver_depth = depth - compare_bias;
 
     // Diagnostic parity path for matched captures/benchmarks.
@@ -1883,9 +3155,13 @@ float cascade_visibility(int cascade, float3 world_position, float3 geometric_no
         blocker_distance = max(0.0f, receiver_depth - average_blocker) /
                            max(length(sz.xyz), 0.00001f);
     }
+    // "Shadow softness" (Enhanced only): how fast the penumbra opens with the
+    // distance to the caster. 1 is the width this renderer always drew; the
+    // Original presentation always gets exactly that.
+    float softness = AmbientSun.w > 0.5f ? BiomeParams.z * 2.0f : 1.0f;
     float filter_radius = blocker_count > 0.0f
-        ? clamp(0.72f + blocker_distance * 0.0045f / max(texel_world, 0.0001f),
-                0.72f, 3.25f)
+        ? clamp(0.72f + blocker_distance * 0.0045f * softness / max(texel_world, 0.0001f),
+                0.72f, 0.72f + 2.53f * softness)
         : (cascade == 2 ? 0.95f : 0.72f);
 
     static const float2 poisson[8] = {
@@ -1927,7 +3203,7 @@ float canopy_shadow_debug_value(float3 world_position, float3 geometric_normal)
     float texel_world = ShadowParams.y / max(length(sx.xyz), 0.0001f);
     float3 sun_direction = normalize(SunAndOptions.xyz);
     float slope = 1.0f - saturate(dot(geometric_normal, sun_direction));
-    float3 biased = world_position + geometric_normal * texel_world * (1.15f + 2.4f * slope) +
+    float3 biased = world_position + geometric_normal * texel_world * (0.55f + 1.2f * slope) +
                     sun_direction * texel_world * 0.35f;
     float2 uv = float2(dot(biased, sx.xyz) + sx.w, dot(biased, sy.xyz) + sy.w);
     if (any(uv < 0.0f) || any(uv > 1.0f))
@@ -1962,7 +3238,7 @@ float sun_shadow(float3 world_position, float3 geometric_normal, float distance_
     visibility = lerp(visibility, 1.0f, far_fade);
     // Cast shadows remove direct sun only. Their opacity is intentionally bounded
     // so a ridge cannot black out a valley that still sees the sky hemisphere.
-    float shadow_opacity = lerp(0.18f, 0.43f, saturate(ShadowParams.x)) *
+    float shadow_opacity = (AmbientSun.w > 0.5f ? lerp(0.70f, 0.94f, saturate(ShadowParams.x)) : lerp(0.18f, 0.43f, saturate(ShadowParams.x))) *
                            saturate(ShadowParams.z);
     return lerp(1.0f, visibility, shadow_opacity);
 }
@@ -2070,6 +3346,52 @@ float held_torch_shadow(float3 world_position, float3 geometric_normal)
     return lerp(0.12f, 1.0f, visibility);
 }
 
+// --- Far terrain (far_terrain_renderer.hpp, bind_near_shadow). ---
+// The shadow field swept from the far landscape's heights: per texel, the
+// height below which the ground is shaded by terrain further toward the sun.
+// The sun cascades only know casters near the camera, so without this a
+// mountain's evening shadow would darken the far landscape and stop at the
+// edge of the detailed window. x counts every caster, y only those beyond the
+// cascades' reach, which is what is laid over ground the cascades cover. All
+// zero (and the term off) unless far terrain is drawn.
+cbuffer FarShadow : register(b7)
+{
+    float4 FarShadowField[2];
+    float4 FarShadowParams;
+};
+Texture2D<float2> FarShadowOlder : register(t22);
+Texture2D<float2> FarShadowNewer : register(t23);
+SamplerState FarShadowSampler : register(s8);
+
+float far_field_light(Texture2D<float2> field, float4 placement, float2 relative_xz, float height,
+                      float beyond)
+{
+    float2 uv = (relative_xz + placement.xy) * placement.z;
+    float2 margin = min(uv, 1.0f - uv);
+    float inside = saturate(min(margin.x, margin.y) * 24.0f) * placement.w;
+    // Heights are stored in 1/64 block above the world's floor.
+    float2 tops = field.SampleLevel(FarShadowSampler, uv, 0.0f) * (65535.0f / 64.0f);
+    float softness = FarShadowParams.y;
+    float light = saturate((height - lerp(tops.y, tops.x, beyond) + softness * 0.25f) / softness);
+    return lerp(1.0f, light, inside);
+}
+
+float far_field_shadow(float3 world_position)
+{
+    if (FarShadowParams.z < 0.5f)
+        return 1.0f;
+    float camera_depth = max(dot(world_position - Eye.xyz, CameraForward.xyz), 0.0f);
+    // Past the cascades' own fade nothing else shades the ground at all.
+    float beyond = saturate((camera_depth - ShadowCascades.z * 0.88f) /
+                            max(ShadowCascades.z * 0.12f, 0.001f));
+    float2 relative_xz = world_position.xz - Eye.xz;
+    float height = world_position.y + 64.0f;
+    float light = lerp(far_field_light(FarShadowOlder, FarShadowField[0], relative_xz, height, beyond),
+                       far_field_light(FarShadowNewer, FarShadowField[1], relative_xz, height, beyond),
+                       FarShadowParams.x);
+    return lerp(1.0f, light, FarShadowParams.w);
+}
+
 float hash31(float3 value)
 {
     value = frac(value * 0.1031f);
@@ -2077,19 +3399,112 @@ float hash31(float3 value)
     return frac((value.x + value.y) * value.z);
 }
 
-float4 main(PixelInput input) : SV_TARGET
+// Returns the lit colour and, for the Enhanced post-processing chain, what it
+// needs to know about the surface (ignored when only one target is bound, as
+// in the Original presentation):
+//   surface0  xyz = world normal, w = baked occlusion already applied to the
+//             colour
+//   surface1  x = share of this pixel's light that is NOT direct sun,
+//             y = baked skylight, z = 1 for an entity, w = how much
+//             screen-space occlusion may still darken this pixel (0 = none)
+float4 shade(PixelInput input, out float4 surface0, out float4 surface1)
 {
+    surface0 = float4(0.5f, 1.0f, 0.5f, 1.0f);
+    surface1 = float4(1.0f, 1.0f, 0.0f, 1.0f);
     float distance_to_eye = distance(input.world_position, Eye.xyz);
     float horizontal_distance_to_eye = distance(input.world_position.xz, Eye.xz);
     float fog = saturate((horizontal_distance_to_eye - LightAndFogStart.w) /
                          max(FogAndEnd.w - LightAndFogStart.w, 0.001f));
+    if (AmbientSun.w > 0.5f)
+        fog = fog * fog * (3.0f - 2.0f * fog);
     // Hell has suspended ash and heat haze even before the normal streaming-edge
     // curtain. It reveals depth as warm silhouettes instead of raising every
     // cave surface with a flat ambient term. Eye.w is zero for Classic and for
     // the matched legacy diagnostic path.
-    float hell_depth = Eye.w * saturate((-32.0f - Eye.y) / 8.0f);
-    float hell_air = hell_depth * (1.0f - exp(-horizontal_distance_to_eye * 0.032f)) * 0.62f;
+    float hell_depth = Eye.w * smoothstep(24.0f, 36.0f, -Eye.y);
+    float hell_air = hell_depth * (1.0f - exp(-horizontal_distance_to_eye * 0.025f)) * 0.38f;
     fog = max(fog, hell_air);
+    if (input.emission < -1.5f)
+    {
+        // (mod-liquid) A mod's liquid block, drawn over the finished opaque
+        // scene: its own texture lit by the face's baked sky and torch light,
+        // and as see-through as the liquid between it and what lies behind
+        // is thin. Enhanced adds the Lagoon water's moving surface, sky
+        // reflection and sun glint.
+        bool modern_liquid = AmbientSun.w > 0.5f;
+        bool from_inside = LiquidView.x > 0.5f;
+        float4 liquid_texel = DiffuseAtlas.Sample(AnisoSampler, float3(input.uv, input.tile));
+        // Enhanced keeps about half of the tile's detail over its mean colour:
+        // a surface, not a carpet of repeated tiles.
+        if (modern_liquid)
+            liquid_texel.rgb = lerp(DiffuseAtlas.SampleLevel(AtlasSampler, float3(0.5f, 0.5f, input.tile), 8.0f).rgb,
+                                    liquid_texel.rgb, 0.5f);
+        float3 albedo = modern_liquid ? liquid_texel.rgb * liquid_texel.rgb : liquid_texel.rgb;
+        float3 liquid_normal = normalize(input.normal);
+        float liquid_sky = saturate(input.sky_light);
+        float liquid_torch = saturate(input.torch_light);
+        float3 liquid_sun = normalize(SunAndOptions.xyz);
+        float liquid_shadow = sun_shadow(input.world_position, liquid_normal, distance_to_eye);
+        float3 torch_tint = modern_liquid ? TorchAndEye.rgb * TorchAndEye.rgb : TorchAndEye.rgb;
+        float3 liquid_light =
+            AmbientSun.rgb * liquid_sky * (1.0f + WaterAndTime.w * 0.25f) +
+            LightAndFogStart.rgb * pow(liquid_sky, 30.0f) *
+                (0.80f + saturate(dot(liquid_normal, liquid_sun)) * 0.20f) * liquid_shadow +
+            torch_tint * liquid_torch * (1.0f - liquid_sky * LightAndFogStart.g);
+        float3 body = albedo * liquid_light;
+        // The liquid the eye looks through: from this face to the scene's
+        // own depth behind it (all of it where only sky lies behind).
+        float behind_depth = SceneDepth.Load(int3(input.position.xy, 0)).r;
+        float behind_camera_z = Projection.w / min(behind_depth - Projection.z, -0.00001f);
+        float thickness = behind_depth >= 0.999999f ? 64.0f
+                                                    : max(0.0f, behind_camera_z - input.position.w);
+        float opacity = lerp(0.42f, 0.92f, 1.0f - exp(-thickness * 0.30f));
+        // A texture drawn partly transparent makes a clearer liquid.
+        opacity *= saturate(0.35f + 0.65f * liquid_texel.a);
+        // Deep liquid darkens toward a richer shade of its own colour.
+        body *= lerp(float3(1.0f, 1.0f, 1.0f), float3(0.42f, 0.62f, 0.78f),
+                     saturate(1.0f - exp(-thickness * 0.10f)));
+        // From inside, the surface is a window: the water up to it is the fog.
+        if (from_inside)
+            opacity = 0.32f;
+        if (modern_liquid)
+        {
+            float time = WaterAndTime.x;
+            float2 p = input.world_position.xz;
+            float2 grad = float2(0.0f, 0.0f);
+            grad += float2(0.9f, 0.36f) * cos(dot(p, float2(0.9f, 0.36f)) * 1.9f + time * 1.35f) * 0.045f;
+            grad += float2(-0.42f, 0.91f) * cos(dot(p, float2(-0.42f, 0.91f)) * 3.1f - time * 1.1f) * 0.03f;
+            grad += float2(0.65f, -0.76f) * cos(dot(p, float2(0.65f, -0.76f)) * 5.3f + time * 1.9f) * 0.02f;
+            float3 wave_normal = abs(liquid_normal.y) > 0.5f
+                                     ? normalize(float3(-grad.x, 1.0f, -grad.y)) * sign(liquid_normal.y)
+                                     : liquid_normal;
+            float3 liquid_view = normalize(Eye.xyz - input.world_position);
+            float3 facing_normal = dot(wave_normal, liquid_view) < 0.0f ? -wave_normal : wave_normal;
+            float fresnel = 0.02f + 0.98f * pow(1.0f - saturate(dot(facing_normal, liquid_view)), 5.0f);
+            float liquid_daylight = 0.35f + WaterAndTime.w * 0.65f;
+            float3 reflect_direction = reflect(-liquid_view, facing_normal);
+            float3 sky_reflection =
+                lerp(FogAndEnd.rgb,
+                     lerp(FogAndEnd.rgb, AmbientSun.rgb + float3(0.06f, 0.10f, 0.16f), 0.6f) * liquid_daylight,
+                     saturate(reflect_direction.y));
+            float glint = pow(saturate(dot(reflect_direction, liquid_sun)), 720.0f) * 2.6f +
+                          pow(saturate(dot(reflect_direction, liquid_sun)), 48.0f) * 0.22f;
+            if (!from_inside)
+            {
+                float reflect_share = saturate(fresnel * 1.05f) * liquid_sky;
+                body = lerp(body, sky_reflection, reflect_share) +
+                       LightAndFogStart.rgb * glint * WaterAndTime.w * liquid_shadow * liquid_sky;
+                opacity = max(opacity, reflect_share);
+            }
+        }
+        body = lerp(body, FogAndEnd.rgb, fog);
+        opacity = lerp(opacity, 1.0f, fog);
+        // What the Enhanced chain learns of the surface (its depth pass):
+        // its own normal, and nothing for screen-space occlusion to take.
+        surface0 = float4(liquid_normal * 0.5f + 0.5f, 1.0f);
+        surface1 = float4(1.0f, liquid_sky, 0.0f, 0.0f);
+        return float4(body, opacity);
+    }
     if (input.emission < -0.5f)
     {
         [unroll]
@@ -2157,18 +3572,19 @@ float4 main(PixelInput input) : SV_TARGET
     clip(texel.a - 0.20f);
     bool modern_lighting = AmbientSun.w > 0.5f;
     bool enhanced_leaf = AmbientSun.w > 0.5f && abs(input.tile - 17.0f) < 0.25f;
+    bool blood_stone = modern_lighting && abs(input.tile - 19.0f) < 0.25f;
     float3 geometric_normal = normalize(input.normal);
+    float2 world_uv = abs(geometric_normal.y) > 0.5f
+                          ? input.world_position.xz
+                          : (abs(geometric_normal.x) > 0.5f
+                                 ? input.world_position.zy
+                                 : input.world_position.xy);
     if (modern_lighting)
     {
         // A second, lower-frequency world-anchored read breaks the obvious
         // one-texture-per-cube repetition. Because the UV does not reset at
         // voxel boundaries, neighbouring faces of the same material form one
         // continuous patch instead of a checkerboard of cloned tiles.
-        float2 world_uv = abs(geometric_normal.y) > 0.5f
-                              ? input.world_position.xz
-                              : (abs(geometric_normal.x) > 0.5f
-                                     ? input.world_position.zy
-                                     : input.world_position.xy);
         float2 material_offset = frac(float2(input.tile * 0.371f, input.tile * 0.613f));
         float4 macro_texel = DiffuseAtlas.Sample(
             AnisoSampler, float3(world_uv * 0.47f + material_offset, input.tile));
@@ -2199,6 +3615,28 @@ float4 main(PixelInput input) : SV_TARGET
     // final composite. Material data atlases stay unmodified/linear.
     if (modern_lighting)
         texel.rgb *= texel.rgb;
+    if (blood_stone)
+    {
+        // The source is almost pure red, with zero green/blue in its cracks.
+        // Recover a mineral albedo from that signal instead of clamping every
+        // dark channel to grey. The installed rock tile supplies fine grain;
+        // the original blood-stone veins and their dark recesses stay intact.
+        float3 stone_detail = DiffuseAtlas.Sample(
+            AnisoSampler, float3(world_uv * 1.35f + float2(0.17f, 0.41f), 5.0f)).rgb;
+        float stone_luma = dot(stone_detail, float3(0.2126f, 0.7152f, 0.0722f));
+        float mineral = lerp(pow(max(texel.r, 0.0001f), 0.64f),
+                              stone_luma * stone_luma * 1.4f, 0.65f);
+#if defined(OPENMINERZ_DEEP_UNDERGROUND)
+        // (In the deep underground the tint keeps some green and blue and
+        // deepens in the recesses, so the stone can read brown in the dark
+        // and orange near lava; hell_atmosphere.hpp. Above it, and wherever
+        // that model is off, blood stone is the red it always was.)
+        texel.rgb = mineral * lerp(float3(0.92f, 0.115f, 0.065f), hell_blood_stone(mineral),
+                                   HellModel.x * hell_depth_presence(input.world_position.y));
+#else
+        texel.rgb = mineral * float3(0.92f, 0.115f, 0.065f);
+#endif
+    }
     if (enhanced_leaf && !input.front_face)
         geometric_normal = -geometric_normal;
     float3 tangent;
@@ -2228,6 +3666,19 @@ float4 main(PixelInput input) : SV_TARGET
     // letting the geometric voxel plane and diffuse texture remain dominant.
     float normal_strength = modern_lighting ? 0.34f : 0.72f;
     float2 tangent_xy = (normal_spec.rg * 2.0f - 1.0f) * normal_strength;
+    if (blood_stone)
+    {
+        // Broad ridges in the old normal map read as inflated rubber in HDR.
+        // Keep a little of their relief and add the stone's shorter-scale slope.
+        float2 stone_normal = NormalSpecAtlas.Sample(
+            AnisoSampler, float3(world_uv * 1.35f + float2(0.17f, 0.41f), 5.0f)).rg;
+        float2 stone_slope = stone_normal * 2.0f - 1.0f;
+        stone_slope.x *= abs(geometric_normal.y) > 0.5f ? geometric_normal.y
+                          : (abs(geometric_normal.x) > 0.5f ? -geometric_normal.x
+                                                             : geometric_normal.z);
+        tangent_xy = (normal_spec.rg * 2.0f - 1.0f) * 0.08f +
+                     stone_slope * 0.34f;
+    }
     float tangent_z = sqrt(saturate(1.0f - dot(tangent_xy, tangent_xy)));
     float3 surface_normal = normalize(tangent * tangent_xy.x + bitangent * tangent_xy.y +
                                       geometric_normal * tangent_z);
@@ -2237,6 +3688,11 @@ float4 main(PixelInput input) : SV_TARGET
     // both carry about 0.30 in this channel; mapping that directly to highlight
     // intensity was the source of their wet-plastic sheen.
     float material_roughness = lerp(0.90f, 0.18f, authored_gloss);
+    if (blood_stone)
+    {
+        authored_gloss = 0.0f;
+        material_roughness = 0.96f;
+    }
     float3 view_direction = normalize(Eye.xyz - input.world_position);
     float ao = lerp(1.0f, input.ambient_occlusion, SunAndOptions.w);
     float sky_exposure = saturate(input.sky_light);
@@ -2291,34 +3747,26 @@ float4 main(PixelInput input) : SV_TARGET
         // lifted by a screen-space or global ambient approximation.
         float3 local_bounce_source = AmbientSun.rgb * 1.18f + FogAndEnd.rgb * 0.08f;
         ambient_term += local_bounce_source * baked_indirect.rgb * 0.30f * sky_fill;
-        // Hell is a vast furnace rather than a sealed ordinary cave. A very low
-        // directional underglow keeps the face immediately in front of the
-        // player mineable even between visible lava pools. It strengthens with
-        // depth and favours walls/ceilings facing the lava layer below; AO still
-        // grounds creases, and the much stronger local term below remains tied
-        // to transported emissive energy.
-        float hell_lava_proximity = saturate((-38.0f - input.world_position.y) / 24.0f);
-        float hell_upglow_direction =
-            0.28f + 0.72f * saturate(0.58f - surface_normal.y * 0.45f);
-        float hell_upglow_variation =
-            0.90f + 0.10f * sin(input.world_position.x * 0.21f +
-                                input.world_position.z * 0.17f);
-        ambient_term += float3(0.26f, 0.038f, 0.007f) * hell_depth *
-                        hell_lava_proximity * hell_upglow_direction *
-                        hell_upglow_variation * material_ao;
-        // The alpha probe is emissive/block-light radiance gathered over this
-        // face's visible hemisphere. In Hell that mostly means lava. Colouring
-        // only that transported energy gives nearby rock an orange furnace
-        // bounce while sealed corners remain genuinely black.
-        float hell_emissive_reach = saturate(baked_indirect.a * 1.65f +
-                                              placed_torch_level * 0.20f);
-        ambient_term += float3(0.38f, 0.052f, 0.008f) *
-                        hell_depth * hell_emissive_reach;
+        // Authored Hell fill, independent of skylight and lava proximity.
+        // Match world::hell_ambient; retain directional relief and corner AO.
+        float hell_surface = Eye.w * smoothstep(24.0f, 36.0f, -input.world_position.y);
+        float hell_facing = 0.56f + 0.44f * saturate(0.5f - surface_normal.y * 0.5f);
+        ambient_term = lerp(ambient_term, float3(1.10f, 0.20f, 0.075f) * hell_facing,
+                            hell_surface);
+#if defined(OPENMINERZ_DEEP_UNDERGROUND)
+        // The deep underground (hell_atmosphere.hpp), which replaces that fill
+        // whenever it runs (Eye.w is then zero): the cavern's own warm glow
+        // and the lava lake as an area light, by how deep this surface is.
+        ambient_term += hell_surface_light(input.world_position, surface_normal, ao).rgb;
+#endif
         // The held light's directly visible surface seeds live in a tiny
         // player-centred 3-D clipmap. Gathering them in this face hemisphere
         // adds real moving color bounce without screen-space leakage.
         ambient_term += dynamic_radiance_gather(
             input.world_position, geometric_normal, tangent, bitangent) * material_ao;
+        // An explosion or a flame nearby lights this surface for as long as it
+        // burns (Enhanced effects only; see vfx_point_lights).
+        ambient_term += vfx_point_lights(input.world_position, surface_normal);
         // Corner AO should ground contacts, not multiply the whole landscape
         // into soot. Large-scale cover is already represented by sky_exposure.
         material_ao = lerp(1.0f, ao, 0.68f);
@@ -2360,6 +3808,56 @@ float4 main(PixelInput input) : SV_TARGET
     float3 torch_color = modern_lighting ? TorchAndEye.rgb * TorchAndEye.rgb : TorchAndEye.rgb;
     float3 torch_component = torch_color * torch_energy *
                              (1.0f - sky_exposure * LightAndFogStart.g);
+#if defined(OPENMINERZ_DEEP_UNDERGROUND)
+    // Light the rock beside lava gives off itself (the deep underground).
+    float3 hell_hot = 0.0f.xxx;
+#endif
+    if (modern_lighting)
+    {
+        // Lava has its own transported field, packed in the spare material
+        // byte. Both lava types illuminate nearby geometry in orange-red;
+        // held and placed torches retain their warmer cream colour.
+        float lava_level = min(placed_torch_level, saturate(input.lava_light));
+        float lava_share = lava_level / max(placed_torch_level, 0.0001f);
+        float lava_energy = pow(lava_level, 1.6f) * placed_response +
+                            local_torch_bounce * lava_share;
+        float ordinary_energy = max(0.0f, placed_torch_level - lava_level) * placed_response +
+                                held_glow * held_response * held_visibility +
+                                local_torch_bounce * (1.0f - lava_share);
+        if (BiomeParams.w > 0.5f)
+        {
+            // A flame is never still, and lava breathes. Smooth in space and
+            // time (no cell seams); distant torches drift out of step. Off
+            // with Reduced motion.
+            float3 p = input.world_position;
+            float t = WaterAndTime.x;
+            ordinary_energy *= 1.0f + 0.034f * sin(t * 9.3f + dot(p, float3(0.23f, 0.17f, 0.19f))) +
+                               0.022f * sin(t * 17.9f + dot(p, float3(-0.13f, 0.21f, 0.11f)) + 1.7f) +
+                               0.012f * sin(t * 31.1f + dot(p, float3(0.07f, -0.11f, 0.29f)) + 4.1f);
+            lava_energy *= 1.0f + 0.045f * sin(t * 1.35f + dot(p, float3(0.11f, 0.05f, 0.09f)));
+        }
+#if defined(OPENMINERZ_DEEP_UNDERGROUND)
+        float3 lava_color = float3(2.8f, 0.60f, 0.075f);
+        if (HellModel.x > 0.5f)
+        {
+            // The deep underground's model: lava light that is yellower right
+            // at the lava, breathes in slow unrelated swells, and heats the
+            // rock beside it until that glows by itself.
+            float lava_depth = hell_depth_presence(input.world_position.y);
+            lava_color = hell_lava_near_color(lava_level, lava_depth);
+            lava_energy *= hell_lava_flicker(input.world_position);
+            hell_hot = hell_incandescence(
+                lava_level, dot(texel.rgb, float3(0.2126f, 0.7152f, 0.0722f)) * 4.0f,
+                lava_depth);
+        }
+        torch_component = (torch_color * ordinary_energy + lava_color * lava_energy) *
+                          (1.0f - sky_exposure * LightAndFogStart.g * 0.65f);
+#else
+        torch_component = (torch_color * ordinary_energy +
+                           float3(2.8f, 0.60f, 0.075f) * lava_energy) *
+                          (1.0f - sky_exposure * LightAndFogStart.g * 0.65f);
+#endif
+    }
     // Shadow quality controls the cast-shadow pass, never the material's
     // directional response. Coupling both made ULTRA dramatically darker
     // than LOW before any shadow-map lookup even happened.
@@ -2389,6 +3887,8 @@ float4 main(PixelInput input) : SV_TARGET
         face_shade = 0.80f + sun_facing * 0.20f;
     }
     float shadow = sun_shadow(input.world_position, geometric_normal, distance_to_eye);
+    // (Far terrain: shade from the landscape beyond the cascades' reach.)
+    shadow = min(shadow, far_field_shadow(input.world_position));
     if (DynamicRadianceParams.w > 0.5f)
     {
         float transmission = canopy_shadow_debug_value(input.world_position,
@@ -2414,11 +3914,21 @@ float4 main(PixelInput input) : SV_TARGET
         input.world_position - geometric_normal * 0.06f);
     float3 transient_direct =
         transient_surface.rgb * step(0.5f, transient_surface.a) * 1.65f;
+#if defined(OPENMINERZ_MOD_LIGHTS)
+    // Lighting props placed by mods (modding/graphics.hpp). Compiled in only
+    // while a mod has lights, so an unmodded frame runs this shader as it was.
+    ambient_term += mod_point_lights(input.world_position, surface_normal, 0.15f);
+#endif
     float3 light_total = ambient_term + torch_component + direct_term + transient_direct;
     float3 lit = texel.rgb * light_total * material_ao;
     float3 half_direction = normalize(sun_direction + view_direction);
     if (modern_lighting)
     {
+#if defined(OPENMINERZ_DEEP_UNDERGROUND)
+        // Rock hot enough to glow by itself (the deep underground; zero
+        // anywhere the lava's flood-filled light does not reach).
+        lit += hell_hot * material_ao;
+#endif
         // Cook-Torrance / GGX. Ordinary blocks remain dielectric (F0 2.5%);
         // only the strongest authored metal mask becomes tinted conductor F0.
         // Smoothness changes the lobe width instead of inventing more energy.
@@ -2435,7 +3945,7 @@ float4 main(PixelInput input) : SV_TARGET
         geometry_k = geometry_k * geometry_k * 0.125f;
         float geometry_v = n_dot_v / lerp(n_dot_v, 1.0f, geometry_k);
         float geometry_l = n_dot_l / lerp(n_dot_l, 1.0f, geometry_k);
-        float metalness = smoothstep(0.82f, 0.98f, saturate(metal_light.r));
+        float metalness = blood_stone ? 0.0f : smoothstep(0.82f, 0.98f, saturate(metal_light.r));
         float3 f0 = lerp(float3(0.025f, 0.025f, 0.025f), texel.rgb, metalness);
         float3 fresnel = f0 + (1.0f - f0) * pow(1.0f - v_dot_h, 5.0f);
         float3 specular_brdf = fresnel * distribution * geometry_v * geometry_l /
@@ -2515,36 +4025,125 @@ float4 main(PixelInput input) : SV_TARGET
     }
     float authored_light = max(metal_light.g, metal_light.b);
     lit += texel.rgb * authored_light * 0.48f;
-    // The modern material atlas already contains a precise smoothness mask for
-    // the mineral fragments in tiles 6..10. Reusing it keeps the surrounding
-    // rock dark instead of making the entire ore block self-illuminated. The
-    // pulse is deliberately shallow: it gives exposed veins a readable glint
-    // and a little bloom without turning them into gameplay light sources.
-    if (BiomeParams.y > 0.5f && input.tile >= 5.5f && input.tile <= 10.5f)
+    // Keep each pack's authored mineral color. Slot 7 is orange iron and slot
+    // 8 is green copper in both originals; a guessed metal palette made these
+    // white/blue and orange. Mask neutral rock/highlights as well as smoothness;
+    // coal (slot 9) has no colored veins and must not emit pale edge highlights.
+    bool colored_ore = (input.tile >= 5.5f && input.tile < 8.5f) ||
+                       (input.tile > 9.5f && input.tile <= 10.5f);
+    if (BiomeParams.y > 0.5f && colored_ore)
     {
-        float ore_mask = smoothstep(0.34f, 0.88f, saturate(metal_light.r));
-        float3 ore_tint = input.tile < 6.5f
-                              ? float3(1.00f, 0.46f, 0.08f)
-                          : input.tile < 7.5f
-                              ? float3(0.72f, 0.84f, 1.00f)
-                          : input.tile < 8.5f
-                              ? float3(1.00f, 0.28f, 0.07f)
-                          : input.tile < 9.5f
-                              ? float3(0.34f, 0.38f, 0.46f)
-                              : float3(0.08f, 0.92f, 1.00f);
-        float ore_strength = input.tile >= 8.5f && input.tile < 9.5f ? 0.14f : 0.34f;
+        float peak = max(texel.r, max(texel.g, texel.b));
+        float low = min(texel.r, min(texel.g, texel.b));
+        float chroma = (peak - low) / max(peak, 0.0001f);
+        float ore_mask = smoothstep(0.34f, 0.88f, saturate(metal_light.r)) *
+                         smoothstep(0.12f, 0.45f, chroma);
+        float3 ore_tint = texel.rgb / max(peak, 0.0001f);
+        float ore_strength = 0.34f;
         float pulse = 0.92f + 0.08f * sin(WaterAndTime.x * 1.45f +
                                          dot(input.world_position, float3(0.31f, 0.17f, 0.23f)));
         lit += ore_tint * ore_mask * ore_strength * pulse;
     }
     lit = lerp(lit, texel.rgb * 1.12f, saturate(input.emission));
+    if (modern_lighting && input.emission > 0.5f && input.tile > 10.5f && input.tile < 11.5f)
+    {
+        // Full-bright display albedo alone made lava look like cold black rock
+        // after linear decoding. Its hot cracks need HDR emission and bloom.
+        float heat = saturate(max(texel.r, max(texel.g, texel.b)) * 3.5f);
+        float molten = smoothstep(0.004f, 0.14f, heat);
+        float3 hot_cracks = lerp(float3(2.2f, 0.20f, 0.005f),
+                                 float3(5.5f, 1.8f, 0.16f), heat * heat);
+        // Classic's lava plate has many more bright texels than Modern's.
+        // Normalize their coverage so changing packs does not blow out a pool.
+        float source_coverage = DiffuseAtlas.SampleLevel(
+            AtlasSampler, float3(0.5f, 0.5f, input.tile), 7.0f).r;
+        float emission_scale = clamp(0.10f / max(source_coverage, 0.01f), 0.36f, 1.0f);
+        lit = float3(0.025f, 0.001f, 0.0003f) + hot_cracks * molten * emission_scale;
+    }
+#if defined(OPENMINERZ_DEEP_UNDERGROUND)
+    // The deep underground's molten rock (hell_atmosphere.hpp), in place of
+    // the lava above whenever that model runs: the pack's own lava artwork
+    // read as two layers that drift across each other, under plates of crust
+    // that crack and breathe. The derivatives are taken out here and every
+    // read inside names its own, so this is a real branch only lava takes.
+    float2 lava_face_dx = ddx(world_uv);
+    float2 lava_face_dy = ddy(world_uv);
+    [branch]
+    if (HellModel.x > 0.5f && input.emission > 0.5f && input.tile > 10.5f && input.tile < 11.5f)
+    {
+        float2 lava_face = hell_lava_face(input.world_position, geometric_normal);
+        float4 lava_layers = hell_lava_layers(lava_face, lava_face_dx, lava_face_dy);
+        float3 lava_first = DiffuseAtlas.SampleGrad(
+            AnisoSampler, float3(lava_layers.xy, input.tile),
+            lava_face_dx * HELL_LAVA_FIRST_SCALE, lava_face_dy * HELL_LAVA_FIRST_SCALE).rgb;
+        float3 lava_second = DiffuseAtlas.SampleGrad(
+            AnisoSampler, float3(lava_layers.zw, input.tile),
+            lava_face_dx * HELL_LAVA_SECOND_SCALE, lava_face_dy * HELL_LAVA_SECOND_SCALE).rgb;
+        // A pack with more bright artwork is turned down, as above.
+        float lava_coverage = DiffuseAtlas.SampleLevel(
+            AtlasSampler, float3(0.5f, 0.5f, input.tile), 7.0f).r;
+        float art_scale = sqrt(clamp(0.10f / max(lava_coverage, 0.01f), 0.36f, 1.0f));
+        lit = hell_molten(lava_face, lava_face_dx, lava_face_dy,
+                          max(lava_first.r, max(lava_first.g, lava_first.b)) * art_scale,
+                          max(lava_second.r, max(lava_second.g, lava_second.b)) * art_scale) *
+              (1.0f + HELL_MOLTEN_DAYLIGHT * sky_exposure * WaterAndTime.w);
+    }
+#endif
+    // Screen-space occlusion and contact shadows may only take away light that
+    // is really there to lose: nothing from a glowing surface, nothing from
+    // the fog in front of it, and (contact shadows) only the sun's share.
+    float untouchable = saturate(max(saturate(input.emission), fog));
+    float all_light = dot(light_total, float3(0.2126f, 0.7152f, 0.0722f));
+    float sun_light = dot(direct_term, float3(0.2126f, 0.7152f, 0.0722f));
+    // A leaf cluster is mostly gaps: left alone, screen-space occlusion would
+    // read every gap as a crease and turn canopies to soot, so leaves take
+    // half of it.
+    surface0 = float4(geometric_normal * 0.5f + 0.5f, material_ao);
+    surface1 = float4(lerp(saturate(1.0f - sun_light / max(all_light, 0.0001f)), 1.0f, untouchable),
+                      sky_exposure, 0.0f, (enhanced_leaf ? 0.5f : 1.0f) * (1.0f - untouchable));
     return float4(lerp(lit, FogAndEnd.rgb, fog), 1.0f);
+}
+
+struct PixelOutput
+{
+    float4 color : SV_TARGET0;
+    float4 surface0 : SV_TARGET1;
+    float4 surface1 : SV_TARGET2;
+};
+
+PixelOutput main(PixelInput input)
+{
+    PixelOutput output;
+    output.color = shade(input, output.surface0, output.surface1);
+    return output;
 }
 )hlsl";
         const auto vertex_blob = compile_shader(vertex_source, "main", "vs_4_0");
         // Array-comparison sampling for the three shadow cascades needs the
         // native D3D11 shader model; ps_4_0 cannot lower a dynamic array slice.
-        const auto pixel_blob = compile_shader(pixel_source, "main", "ps_5_0");
+        // The deep underground's constants and lighting functions come first
+        // (hell_atmosphere.hpp); they declare nothing this shader declares, and
+        // they define the switch its `#if defined(OPENMINERZ_DEEP_UNDERGROUND)`
+        // blocks test. Without them (the diagnostic below, or a compiler that
+        // refuses them) the shader is, text for text, the one it was before.
+        const bool deep_underground_shaders = deep_underground_shaders_wanted();
+        auto pixel_blob = deep_underground_shaders
+                              ? compile_shader(
+                                    (HellAtmosphere::shader_library() + pixel_source).c_str(),
+                                    "main", "ps_5_0")
+                              : nullptr;
+        deep_underground_terrain_ = pixel_blob != nullptr;
+        if (pixel_blob == nullptr)
+        {
+            if (deep_underground_shaders)
+                SDL_Log("Deep terrain shader unavailable: %s", failure_reason_.c_str());
+            failure_reason_.clear();
+            pixel_blob = compile_shader(pixel_source, "main", "ps_5_0");
+        }
+        // The exact text compiled, for the mod-light variant (graphics area).
+        terrain_pixel_text_ = deep_underground_terrain_
+                                  ? HellAtmosphere::shader_library() + pixel_source
+                                  : std::string{pixel_source};
         if (vertex_blob == nullptr || pixel_blob == nullptr ||
             FAILED(device_->CreateVertexShader(vertex_blob->GetBufferPointer(),
                                                vertex_blob->GetBufferSize(), nullptr,
@@ -2621,6 +4220,20 @@ float4 main(PixelInput input) : SV_TARGET
         {
             failure_reason_ = "failed to create the voxel blend state";
             return false;
+        }
+        {
+            // Opaque, but leaves a fourth target (per-object motion, bound only
+            // while motion blur is on) untouched: terrain does not move, and a
+            // pixel shader that does not write a bound target leaves it
+            // undefined. Optional; without it motion blur is camera-only.
+            D3D11_BLEND_DESC motion_description{};
+            motion_description.IndependentBlendEnable = TRUE;
+            for (std::size_t target = 0U; target < 3U; ++target)
+                motion_description.RenderTarget[target].RenderTargetWriteMask =
+                    D3D11_COLOR_WRITE_ENABLE_ALL;
+            if (FAILED(device_->CreateBlendState(&motion_description,
+                                                 &terrain_motion_blend_state_)))
+                terrain_motion_blend_state_.Reset();
         }
         auto &water_blend = blend_description.RenderTarget[0];
         water_blend.BlendEnable = TRUE;
@@ -3545,6 +5158,10 @@ float scene_luma(float2 uv, float exposure)
 // consistently so the composite over the skybox stays clean.
 float4 fxaa_scene(float2 uv, float exposure)
 {
+#if defined(OPENMINERZ_POST_NO_FXAA)
+    // Edge smoothing is switched off in the settings: pass the scene through.
+    return Scene.Sample(LinearSampler, uv);
+#else
     float2 texel = TargetSize.zw;
     float luma_nw = scene_luma(uv + float2(-1.0f, -1.0f) * texel, exposure);
     float luma_ne = scene_luma(uv + float2(1.0f, -1.0f) * texel, exposure);
@@ -3570,6 +5187,26 @@ float4 fxaa_scene(float2 uv, float exposure)
     float exposed_b = dot(sample_b.rgb * exposure, float3(0.299f, 0.587f, 0.114f));
     float luma_b = exposed_b / (1.0f + exposed_b);
     return (luma_b < luma_min || luma_b > luma_max) ? sample_a : sample_b;
+#endif
+}
+
+float3 display_color(float3 color)
+{
+    color = apply_white_balance(max(color, 0.0f), GradeParams.y);
+    color = apply_tonemap(color);
+    // The Rebirth scene has stayed in linear light from albedo through fog and
+    // ACES. Encode it only now for SDL's ordinary UNORM presentation target.
+    // Classic intentionally retains its recovered display-space pipeline.
+    if (AmbientSun.w > 0.5f)
+        color = sqrt(saturate(color));
+    color = apply_grade(color, GradeParams.y);
+    // A biome should be felt in distant air and palette, not painted over
+    // nearby material lighting. The authored multiplier therefore enters as a
+    // restrained display-space blend and never changes exposure or shadows.
+    float biome_luminance = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+    float3 biome_color = lerp(biome_luminance.xxx, color, BiomeParams.x) * BiomeTint.rgb;
+    color = saturate(lerp(color, biome_color, BiomeTint.w));
+    return color;
 }
 
 float4 main(PostPixelInput input) : SV_TARGET
@@ -3578,17 +5215,24 @@ float4 main(PostPixelInput input) : SV_TARGET
     // already exposed the bloom it produced.
     float exposure = scene_exposure();
     float4 scene = fxaa_scene(input.uv, exposure);
-    float3 color = scene.rgb * exposure + Bloom.Sample(LinearSampler, input.uv).rgb * PostParams.x;
+    float3 color = Bloom.Sample(LinearSampler, input.uv).rgb * PostParams.x;
     if (PostSun.z > 0.02f)
     {
         float2 sun_uv = PostSun.xy;
         float2 delta = sun_uv - input.uv;
         float aspect = TargetSize.x * TargetSize.w;
-        float sun_distance = length(float2(delta.x * aspect, delta.y));
+        // The glow and shaft radii below are ANGLES around the sun, written as
+        // screen heights at the default 74-degree field of view (1.32704 is
+        // 1 / tan(37 degrees), Projection.y is 1 / tan(fov / 2)). Measuring the
+        // distance in those units keeps the glow the same size against the sky
+        // at every field of view and through a shouldered zoom.
+        float sun_distance =
+            length(float2(delta.x * aspect, delta.y)) * (1.32704f / max(Projection.y, 0.001f));
         float2 outside = max(float2(0.0f, 0.0f), max(-sun_uv, sun_uv - 1.0f));
         float edge_fade = saturate(1.0f - (outside.x + outside.y) * 3.0f);
         float energy = 0.25f + 0.75f * PostSun.w;
         float3 sun_color = normalize(LightAndFogStart.rgb + 0.001f) * 1.05f;
+#if !defined(OPENMINERZ_POST_NO_SHAFTS)
         // God rays: march toward the sun accumulating sky visibility.  The march
         // start is dithered per pixel (interleaved gradient noise) so the discrete
         // taps blur into smooth shafts instead of repeating ghost silhouettes of
@@ -3608,31 +5252,27 @@ float4 main(PostPixelInput input) : SV_TARGET
         }
         float rays = (accumulated / total_weight) * saturate(1.0f - sun_distance * 1.1f);
         color += sun_color * rays * rays * PostParams.y * edge_fade * energy;
+#endif
         // Sun glow disc, occluded by geometry in front of the sun.
         float sun_visibility = 1.0f - Scene.Sample(LinearSampler, saturate(sun_uv)).a;
         float glow = pow(saturate(1.0f - sun_distance / 0.35f), 3.0f) * 0.28f +
                      pow(saturate(1.0f - sun_distance / 0.06f), 2.0f) * 0.95f;
         color += sun_color * glow * sun_visibility * edge_fade * energy;
     }
-    // White balance in linear light, tone map, then grade and dither.
-    color = apply_white_balance(max(color, 0.0f), GradeParams.y);
-    color = apply_tonemap(color);
-    // The Rebirth scene has stayed in linear light from albedo through fog and
-    // ACES. Encode it only now for SDL's ordinary UNORM presentation target.
-    // Classic intentionally retains its recovered display-space pipeline.
-    if (AmbientSun.w > 0.5f)
-        color = sqrt(saturate(color));
-    color = apply_grade(color, GradeParams.y);
-    // A biome should be felt in distant air and palette, not painted over
-    // nearby material lighting. The authored multiplier therefore enters as a
-    // restrained display-space blend and never changes exposure or shadows.
-    float biome_luminance = dot(color, float3(0.2126f, 0.7152f, 0.0722f));
-    float3 biome_color = lerp(biome_luminance.xxx, color, BiomeParams.x) * BiomeTint.rgb;
-    color = saturate(lerp(color, biome_color, BiomeTint.w));
-    color = apply_dither(color, input.position.xy);
+    // FXAA stores premultiplied linear coverage. Nonlinear tone mapping or gamma
+    // must operate on the unassociated colour; mapping coverage itself created
+    // bright outlines around mountains and every fine leaf against the sky.
+    float3 additive_light = color;
+    color += scene.rgb * exposure / max(scene.a, 0.0001f);
+    color = display_color(color) * scene.a;
+    if (scene.a < 0.9999f)
+        color += display_color(additive_light) * (1.0f - scene.a);
+    color += (apply_dither(0.0f.xxx, input.position.xy)) * scene.a;
     return float4(color, scene.a);
 }
 )hlsl";
+        // Kept so composite_shader() can build the reduced variants on demand.
+        composite_source_ = composite_pixel_source;
         const auto vertex_blob = compile_shader(post_vertex_source, "main", "vs_4_0");
         const auto bright_blob = compile_shader(bright_pixel_source, "main", "ps_4_0");
         const auto blur_blob = compile_shader(blur_pixel_source, "main", "ps_4_0");
@@ -3768,6 +5408,19 @@ cbuffer Scene : register(b0)
     float4 AmbientSun;
 };
 
+// Last frame's camera (the head of post_processing.cpp's Post buffer), bound
+// only by the Enhanced presentation while motion blur is on.
+cbuffer PostCamera : register(b2)
+{
+    float4 PostSize;
+    float4 PostTime;
+    float4 PrevEye;
+    float4 PrevRight;
+    float4 PrevUp;
+    float4 PrevForward;
+    float4 PrevProjection;
+};
+
 struct VertexInput
 {
     float3 position : POSITION;
@@ -3775,6 +5428,8 @@ struct VertexInput
     float4 color : COLOR0;
     float3 normal : NORMAL0;
     float2 light_data : TEXCOORD1;
+    // The same vertex one frame ago (second stream).
+    float3 previous : PREVIOUS;
 };
 
 struct PixelInput
@@ -3785,6 +5440,9 @@ struct PixelInput
     float3 world_position : TEXCOORD1;
     float3 normal : TEXCOORD2;
     float2 light_data : TEXCOORD3;
+    // Clip-space x, y, w now and one frame ago, for per-object motion blur.
+    float3 motion_now : TEXCOORD4;
+    float3 motion_before : TEXCOORD5;
 };
 
 PixelInput main(VertexInput input)
@@ -3803,6 +5461,17 @@ PixelInput main(VertexInput input)
     output.world_position = input.position;
     output.normal = input.normal;
     output.light_data = input.light_data;
+    output.motion_now = output.position.xyw;
+    // A vertex that jumped (a respawn, a different creature in the same slot)
+    // did not travel there: treat it as standing still.
+    float3 before = input.previous;
+    float3 travelled = before - input.position;
+    if (dot(travelled, travelled) > 2.25f)
+        before = input.position;
+    float3 previous_relative = before - PrevEye.xyz;
+    output.motion_before = float3(dot(previous_relative, PrevRight.xyz) * PrevProjection.x,
+                                  dot(previous_relative, PrevUp.xyz) * PrevProjection.y,
+                                  dot(previous_relative, PrevForward.xyz));
     return output;
 }
 )hlsl";
@@ -4003,6 +5672,8 @@ struct PixelInput
     float3 world_position : TEXCOORD1;
     float3 normal : TEXCOORD2;
     float2 light_data : TEXCOORD3;
+    float3 motion_now : TEXCOORD4;
+    float3 motion_before : TEXCOORD5;
     bool front_face : SV_IsFrontFace;
 };
 
@@ -4016,6 +5687,36 @@ float3 entity_dynamic_seed(float3 world_position)
         return 0.0f.xxx;
     float3 packed = DynamicRadiance.Load(int4(cell, 0)).rgb;
     return packed * packed;
+}
+
+// Point lights thrown by this frame's effects (vfx/vfx_renderer.hpp). Bound
+// only by the Enhanced presentation's chain; zero lights everywhere else.
+cbuffer VfxLights : register(b9)
+{
+    float4 VfxLightCount;
+    float4 VfxLightPosRadius[16];
+    float4 VfxLightColor[16];
+};
+
+float3 entity_vfx_point_lights(float3 world_position, float3 normal)
+{
+    float3 light = 0.0f.xxx;
+    int count = (int)VfxLightCount.x;
+    [loop]
+    for (int index = 0; index < count; ++index)
+    {
+        float3 offset = VfxLightPosRadius[index].xyz - world_position;
+        float radius = VfxLightPosRadius[index].w;
+        float range_squared = dot(offset, offset);
+        if (range_squared < radius * radius)
+        {
+            float range = sqrt(range_squared);
+            float share = saturate(1.0f - range / radius);
+            float facing = saturate(dot(normal, offset / max(range, 0.001f)) * 0.82f + 0.18f);
+            light += VfxLightColor[index].rgb * (share * share * facing);
+        }
+    }
+    return light;
 }
 
 float3 entity_dynamic_bounce(float3 world_position)
@@ -4174,7 +5875,7 @@ float entity_sun_shadow(float3 world_position, float3 normal)
     float far_fade = saturate((camera_depth - ShadowCascades.z * 0.88f) /
                               max(ShadowCascades.z * 0.12f, 0.001f));
     visibility = lerp(visibility, 1.0f, far_fade);
-    float opacity = lerp(0.18f, 0.43f, saturate(ShadowParams.x)) * ShadowParams.z;
+    float opacity = (AmbientSun.w > 0.5f ? lerp(0.70f, 0.94f, saturate(ShadowParams.x)) : lerp(0.18f, 0.43f, saturate(ShadowParams.x))) * ShadowParams.z;
     return lerp(1.0f, visibility, opacity);
 }
 
@@ -4244,8 +5945,13 @@ float entity_point_shadow(float3 world_position, float3 normal)
     return lerp(0.14f, 1.0f, visibility / 9.0f);
 }
 
-float4 main(PixelInput input) : SV_TARGET
+// Lit colour plus the terrain shader's surface data (see `shade` there). A
+// prop without normals, a projectile or a glowing effect reports "nothing may
+// darken this pixel further", so screen-space occlusion leaves it alone.
+float4 shade(PixelInput input, out float4 surface0, out float4 surface1)
 {
+    surface0 = float4(0.5f, 1.0f, 0.5f, 1.0f);
+    surface1 = float4(1.0f, 1.0f, 1.0f, 0.0f);
     float4 texel = Diffuse.Sample(DiffuseSampler, input.uv);
     bool modern_lighting = AmbientSun.w > 0.5f;
     if (modern_lighting)
@@ -4255,8 +5961,10 @@ float4 main(PixelInput input) : SV_TARGET
     // a distant dragon reads as a silhouette instead of vanishing.
     float fog = saturate((horizontal_distance - LightAndFogStart.w) /
                          max(FogAndEnd.w - LightAndFogStart.w, 0.001f));
-    float hell_depth = Eye.w * saturate((-32.0f - Eye.y) / 8.0f);
-    float hell_air = hell_depth * (1.0f - exp(-horizontal_distance * 0.032f)) * 0.62f;
+    if (AmbientSun.w > 0.5f)
+        fog = fog * fog * (3.0f - 2.0f * fog);
+    float hell_depth = Eye.w * smoothstep(24.0f, 36.0f, -Eye.y);
+    float hell_air = hell_depth * (1.0f - exp(-horizontal_distance * 0.025f)) * 0.38f;
     fog = max(fog, hell_air);
     fog = min(fog, 0.55f);
     float normal_length_squared = dot(input.normal, input.normal);
@@ -4279,6 +5987,10 @@ float4 main(PixelInput input) : SV_TARGET
         float3 ambient = sky_irradiance * sky_exposure *
                          (1.0f + WaterAndTime.w * 0.18f);
         ambient += entity_dynamic_bounce(input.world_position);
+        ambient += entity_vfx_point_lights(input.world_position, normal);
+#if defined(OPENMINERZ_MOD_LIGHTS)
+        ambient += mod_point_lights(input.world_position, normal, 0.15f);
+#endif
 
         float3 sun_direction = normalize(SunAndOptions.xyz);
         float n_dot_l = saturate(dot(normal, sun_direction));
@@ -4288,13 +6000,16 @@ float4 main(PixelInput input) : SV_TARGET
 
         float placed = saturate(input.light_data.y) *
                        (1.0f - sky_exposure * LightAndFogStart.g * 0.85f);
-        // Entity vertices carry the same flood-filled block-light sample as
-        // terrain. Use it to reveal monsters beside lava without granting a
-        // through-wall or distance-independent enemy light.
-        ambient += float3(0.36f, 0.048f, 0.007f) * hell_depth *
-                   saturate(input.light_data.y * 1.15f);
-        ambient += float3(0.12f, 0.018f, 0.003f) * hell_depth *
-                   (0.35f + 0.65f * saturate(input.light_data.y));
+        float hell_actor = Eye.w * smoothstep(24.0f, 36.0f, -input.world_position.y);
+        ambient = lerp(ambient, float3(1.10f, 0.20f, 0.075f) *
+                                (0.56f + 0.44f * saturate(0.5f - normal.y * 0.5f)), hell_actor);
+#if defined(OPENMINERZ_DEEP_UNDERGROUND)
+        // The deep underground (hell_atmosphere.hpp), which replaces that fill
+        // whenever it runs: creatures stand in the same glow as the rock, lit
+        // from below by the same lava.
+        float4 hell_light = hell_surface_light(input.world_position, normal, 1.0f);
+        ambient += hell_light.rgb;
+#endif
         float held = TorchAndEye.w *
                      pow(saturate(1.0f - distance(input.world_position, Eye.xyz) / 9.0f), 2.0f);
         float held_facing = 0.24f + 0.96f * saturate(dot(normal, view_direction));
@@ -4302,7 +6017,30 @@ float4 main(PixelInput input) : SV_TARGET
         float3 torch_color = TorchAndEye.rgb * TorchAndEye.rgb;
         float3 torch = torch_color * (placed * 0.78f +
                                       held * held_facing * held_visibility);
+#if defined(OPENMINERZ_DEEP_UNDERGROUND)
+        // A creature carries one flood-filled light value, torches and lava
+        // together. Deep down almost all of it is lava, so there it takes the
+        // lava's colour and comes mostly from below.
+        if (hell_light.a > 0.0f)
+            torch = lerp(torch_color * 0.78f,
+                         hell_lava_near_color(placed, hell_light.a) *
+                             (0.30f + 0.55f * saturate(0.6f - normal.y * 0.6f)),
+                         hell_light.a) * placed +
+                    torch_color * (held * held_facing * held_visibility);
+#endif
         entity_light = ambient + direct + torch;
+        float all_light = dot(entity_light, float3(0.2126f, 0.7152f, 0.0722f));
+        float sun_light = dot(direct, float3(0.2126f, 0.7152f, 0.0722f));
+        surface0 = float4(normal * 0.5f + 0.5f, 1.0f);
+        surface1 = float4(lerp(saturate(1.0f - sun_light / max(all_light, 0.0001f)), 1.0f, fog),
+                          sky_exposure, 1.0f, 1.0f - fog);
+        // A lit prop too small for screen-space shading to resolve (the
+        // effects layer's explosion debris, marked by a vertex alpha of zero)
+        // asks to be left alone by it, as an unlit prop does: half-resolution
+        // occlusion and contact shadows otherwise paint a chunk a few pixels
+        // wide solid black.
+        if (input.color.a < 0.5f)
+            surface1 = float4(1.0f, sky_exposure, 1.0f, 0.0f);
     }
     else if (modern_lighting && TorchAndEye.w > 0.0f)
     {
@@ -4314,12 +6052,29 @@ float4 main(PixelInput input) : SV_TARGET
     }
     else if (modern_lighting)
     {
-        // A handful of original prop meshes have no usable normals. They still
-        // receive the restrained furnace floor so a close prop does not become
-        // a literal hole in the image.
-        entity_light += float3(0.042f, 0.006f, 0.001f) * hell_depth;
+        // Unnormalled props share the same authored Hell tint.
+        entity_light = lerp(entity_light, float3(1.10f, 0.20f, 0.075f), hell_depth);
     }
     float3 lit = texel.rgb * input.color.rgb * entity_light;
+#if defined(OPENMINERZ_MOD_LIGHTS)
+    // Mod lights on what the branch above did not light with them: the
+    // Original presentation (vertex colours carry its baked light) and props
+    // without normals, which take them from every side.
+    if (!(modern_lighting && normal_length_squared > 0.25f))
+        lit += texel.rgb * mod_point_lights(input.world_position,
+                                            normal_length_squared > 0.25f
+                                                ? normalize(input.normal)
+                                                : float3(0.0f, 1.0f, 0.0f),
+                                            normal_length_squared > 0.25f ? 0.15f : 1.0f);
+#endif
+    if (input.light_data.x < -2.5f)
+    {
+        float edge = abs(input.uv.x - 0.5f) * 2.0f;
+        clip(0.98f - edge);
+        lit = input.color.rgb * (1.8f + 1.4f * pow(saturate(1.0f-edge), 4.0f));
+    }
+    else if (input.light_data.x < -1.5f)
+        lit = texel.rgb * max(entity_light, 0.25f) + input.color.rgb * texel.a * 3.2f;
     float3 fogged = lerp(lit, FogAndEnd.rgb, fog);
 #if defined(OPENMINERZ_ALPHA_LIT)
     // Avatar expression and material-overlay batches are ordinary lit
@@ -4330,6 +6085,26 @@ float4 main(PixelInput input) : SV_TARGET
 #else
     return float4(fogged, 1.0f);
 #endif
+}
+
+struct PixelOutput
+{
+    float4 color : SV_TARGET0;
+    float4 surface0 : SV_TARGET1;
+    float4 surface1 : SV_TARGET2;
+    // How far this pixel moved on screen since last frame (uv), alpha one.
+    // Bound only while the Enhanced motion blur is on.
+    float4 motion : SV_TARGET3;
+};
+
+PixelOutput main(PixelInput input)
+{
+    PixelOutput output;
+    output.color = shade(input, output.surface0, output.surface1);
+    float2 now = input.motion_now.xy / max(input.motion_now.z, 0.0001f);
+    float2 before = input.motion_before.xy / max(input.motion_before.z, 0.0001f);
+    output.motion = float4((now - before) * float2(0.5f, -0.5f), 0.0f, 1.0f);
+    return output;
 }
 )hlsl";
         // Particles and other soft billboards: no alpha clip, premultiplied
@@ -4354,7 +6129,9 @@ cbuffer Scene : register(b0)
 
 Texture2D Diffuse : register(t0);
 Texture2D<float> SceneDepth : register(t8);
+Texture3D<float> EffectNoise : register(t9);
 SamplerState DiffuseSampler : register(s0);
+SamplerState EffectNoiseSampler : register(s9);
 
 struct PixelInput
 {
@@ -4362,11 +6139,97 @@ struct PixelInput
     float2 uv : TEXCOORD0;
     float4 color : COLOR0;
     float3 world_position : TEXCOORD1;
+    float3 volume_center : TEXCOORD2;
     float2 light_data : TEXCOORD3;
 };
 
+// Animated 3D density integrated along the viewing ray, inside a spherical
+// proxy. No flame/smoke image is sampled. Scene depth clips the ray interval,
+// so volumes intersect walls continuously and cannot paint over foregrounds.
+float vfx_noise(float3 p)
+{
+    float3 i = floor(p), f = frac(p);
+    f = f * f * (3.0f - 2.0f * f);
+    return EffectNoise.SampleLevel(EffectNoiseSampler, (i + f + 0.5f) / 64.0f, 0).r;
+}
+float4 volume_effect(PixelInput input)
+{
+    float radius = max(input.light_data.x, 0.015f);
+    bool core = input.light_data.y < -4.5f;
+    float3 axis = core ? normalize(input.color.rgb) : float3(0,1,0);
+    float stretch = core ? 2.4f : 1.0f;
+    float3 ray = normalize(input.world_position - Eye.xyz);
+    float3 offset = Eye.xyz - input.volume_center;
+    float3 local_ray = ray + axis * dot(ray, axis) * (1.0f/stretch - 1.0f);
+    float3 local_offset = offset + axis * dot(offset, axis) * (1.0f/stretch - 1.0f);
+    float a = dot(local_ray, local_ray);
+    float b = dot(local_offset, local_ray);
+    float discriminant = b * b - a * (dot(local_offset, local_offset) - radius * radius);
+    clip(discriminant);
+    float reach = sqrt(max(discriminant, 0.0f));
+    float entry = max(0.0f, (-b - reach) / a);
+    float exit = (-b + reach) / a;
+    float raw = SceneDepth.Load(int3(int2(input.position.xy), 0));
+    float scene_z = Projection.w / (raw - Projection.z);
+    exit = min(exit, scene_z / max(dot(ray, CameraForward.xyz), 0.0001f));
+    clip(exit - entry);
+    float step_length = (exit - entry) / 14.0f;
+    float transmittance = 1.0f;
+    float3 radiance = 0.0f;
+    bool smoke = input.light_data.y > -2.5f;
+    bool ice = abs(input.light_data.y + 4.0f) < 0.2f || input.light_data.y < -5.5f;
+    float time = WaterAndTime.x;
+    [loop] for (int j = 0; j < 14; ++j)
+    {
+        float3 position = Eye.xyz + ray * (entry + ((float)j + 0.5f) * step_length);
+        float3 local = position - input.volume_center;
+        float3 q = (local + axis * dot(local, axis) * (1.0f/stretch - 1.0f)) / radius;
+        float3 flow = q * float3(3.1f, smoke ? 3.1f : 2.0f, 3.1f) + input.volume_center * 0.17f;
+        flow.y -= time * (smoke ? 0.55f : 2.4f);
+        float billow = vfx_noise(flow * 0.63f + 3.7f);
+        flow += (billow - 0.5f) * 1.8f;
+        float noise = vfx_noise(flow) * 0.58f + vfx_noise(flow * 2.03f + 7.1f) * 0.28f +
+                      vfx_noise(flow * 4.11f - 3.2f) * 0.14f;
+        float edge = saturate(((smoke ? 0.80f : 0.60f) - dot(q, q) +
+                              (billow - 0.5f) * (smoke ? 1.1f : 1.6f)) * 2.8f) *
+                     saturate((1.0f - dot(q,q)) * 6.0f);
+        float density = edge * smoothstep(smoke ? 0.22f : 0.30f, 0.72f, noise);
+        // Optical depth is integrated from the eye when inside the plume;
+        // there is no close-range quad fade or opaque full-screen smoke card.
+        float opacity = 1.0f - exp(-density * step_length / radius * (smoke ? 3.2f : 4.0f) * input.color.a);
+        float3 color;
+        if (smoke)
+        {
+            float daylight = saturate(WaterAndTime.w);
+            float top_light = saturate(q.y * 0.5f + 0.5f);
+            float self_shadow = exp(-density * 1.6f * (1.0f - top_light));
+            float lighting = 0.24f + (0.36f + 0.65f * daylight) * self_shadow;
+            color = input.color.rgb * lighting;
+        }
+        else
+        {
+            float temperature = saturate((noise - 0.23f) * 1.85f - dot(q,q) * 0.16f);
+            float3 outer = ice ? float3(0.012f, 0.045f, 0.75f) : float3(0.75f, 0.008f, 0.001f);
+            float3 inner = ice ? float3(0.08f, 1.2f, 3.2f) : float3(4.0f, 0.65f, 0.025f);
+            color = lerp(outer, inner, temperature * temperature);
+            color += (ice ? float3(1.4f, 2.4f, 3.0f) : float3(5.0f, 2.2f, 0.35f)) *
+                     pow(temperature, 8.0f);
+        }
+        radiance += transmittance * opacity * color;
+        transmittance *= 1.0f - opacity;
+        if (transmittance < 0.015f) break;
+    }
+    float alpha = 1.0f - transmittance;
+    float distance_to_volume = distance(input.volume_center, Eye.xyz);
+    float fog = saturate((distance_to_volume - LightAndFogStart.w) /
+                         max(FogAndEnd.w - LightAndFogStart.w, 0.001f));
+    return float4(lerp(radiance, FogAndEnd.rgb * alpha, fog), alpha);
+}
+
 float4 main(PixelInput input) : SV_TARGET
 {
+    if (input.light_data.y <= -1.5f)
+        return volume_effect(input);
     float4 texel = Diffuse.Sample(DiffuseSampler, input.uv);
     if (AmbientSun.w > 0.5f)
         texel.rgb *= texel.rgb;
@@ -4385,11 +6248,21 @@ float4 main(PixelInput input) : SV_TARGET
     float horizontal_distance = distance(input.world_position.xz, Eye.xz);
     float fog = saturate((horizontal_distance - LightAndFogStart.w) /
                          max(FogAndEnd.w - LightAndFogStart.w, 0.001f));
-    float hell_depth = Eye.w * saturate((-32.0f - Eye.y) / 8.0f);
-    float hell_air = hell_depth * (1.0f - exp(-horizontal_distance * 0.032f)) * 0.62f;
+    if (AmbientSun.w > 0.5f)
+        fog = fog * fog * (3.0f - 2.0f * fog);
+    float hell_depth = Eye.w * smoothstep(24.0f, 36.0f, -Eye.y);
+    float hell_air = hell_depth * (1.0f - exp(-horizontal_distance * 0.025f)) * 0.38f;
     fog = max(fog, hell_air);
     fog = min(fog, 0.55f);
-    float3 lit = lerp(texel.rgb * input.color.rgb, FogAndEnd.rgb, fog);
+    float3 surface = texel.rgb * input.color.rgb;
+#if defined(OPENMINERZ_EMISSIVE)
+    // Additive spans are light sources: flames, sparks, muzzle and explosion
+    // flashes. In the Enhanced presentation's scene light they have to be
+    // brighter than a sunlit wall, or they would not bloom like one.
+    if (AmbientSun.w > 0.5f)
+        surface *= 2.4f;
+#endif
+    float3 lit = lerp(surface, FogAndEnd.rgb, fog);
     return float4(lit * alpha, alpha);
 }
 )hlsl";
@@ -4398,11 +6271,45 @@ float4 main(PixelInput input) : SV_TARGET
             compile_shader(entity_sun_shadow_vertex_source, "main", "vs_4_0");
         const auto point_shadow_vertex_blob =
             compile_shader(entity_point_shadow_vertex_source, "main", "vs_4_0");
-        const auto pixel_blob = compile_shader(entity_pixel_source, "main", "ps_5_0");
+        // The deep underground's constants and lighting functions come first
+        // (hell_atmosphere.hpp), as in the terrain shader, and with the same
+        // fallback to the shader exactly as it was.
+        std::string lit_entity_source =
+            deep_underground_shaders_wanted()
+                ? HellAtmosphere::shader_library() + entity_pixel_source
+                : std::string{entity_pixel_source};
+        auto pixel_blob = compile_shader(lit_entity_source.c_str(), "main", "ps_5_0");
+        deep_underground_creatures_ = pixel_blob != nullptr && deep_underground_shaders_wanted();
+        if (pixel_blob == nullptr && deep_underground_shaders_wanted())
+        {
+            failure_reason_.clear();
+            lit_entity_source = entity_pixel_source;
+            pixel_blob = compile_shader(lit_entity_source.c_str(), "main", "ps_5_0");
+        }
         const std::string alpha_lit_source =
-            std::string{"#define OPENMINERZ_ALPHA_LIT 1\n"} + entity_pixel_source;
+            std::string{"#define OPENMINERZ_ALPHA_LIT 1\n"} + lit_entity_source;
         const auto alpha_lit_blob = compile_shader(alpha_lit_source.c_str(), "main", "ps_5_0");
+        // The exact texts compiled, for the mod-light variants (graphics area).
+        entity_pixel_text_ = lit_entity_source;
+        entity_alpha_lit_text_ = alpha_lit_source;
         const auto particle_blob = compile_shader(particle_pixel_source, "main", "ps_4_0");
+        // Additive spans (flames, sparks, flashes) use a variant that gives
+        // them a light source's brightness in the Enhanced presentation. It is
+        // optional: without it they are drawn by the plain particle shader.
+        {
+            const std::string emissive_source =
+                std::string{"#define OPENMINERZ_EMISSIVE 1\n"} + particle_pixel_source;
+            const std::string previous_failure = failure_reason_;
+            const auto emissive_blob = compile_shader(emissive_source.c_str(), "main", "ps_4_0");
+            if (emissive_blob == nullptr ||
+                FAILED(device_->CreatePixelShader(emissive_blob->GetBufferPointer(),
+                                                  emissive_blob->GetBufferSize(), nullptr,
+                                                  &particle_emissive_pixel_shader_)))
+            {
+                particle_emissive_pixel_shader_.Reset();
+                failure_reason_ = previous_failure;
+            }
+        }
         if (vertex_blob == nullptr || sun_shadow_vertex_blob == nullptr ||
             point_shadow_vertex_blob == nullptr || pixel_blob == nullptr ||
             alpha_lit_blob == nullptr ||
@@ -4426,12 +6333,14 @@ float4 main(PixelInput input) : SV_TARGET
                                               particle_blob->GetBufferSize(), nullptr,
                                               &particle_pixel_shader_)))
             return;
-        constexpr std::array<D3D11_INPUT_ELEMENT_DESC, 5> entity_elements{{
+        constexpr std::array<D3D11_INPUT_ELEMENT_DESC, 6> entity_elements{{
             {"POSITION", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 0U, 0U, D3D11_INPUT_PER_VERTEX_DATA, 0U},
             {"TEXCOORD", 0U, DXGI_FORMAT_R32G32_FLOAT, 0U, 12U, D3D11_INPUT_PER_VERTEX_DATA, 0U},
             {"COLOR", 0U, DXGI_FORMAT_R32G32B32A32_FLOAT, 0U, 20U, D3D11_INPUT_PER_VERTEX_DATA, 0U},
             {"NORMAL", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 0U, 36U, D3D11_INPUT_PER_VERTEX_DATA, 0U},
             {"TEXCOORD", 1U, DXGI_FORMAT_R32G32_FLOAT, 0U, 48U, D3D11_INPUT_PER_VERTEX_DATA, 0U},
+            // Second stream: the position of the same vertex one frame ago.
+            {"PREVIOUS", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 1U, 0U, D3D11_INPUT_PER_VERTEX_DATA, 0U},
         }};
         if (FAILED(device_->CreateInputLayout(entity_elements.data(),
                                               static_cast<UINT>(entity_elements.size()),
@@ -4464,6 +6373,37 @@ float4 main(PixelInput input) : SV_TARGET
         target_blend.DestBlendAlpha = D3D11_BLEND_ONE;
         if (FAILED(device_->CreateBlendState(&blend_description, &entity_multiply_blend_state_)))
             return;
+        // A small procedural 3D scalar field, not a smoke/fire picture. Hardware
+        // trilinear sampling replaces hundreds of hashes per ray step, keeping
+        // large overlapping plumes practical at close range.
+        std::vector<std::uint8_t> effect_noise(64U * 64U * 64U);
+        std::uint32_t noise_state = 0x57465833U;
+        for (auto &value : effect_noise)
+        {
+            noise_state ^= noise_state << 13U;
+            noise_state ^= noise_state >> 17U;
+            noise_state ^= noise_state << 5U;
+            value = static_cast<std::uint8_t>(noise_state >> 24U);
+        }
+        D3D11_TEXTURE3D_DESC noise_description{};
+        noise_description.Width = noise_description.Height = noise_description.Depth = 64U;
+        noise_description.MipLevels = 1U;
+        noise_description.Format = DXGI_FORMAT_R8_UNORM;
+        noise_description.Usage = D3D11_USAGE_IMMUTABLE;
+        noise_description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const D3D11_SUBRESOURCE_DATA noise_data{effect_noise.data(), 64U, 64U*64U};
+        Microsoft::WRL::ComPtr<ID3D11Texture3D> noise_texture;
+        D3D11_SAMPLER_DESC noise_sampler{};
+        noise_sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        noise_sampler.AddressU = noise_sampler.AddressV = noise_sampler.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        noise_sampler.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(device_->CreateTexture3D(&noise_description, &noise_data, &noise_texture)) ||
+            FAILED(device_->CreateShaderResourceView(noise_texture.Get(), nullptr, &effect_noise_view_)) ||
+            FAILED(device_->CreateSamplerState(&noise_sampler, &effect_noise_sampler_)))
+        {
+            failure_reason_ = "Could not create the procedural effect density field";
+            return;
+        }
         entity_ready_ = true;
     }
 
@@ -4575,6 +6515,46 @@ float4 main(PixelInput input) : SV_TARGET
         return true;
     }
 
+    // The opaque spans of the current batch: which vertices belong to what.
+    void entity_layout(std::vector<std::array<std::uintptr_t, 3>> &layout) const
+    {
+        layout.clear();
+        for (const EntitySpan &span : entity_batch_.spans)
+            if (span.blend == EntityBlend::opaque)
+                layout.push_back({span.first, span.count,
+                                  reinterpret_cast<std::uintptr_t>(span.texture)});
+    }
+
+    // Stream 1 of the entity pass: where each vertex was one frame ago, or the
+    // current positions when last frame's buffer does not describe the same
+    // vertices (then only the camera's motion is seen).
+    [[nodiscard]] ID3D11Buffer *entity_previous_stream()
+    {
+        if (!entity_motion_vectors_ || !entity_previous_valid_ ||
+            entity_previous_buffer_ == nullptr)
+            return entity_vertex_buffer_.Get();
+        std::vector<std::array<std::uintptr_t, 3>> layout;
+        entity_layout(layout);
+        return layout == entity_previous_layout_ ? entity_previous_buffer_.Get()
+                                                 : entity_vertex_buffer_.Get();
+    }
+
+    // End of a frame drawn with per-object motion: this frame's vertices
+    // become "one frame ago" and the older buffer is reused for the next upload.
+    void retire_entity_batch()
+    {
+        entity_previous_valid_ = entity_motion_vectors_ && !entity_batch_.vertices.empty() &&
+                                 entity_uploaded_count_ == entity_batch_.vertices.size();
+        if (!entity_previous_valid_)
+        {
+            entity_previous_layout_.clear();
+            return;
+        }
+        entity_layout(entity_previous_layout_);
+        std::swap(entity_vertex_buffer_, entity_previous_buffer_);
+        std::swap(entity_vertex_capacity_, entity_previous_capacity_);
+    }
+
     void draw_entity_shadow_geometry(ID3D11VertexShader *entity_shadow_shader,
                                      ID3D11VertexShader *terrain_shadow_shader)
     {
@@ -4601,10 +6581,21 @@ float4 main(PixelInput input) : SV_TARGET
         const UINT stride = sizeof(EntityVertex);
         const UINT offset = 0U;
         context_->IASetInputLayout(entity_input_layout_.Get());
-        ID3D11Buffer *vertex_buffer = entity_vertex_buffer_.Get();
-        context_->IASetVertexBuffers(0U, 1U, &vertex_buffer, &stride, &offset);
+        // Stream 0 is this frame's vertices, stream 1 the same vertices one
+        // frame ago (or this frame's again; see entity_previous_stream).
+        const std::array<ID3D11Buffer *, 2> vertex_buffers{entity_vertex_buffer_.Get(),
+                                                           entity_previous_stream()};
+        const std::array<UINT, 2> strides{stride, stride};
+        const std::array<UINT, 2> offsets{offset, offset};
+        context_->IASetVertexBuffers(0U, 2U, vertex_buffers.data(), strides.data(),
+                                     offsets.data());
+        ID3D11Buffer *previous_camera =
+            entity_motion_vectors_ && post_processor_ != nullptr
+                ? post_processor_->camera_constants()
+                : nullptr;
+        context_->VSSetConstantBuffers(2U, 1U, &previous_camera);
         context_->VSSetShader(entity_vertex_shader_.Get(), nullptr, 0U);
-        context_->PSSetShader(entity_pixel_shader_.Get(), nullptr, 0U);
+        context_->PSSetShader(lit_entity_shader(), nullptr, 0U);
         bool any_blended = false;
         for (const EntitySpan &span : entity_batch_.spans)
         {
@@ -4617,6 +6608,9 @@ float4 main(PixelInput input) : SV_TARGET
             if (view == nullptr)
                 continue;
             context_->PSSetShaderResources(0U, 1U, &view);
+            ID3D11SamplerState *mesh_sampler =
+                span.repeat_texture ? aniso_sampler_state_.Get() : sampler_state_.Get();
+            context_->PSSetSamplers(0U, 1U, &mesh_sampler);
             context_->Draw(span.count, span.first);
         }
         // Soft spans second: depth-tested against everything opaque (terrain and
@@ -4630,8 +6624,18 @@ float4 main(PixelInput input) : SV_TARGET
             ID3D11RenderTargetView *entity_target = target_view_.Get();
             context_->OMSetRenderTargets(1U, &entity_target, depth_view_readonly_.Get());
             context_->OMSetDepthStencilState(water_depth_state_.Get(), 0U);
+            // Slot t8 is shared: particles read scene depth there, while the lit
+            // alpha spans run the entity shader, which reads the canopy
+            // transmission array the main pass bound there. Keep that view to hand
+            // to alpha spans and back to the water pass afterwards.
+            Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> main_pass_transmission;
+            context_->PSGetShaderResources(8U, 1U, main_pass_transmission.GetAddressOf());
             ID3D11ShaderResourceView *scene_depth = depth_srv_.Get();
             context_->PSSetShaderResources(8U, 1U, &scene_depth);
+            ID3D11ShaderResourceView *noise_view = effect_noise_view_.Get();
+            ID3D11SamplerState *noise_sampler = effect_noise_sampler_.Get();
+            context_->PSSetShaderResources(9U, 1U, &noise_view);
+            context_->PSSetSamplers(9U, 1U, &noise_sampler);
             EntityBlend active_blend = EntityBlend::opaque;
             ID3D11PixelShader *active_pixel_shader{};
             for (const EntitySpan &span : entity_batch_.spans)
@@ -4643,12 +6647,19 @@ float4 main(PixelInput input) : SV_TARGET
                     continue;
                 ID3D11PixelShader *pixel_shader =
                     span.blend == EntityBlend::alpha_lit
-                        ? entity_alpha_lit_pixel_shader_.Get()
-                        : particle_pixel_shader_.Get();
+                        ? lit_entity_alpha_shader()
+                        : (span.blend == EntityBlend::additive &&
+                                   particle_emissive_pixel_shader_ != nullptr
+                               ? particle_emissive_pixel_shader_.Get()
+                               : particle_pixel_shader_.Get());
                 if (pixel_shader != active_pixel_shader)
                 {
                     active_pixel_shader = pixel_shader;
                     context_->PSSetShader(active_pixel_shader, nullptr, 0U);
+                    ID3D11ShaderResourceView *slot8 = span.blend == EntityBlend::alpha_lit
+                                                          ? main_pass_transmission.Get()
+                                                          : scene_depth;
+                    context_->PSSetShaderResources(8U, 1U, &slot8);
                 }
                 if (span.blend != active_blend)
                 {
@@ -4661,18 +6672,26 @@ float4 main(PixelInput input) : SV_TARGET
                     context_->OMSetBlendState(blend, nullptr, 0xFFFFFFFFU);
                 }
                 context_->PSSetShaderResources(0U, 1U, &view);
+                ID3D11SamplerState *mesh_sampler =
+                    span.repeat_texture ? aniso_sampler_state_.Get() : sampler_state_.Get();
+                context_->PSSetSamplers(0U, 1U, &mesh_sampler);
                 context_->Draw(span.count, span.first);
             }
-            ID3D11ShaderResourceView *empty_depth{};
-            context_->PSSetShaderResources(8U, 1U, &empty_depth);
+            // Rebinding t8 also unbinds the depth SRV before depth is writable again.
+            ID3D11ShaderResourceView *restored_transmission = main_pass_transmission.Get();
+            context_->PSSetShaderResources(8U, 1U, &restored_transmission);
+            ID3D11ShaderResourceView *empty_noise{};
+            context_->PSSetShaderResources(9U, 1U, &empty_noise);
             context_->OMSetRenderTargets(1U, &entity_target, depth_view_.Get());
             context_->OMSetDepthStencilState(depth_state_.Get(), 0U);
             context_->OMSetBlendState(blend_state_.Get(), nullptr, 0xFFFFFFFFU);
         }
         // Restore the voxel pipeline so the water pass keeps working unchanged.
+        ID3D11SamplerState *default_sampler = sampler_state_.Get();
+        context_->PSSetSamplers(0U, 1U, &default_sampler);
         context_->IASetInputLayout(input_layout_.Get());
         context_->VSSetShader(vertex_shader_.Get(), nullptr, 0U);
-        context_->PSSetShader(pixel_shader_.Get(), nullptr, 0U);
+        context_->PSSetShader(lit_terrain_shader(), nullptr, 0U);
         const std::array material_views{atlas_array_view_.Get(), normal_spec_array_view_.Get(),
                                         metal_light_array_view_.Get()};
         context_->PSSetShaderResources(0U, static_cast<UINT>(material_views.size()),
@@ -4921,6 +6940,58 @@ float4 main(PixelInput input) : SV_TARGET
     Microsoft::WRL::ComPtr<ID3D11PixelShader> bright_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> blur_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> composite_pixel_shader_;
+    // Player quality settings (see set_quality). The "requested" values are
+    // what the settings ask for; the others describe the live GPU objects.
+    std::array<Microsoft::WRL::ComPtr<ID3D11PixelShader>, 4> composite_variants_;
+    std::array<bool, 4> composite_variant_failed_{};
+    const char *composite_source_{};
+    UINT requested_shadow_resolution_{2048U};
+    UINT shadow_resolution_{2048U};
+    UINT requested_anisotropy_{8U};
+    UINT anisotropy_{8U};
+    float mip_bias_{};
+    float shadow_distance_{150.0F};
+    bool fxaa_enabled_{true};
+    bool bloom_enabled_{true};
+    bool sun_shafts_enabled_{true};
+    // The Enhanced presentation's sky and post-processing chain; null when the
+    // device could not build it, in which case the chain above is used.
+    std::unique_ptr<PostProcessor> post_processor_;
+    // The Enhanced presentation's deep underground (hell_atmosphere.hpp): the
+    // lava map the lit shaders read, its air pass and its embers; null or not
+    // ready() when the device could not build it, in which case Hell keeps the
+    // older flat fill. `hell_frame_` is what it decided for the last draw.
+    std::unique_ptr<HellAtmosphere> hell_;
+    HellFrameState hell_frame_{};
+    // The Enhanced presentation's effects (vfx/vfx_renderer.hpp); null or not
+    // ready() when the device could not build it.
+    std::unique_ptr<VfxRenderer> vfx_;
+    // Mod graphics area: lighting props (modding/graphics/mod_light_gpu.hpp),
+    // created by the first frame that has any; whether this draw uses them;
+    // the exact text of each lit pixel shader, from which their mod-light
+    // variants are compiled; and the atmosphere layers' fog band.
+    std::unique_ptr<ModLightGpu> mod_lights_;
+    bool mod_lights_active_{};
+    std::string terrain_pixel_text_;
+    std::string entity_pixel_text_;
+    std::string entity_alpha_lit_text_;
+    const modding::graphics::AtmosphereStack *mod_atmosphere_{};
+    // A mod's colour grade of the finished world image (mod_output.hpp).
+    const modding::graphics::Image *mod_grade_lut_{};
+    std::string mod_grade_name_;
+    float mod_grade_strength_{};
+    std::unique_ptr<ModScreenPass> mod_grade_pass_;
+    // (mod-liquid) The camera inside a mod liquid, and the liquid's colour.
+    bool liquid_view_inside_{};
+    std::array<float, 3> liquid_view_color_{};
+    // Whether each lit shader was compiled with that model; it runs only when
+    // both were.
+    bool deep_underground_terrain_{};
+    bool deep_underground_creatures_{};
+    // The far landscape and the surface air (far_terrain_renderer.hpp); null or
+    // not active() when the device could not build it or the setting is off.
+    std::unique_ptr<FarTerrainRenderer> far_terrain_;
+    float post_last_seconds_{-1.0F};
     Microsoft::WRL::ComPtr<ID3D11DepthStencilState> post_depth_state_;
     // Auto exposure: log-luminance downsample plus a 1x1 adaptation pair.
     static constexpr UINT luminance_extent = 64U;
@@ -4953,6 +7024,20 @@ float4 main(PixelInput input) : SV_TARGET
     Microsoft::WRL::ComPtr<ID3D11PixelShader> entity_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> entity_alpha_lit_pixel_shader_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> particle_pixel_shader_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> effect_noise_view_;
+    Microsoft::WRL::ComPtr<ID3D11SamplerState> effect_noise_sampler_;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> particle_emissive_pixel_shader_;
+    // Per-object motion for the Enhanced motion blur: last frame's entity
+    // vertices are kept and bound as a second stream. They describe the same
+    // vertices only while the opaque spans are laid out exactly as last frame;
+    // otherwise the current buffer is bound twice and a moving creature blurs
+    // with the camera alone for that frame.
+    Microsoft::WRL::ComPtr<ID3D11BlendState> terrain_motion_blend_state_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> entity_previous_buffer_;
+    UINT entity_previous_capacity_{};
+    std::vector<std::array<std::uintptr_t, 3>> entity_previous_layout_;
+    bool entity_previous_valid_{};
+    bool entity_motion_vectors_{};
     Microsoft::WRL::ComPtr<ID3D11InputLayout> entity_input_layout_;
     Microsoft::WRL::ComPtr<ID3D11BlendState> entity_alpha_blend_state_;
     Microsoft::WRL::ComPtr<ID3D11BlendState> entity_additive_blend_state_;
@@ -4968,6 +7053,12 @@ float4 main(PixelInput input) : SV_TARGET
 #endif
     EntityBatch entity_batch_;
     world::DynamicRadianceVolume dynamic_radiance_volume_;
+    PostEffects post_effects_{};
+    PostView post_view_{};
+    std::array<SDL_Texture *, 6> sky_plate_first_{};
+    std::array<SDL_Texture *, 6> sky_plate_second_{};
+    float sky_plate_second_weight_{};
+    bool drew_sky_{};
 
     SDL_Renderer *renderer_{};
     SDL_Texture *target_texture_{};
@@ -5016,6 +7107,11 @@ void DepthVoxelRenderer::replace_chunk(const world::ChunkFaceBatch &batch)
     impl_->replace_chunk(batch);
 }
 
+void DepthVoxelRenderer::install_packed_chunk(PackedChunkMesh packed)
+{
+    impl_->install_packed_chunk(std::move(packed));
+}
+
 void DepthVoxelRenderer::retain_chunks(int minimum_chunk_x, int minimum_chunk_z,
                                        int maximum_chunk_x, int maximum_chunk_z)
 {
@@ -5033,9 +7129,75 @@ void DepthVoxelRenderer::submit_entities(EntityBatch batch)
     impl_->submit_entities(std::move(batch));
 }
 
+void DepthVoxelRenderer::forget_entity_texture(SDL_Texture *texture) noexcept
+{
+    impl_->forget_entity_texture(texture);
+}
+
 void DepthVoxelRenderer::submit_dynamic_radiance(world::DynamicRadianceVolume volume)
 {
     impl_->submit_dynamic_radiance(std::move(volume));
+}
+
+void DepthVoxelRenderer::submit_far_terrain(world::FarTerrainFrame frame)
+{
+    impl_->submit_far_terrain(std::move(frame));
+}
+
+void DepthVoxelRenderer::set_far_mod_palette(const world::ModPaletteLooks &looks,
+                                             std::span<const world::BlockType> fallbacks,
+                                             std::span<const world::FarSurfaceProfile> profiles)
+{
+    impl_->set_far_mod_palette(looks, fallbacks, profiles);
+}
+
+bool DepthVoxelRenderer::vfx_available() const noexcept
+{
+    return impl_->vfx_available();
+}
+
+void DepthVoxelRenderer::submit_vfx(vfx::Frame &frame, const VfxOptions &options)
+{
+    impl_->submit_vfx(frame, options);
+}
+
+// Mod graphics area.
+void DepthVoxelRenderer::submit_mod_lights(const modding::graphics::LightFrame &frame)
+{
+    impl_->submit_mod_lights(frame);
+}
+
+modding::graphics::LightClusterStats DepthVoxelRenderer::mod_light_statistics()
+{
+    return impl_->mod_light_statistics();
+}
+
+void DepthVoxelRenderer::install_mod_tiles(const std::vector<modding::graphics::Image> &tiles)
+{
+    impl_->install_mod_tiles(tiles);
+}
+
+void DepthVoxelRenderer::replace_atlases(SDL_Texture *atlas, SDL_Texture *normal_spec_atlas,
+                                         SDL_Texture *metal_light_atlas)
+{
+    impl_->replace_atlases(atlas, normal_spec_atlas, metal_light_atlas);
+}
+
+void DepthVoxelRenderer::set_mod_atmosphere(
+    const modding::graphics::AtmosphereStack *stack) noexcept
+{
+    impl_->set_mod_atmosphere(stack);
+}
+
+void DepthVoxelRenderer::set_mod_grade(const modding::graphics::Image *lut, std::string_view name,
+                                       float strength)
+{
+    impl_->set_mod_grade(lut, name, strength);
+}
+
+world::FarTerrainGpuStats DepthVoxelRenderer::far_terrain_stats() const noexcept
+{
+    return impl_->far_terrain_stats();
 }
 
 void DepthVoxelRenderer::set_grading(int tone_curve, bool auto_exposure,
@@ -5049,11 +7211,65 @@ DisplayGrading DepthVoxelRenderer::display_grading() const noexcept
     return impl_->display_grading();
 }
 
+void DepthVoxelRenderer::set_post_effects(const PostEffects &effects) noexcept
+{
+    impl_->set_post_effects(effects);
+}
+
+void DepthVoxelRenderer::set_post_view(const PostView &view) noexcept
+{
+    impl_->set_post_view(view);
+}
+
+void DepthVoxelRenderer::set_sky_plates(const std::array<SDL_Texture *, 6> &first,
+                                        const std::array<SDL_Texture *, 6> &second,
+                                        float second_weight) noexcept
+{
+    impl_->set_sky_plates(first, second, second_weight);
+}
+
+bool DepthVoxelRenderer::draws_sky() const noexcept
+{
+    return impl_->draws_sky();
+}
+
+void DepthVoxelRenderer::draw_lens(float elapsed_seconds)
+{
+    impl_->draw_lens(elapsed_seconds);
+}
+
+void DepthVoxelRenderer::draw_mod_grade()
+{
+    impl_->draw_mod_grade();
+}
+
+void DepthVoxelRenderer::set_liquid_view(bool inside, std::array<float, 3> color) noexcept
+{
+    impl_->set_liquid_view(inside, color);
+}
+
+bool DepthVoxelRenderer::deep_light_model() const noexcept
+{
+    return impl_->deep_light_model();
+}
+
+float DepthVoxelRenderer::lava_light_at(float x, float y, float z, float normal_y) const noexcept
+{
+    return impl_->lava_light_at(x, y, z, normal_y);
+}
+
+void DepthVoxelRenderer::set_quality(int shadow_resolution, float shadow_distance, int anisotropy,
+                                     bool fxaa, bool bloom, bool sun_shafts) noexcept
+{
+    impl_->set_quality(shadow_resolution, shadow_distance, anisotropy, fxaa, bloom, sun_shafts);
+}
+
 bool DepthVoxelRenderer::draw(const ui::UiMetrics &metrics, const world::SkyState &sky,
                               const world::PlayerState &player, float vertical_fov_degrees,
                               float render_scale, float elapsed_seconds, float visibility_distance,
-                              world::BiomeKind biome, bool water_enabled, bool enhanced_foliage,
-                              bool ambient_occlusion, bool ore_glow, float shadow_strength)
+                              [[maybe_unused]] world::BiomeKind biome, bool water_enabled,
+                              bool enhanced_foliage, bool ambient_occlusion, bool ore_glow,
+                              float shadow_strength)
 {
     return impl_->draw(metrics, sky, player, vertical_fov_degrees, render_scale, elapsed_seconds,
                        visibility_distance, biome, water_enabled, enhanced_foliage,

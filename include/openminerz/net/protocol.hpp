@@ -45,7 +45,11 @@ struct MessageDescriptor final
 };
 
 inline constexpr std::size_t minimum_packet_size = 2U;
-inline constexpr std::size_t maximum_packet_size = 4096U;
+// The original MemoryStream starts at 4096 bytes and grows. A full 16x128x16
+// chunk delta alone needs 128 KiB; PC voice at 44.1 kHz needs 4416 bytes.
+// Keep a bounded native budget without mistaking the initial allocation for
+// the stock wire limit.
+inline constexpr std::size_t maximum_packet_size = 256U * 1024U;
 inline constexpr std::size_t maximum_payload_size = maximum_packet_size - minimum_packet_size;
 
 [[nodiscard]] std::span<const MessageDescriptor> message_manifest(ProtocolVersion version) noexcept;

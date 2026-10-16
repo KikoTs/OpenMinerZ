@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -34,13 +35,28 @@ struct ModManifest final
 {
     ProtocolVersion protocol{ProtocolVersion::classic_v3};
     std::vector<ModDescriptor> mods;
+    // (Authority) The host chose "OpenMinerZ players only": admission needs
+    // the extension hello even with no server/core mod, and the host owns
+    // health, damage, items and edits (net/session_authority.hpp). Bit 1 of
+    // the extension flags byte; false leaves every byte as it was.
+    bool openminerz_only{};
 };
 
 enum class ExtensionMessageKind : std::uint8_t
 {
     client_hello = 1,
     server_accept = 2,
-    server_reject = 3
+    server_reject = 3,
+    // Mod channel (net/mod_channel.hpp): one fragment of a mod message. Only
+    // ever exchanged with a peer that completed the hello for a manifest that
+    // carries a server/core mod.
+    mod_data = 16,
+    // Client-visible mod download before the hello (net/mod_download.hpp).
+    download_request = 17,
+    download_offer = 18,
+    download_chunk_request = 19,
+    download_chunk = 20,
+    download_refusal = 21
 };
 
 struct ExtensionMessage final
@@ -79,6 +95,16 @@ enum class ExtensionDecodeError : std::uint8_t
 };
 
 [[nodiscard]] bool is_extension_packet(std::span<const std::uint8_t> packet) noexcept;
+// The kind byte of an extension packet of this extension version, without
+// validating anything else; nullopt for any other packet. Handshake kinds are
+// decoded by decode_extension_message, mod-channel and download kinds by
+// their own codecs (which reject what this lets through).
+[[nodiscard]] std::optional<ExtensionMessageKind> extension_message_kind(
+    std::span<const std::uint8_t> packet) noexcept;
+[[nodiscard]] bool is_mod_channel_packet(std::span<const std::uint8_t> packet) noexcept;
+[[nodiscard]] bool is_mod_download_packet(std::span<const std::uint8_t> packet) noexcept;
+// The CRC32 (IEEE, reflected) every extension packet ends with, little-endian.
+[[nodiscard]] std::uint32_t extension_crc32(std::span<const std::uint8_t> bytes) noexcept;
 [[nodiscard]] std::vector<std::uint8_t> encode_extension_message(const ExtensionMessage &message);
 [[nodiscard]] bool decode_extension_message(std::span<const std::uint8_t> packet,
                                             ExtensionMessage &message, ExtensionDecodeError &error);
@@ -109,6 +135,8 @@ struct ModCompatibilityResult final
 };
 
 [[nodiscard]] bool validate_mod_manifest(const ModManifest &manifest, std::string &error) noexcept;
+// Only OpenMinerZ peers may join: a server/core mod, or openminerz_only.
+// (Authority) Exactly the sessions whose host is authoritative.
 [[nodiscard]] bool requires_extension(const ModManifest &manifest) noexcept;
 
 // A peer with no advertised OpenMinerZ capability is treated as a stock

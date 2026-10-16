@@ -145,6 +145,18 @@ std::span<const SpawnerSpawnEntry> spawner_spawn_entries() noexcept
     return spawn_entries;
 }
 
+std::vector<std::uint8_t> spawner_wave_enemy_types(const SpawnerDefinition &definition, int world_level)
+{
+    // The tiers and the rare-loot rule SpawnerSimulation::handle_spawn_event asks for.
+    std::vector<std::uint8_t> types;
+    for (const SpawnerSpawnEntry &candidate : spawn_entries)
+        if (is_spawner_spawn_candidate(candidate, world_level, 1, 5, false,
+                                       std::numeric_limits<int>::max(), definition.package_flags) &&
+            std::find(types.begin(), types.end(), candidate.enemy_type) == types.end())
+            types.push_back(candidate.enemy_type);
+    return types;
+}
+
 bool is_spawner_spawn_candidate(const SpawnerSpawnEntry &candidate, int world_level,
                                 int minimum_tier, int maximum_tier, bool rare_loot,
                                 int maximum_value, SpawnerPackageFlags permitted_flags) noexcept

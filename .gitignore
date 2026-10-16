@@ -32,6 +32,19 @@ steam_appid.txt
 /DerivedData/
 /content-packs/
 /SteamBridge/
+**/DerivedData/
+**/ContentPacks/
+**/content-packs/
+*.omrc
+*.omsm
+*.omsk
+*.omza
+*.omavatar
+*.ocavatar
+*.omhc
+*.omfnt
+.private-import
+import-manifest.json
 
 # Local captures, protocol evidence, and work logs
 /artifacts/
@@ -45,14 +58,11 @@ steam_appid.txt
 *.tmp
 
 # Local tools and editor state
-/.claude/
-/.idea/
-/.vs/
-/.vscode/
+/.*/
+!/.github/
 /tools/**/bin/
 /tools/**/obj/
 /tools/**/.venv/
-/.classic-hd-work/
 __pycache__/
 *.py[cod]
 *.suo

@@ -1,0 +1,22 @@
+# The Restless Crypt: English strings.
+hermit.name = Old Hermit
+hermit.greet = Ah, a traveller. Sit a while; the fire is warm and the night is not.
+hermit.request = The crypt east of here has woken. Four ghouls walk its hall and they will not stay below for long. Will you put them back to rest?
+hermit.accept = Take the stairs under the broken arch. Bring back nothing but quiet.
+hermit.waiting = The hall is still loud. {left} of them still walk.
+hermit.thanks = Quiet at last. Take this charm; it kept me safe longer than I deserved.
+hermit.after = The crypt sleeps. So should you.
+choice.ask = What troubles you?
+choice.yes = I will.
+choice.no = Not tonight.
+choice.done = The crypt is quiet.
+choice.bye = Farewell.
+quest.title = The Restless Crypt
+quest.description = An old hermit camps near the crypt east of where you woke.
+quest.talk = Talk to the Old Hermit
+quest.clear = Lay the crypt ghouls to rest
+quest.return = Return to the hermit
+toast.quest = New quest
+toast.journal = Press J for your journal.
+title.complete = Quest complete
+key.journal = Quest journal

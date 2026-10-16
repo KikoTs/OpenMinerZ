@@ -144,7 +144,8 @@ struct PeerBootstrapStatus final
 class AuthoritativeBootstrapHost final
 {
   public:
-    AuthoritativeBootstrapHost(ProtocolVersion protocol, AuthoritativeBootstrapSnapshot snapshot);
+    AuthoritativeBootstrapHost(ProtocolVersion protocol, AuthoritativeBootstrapSnapshot snapshot,
+                               std::filesystem::path inventory_directory = {});
 
     [[nodiscard]] bool register_peer(PeerId peer, std::uint8_t player_gid);
     void disconnect(PeerId peer) noexcept;
@@ -154,11 +155,16 @@ class AuthoritativeBootstrapHost final
     [[nodiscard]] bool set_custom_door(IntVector3 location, std::uint8_t model_name);
     [[nodiscard]] bool destroy_custom_block(IntVector3 location);
     [[nodiscard]] bool update_spawner(IntVector3 location, bool started);
+    [[nodiscard]] bool update_hell_boss_progress(std::uint32_t spawned, std::uint32_t maximum);
     [[nodiscard]] bool apply_block_edit(IntVector3 position, std::uint8_t block_type);
     [[nodiscard]] bool apply_block_replacements(std::span<const IntVector3> positions,
                                                 std::uint8_t block_type);
     [[nodiscard]] bool apply_block_removals(std::span<const IntVector3> positions);
     [[nodiscard]] std::optional<PeerBootstrapStatus> status(PeerId peer) const noexcept;
+    // Exactly the world state a late joiner would now be told about. Exposed so
+    // a desync comparison can digest the authoritative world without replaying
+    // the whole bootstrap transcript.
+    [[nodiscard]] const AuthoritativeBootstrapSnapshot &snapshot() const noexcept;
     // Ordinary gameplay is valid only for the currently admitted peer/GID
     // generation after its source-ordered PlayerExists request was accepted.
     [[nodiscard]] bool gameplay_ready(PeerId peer, std::uint8_t player_gid) const noexcept;
@@ -181,6 +187,7 @@ class AuthoritativeBootstrapHost final
         MessageDeliveryPolicy delivery, PeerId original_sender = 0U) const;
 
     ProtocolVersion protocol_;
+    std::filesystem::path inventory_directory_;
     AuthoritativeBootstrapSnapshot snapshot_;
     std::unordered_map<PeerId, PeerState> peers_;
     std::unordered_map<PeerId, PlayerInventoryPayload> stored_inventories_;

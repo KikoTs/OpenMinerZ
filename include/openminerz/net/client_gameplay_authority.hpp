@@ -92,6 +92,8 @@ class ClientGameplayRateLimiter final
         std::uint16_t block_removals{};
         std::uint16_t pickup_creations{};
         std::uint16_t pickup_requests{};
+        std::uint16_t crate_items{};
+        std::uint16_t crate_destructions{};
         std::uint16_t gunshots{};
         std::uint16_t shotgun_shots{};
         std::uint16_t melee_attacks{};
@@ -108,6 +110,7 @@ class ClientGameplayRateLimiter final
         std::uint16_t player_updates{};
         std::uint16_t text_messages{};
         std::uint16_t voice_messages{};
+        std::uint16_t level_restarts{};
     };
 
     std::unordered_map<PeerId, Window> windows_;

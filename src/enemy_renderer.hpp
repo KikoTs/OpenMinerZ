@@ -15,9 +15,9 @@ namespace openminerz
 {
 
 // One CPU-skinned world-space triangle vertex handed to the depth renderer's
-// entity pass. Soft effects leave normal/light data at zero and retain their
-// authored colour; skinned geometry carries the data needed by Rebirth's
-// directional and shadowed lighting path.
+// entity pass. Skinned geometry carries normals and baked lighting. Procedural
+// volumes reuse the normal fields for their world centre, sky_light for radius,
+// and negative torch_light values for the smoke/fire/ice shader selector.
 struct EntityVertex final
 {
     float x{};
@@ -59,6 +59,8 @@ struct EntitySpan final
     std::uint32_t first{};
     std::uint32_t count{};
     EntityBlend blend{EntityBlend::opaque};
+    // Mesh UVs remain continuous across triangle edges; the sampler wraps them.
+    bool repeat_texture{};
 };
 
 struct EntityBatch final
@@ -100,10 +102,8 @@ struct ExplosiveFuseVisual final
     bool flash{};
 };
 
-// The dragon's fireball: the original FireBall model tumbling about its local
-// X axis at 3 rad/s, rendered fullbright like FireballModelEntity. The id is
-// stable across frames so the renderer can keep trail-emitter accumulators;
-// velocity feeds the LocalSpace trail particles (glow/ball ride along).
+// A dragon fireball's procedural volume and trail. Stable ids preserve emission
+// history between frames; ice selects the blue core, trail and impact palette.
 struct FireballVisual final
 {
     world::Vec3 position{};
@@ -128,11 +128,18 @@ class EnemyModelLibrary final
     [[nodiscard]] float clip_duration(world::EnemyModelKind model,
                                       std::string_view clip) const noexcept;
     // sun_light/torch_light are 0..1 factors sampled by the caller at each enemy.
+    // `enhanced`: the Enhanced presentation's shader lights the vertices from
+    // those factors itself, so they carry the skin's albedo (white) instead of
+    // the Original presentation's baked light - lit once, not twice.
     void append_enemy(EntityBatch &batch, const world::Enemy &enemy, float sun_light,
                       float torch_light, const std::array<float, 3> &sun_color,
-                      float daylight);
+                      float daylight, bool enhanced = false);
     void append_dragon(EntityBatch &batch, const world::Dragon &dragon,
-                       const std::array<float, 3> &sun_color);
+                       const std::array<float, 3> &sun_color, bool enhanced = false);
+    // (Visuals) A texture pack changed: the skins are loaded again (through
+    // the pack). Returns the textures they replaced, for the caller to forget
+    // in the depth renderer and destroy.
+    [[nodiscard]] std::vector<SDL_Texture *> reload_textures();
 
   private:
     class Impl;

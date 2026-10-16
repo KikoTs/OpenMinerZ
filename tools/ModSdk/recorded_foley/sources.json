@@ -1,0 +1,82 @@
+[
+  {
+    "file": "assaultriflereload1_0.wav",
+    "author": "SpringySpringo",
+    "page": "https://opengameart.org/content/gun-reload-sounds",
+    "download": "https://opengameart.org/sites/default/files/assaultriflereload1_0.wav",
+    "license": "CC0-1.0",
+    "sha256": "efb2d724d634eabe6ba8d3065686abca848bb7497d4d43a5e4aed5e5ea23016f"
+  },
+  {
+    "file": "clank1.wav",
+    "author": "Brian MacIntosh (BMacZero)",
+    "page": "https://opengameart.org/content/mechanical-sounds",
+    "download": "https://opengameart.org/sites/default/files/clank1.wav",
+    "license": "CC0-1.0",
+    "sha256": "899a46a8423fa0ca349b3c70a07a422d1eaa3a58695ce6facfbae074dd70226f"
+  },
+  {
+    "file": "clipload2.wav",
+    "author": "Brian MacIntosh (BMacZero)",
+    "page": "https://opengameart.org/content/gun-reload-sound-effects",
+    "download": "https://opengameart.org/sites/default/files/clipload2.wav",
+    "license": "CC0-1.0",
+    "sha256": "a5441641e7e9ede24f3ac311642e06265c6f480e3b1ba4b92c19c81c3a5e4d86"
+  },
+  {
+    "file": "cloth_sounds.wav",
+    "author": "Vinrax",
+    "page": "https://opengameart.org/content/cloth-swing-sounds",
+    "download": "https://opengameart.org/sites/default/files/cloth_sounds.wav",
+    "license": "CC-BY-3.0",
+    "sha256": "fe85c3aef953348afa856d1219e1fb57bbbf0c2df2d23dbbfdf754d9fd03690f"
+  },
+  {
+    "file": "lightclunk1.wav",
+    "author": "Brian MacIntosh (BMacZero)",
+    "page": "https://opengameart.org/content/mechanical-sounds",
+    "download": "https://opengameart.org/sites/default/files/lightclunk1.wav",
+    "license": "CC0-1.0",
+    "sha256": "d5a2aa8764c02924f6ed6fbaad0c650ab2d57ec57a626cee9e6645f941dbc8fa"
+  },
+  {
+    "file": "lightclunk2.wav",
+    "author": "Brian MacIntosh (BMacZero)",
+    "page": "https://opengameart.org/content/mechanical-sounds",
+    "download": "https://opengameart.org/sites/default/files/lightclunk2.wav",
+    "license": "CC0-1.0",
+    "sha256": "987be837a5941ded9a81572c319b9bf8f57d9f89741a5781fc7104adc87d60f5"
+  },
+  {
+    "file": "mechanical1.wav",
+    "author": "Brian MacIntosh (BMacZero)",
+    "page": "https://opengameart.org/content/mechanical-sounds",
+    "download": "https://opengameart.org/sites/default/files/mechanical1.wav",
+    "license": "CC0-1.0",
+    "sha256": "de520ad93fa9f4df357b31a8fdef7778d8df994574c861f9337d5241fee5db33"
+  },
+  {
+    "file": "rattle1.wav",
+    "author": "Brian MacIntosh (BMacZero)",
+    "page": "https://opengameart.org/content/mechanical-sounds",
+    "download": "https://opengameart.org/sites/default/files/rattle1.wav",
+    "license": "CC0-1.0",
+    "sha256": "65ae71cd800986e4e4c0c1a180221c0f240f6ffd9e306f8634c0335a5e3f039a"
+  },
+  {
+    "file": "reload.wav",
+    "author": "zer0_sol",
+    "page": "https://opengameart.org/content/handgun-reload-sound-effect",
+    "download": "https://opengameart.org/sites/default/files/reload.wav",
+    "license": "CC0-1.0",
+    "sha256": "091399145b174ac3b2e0df245b4712a13ce85df072e37256b0fc32658718be53"
+  },
+  {
+    "file": "singlebullet1.wav",
+    "author": "Brian MacIntosh (BMacZero)",
+    "page": "https://opengameart.org/content/gun-reload-sound-effects",
+    "download": "https://opengameart.org/sites/default/files/singlebullet1.wav",
+    "license": "CC0-1.0",
+    "sha256": "422bb2b92072cf8ecb77fda83e70d27bdcb7fa8cee33415ef66985a8cc14dde2"
+  }
+]

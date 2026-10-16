@@ -1,5 +1,7 @@
 #include "openminerz/world/block.hpp"
 
+#include <atomic>
+#include <iterator>
 #include <limits>
 
 namespace openminerz::world
@@ -10,15 +12,35 @@ bool is_solid(BlockType type) noexcept
     return type != BlockType::empty && type != BlockType::uninitialized;
 }
 
+namespace
+{
+// The "Sinking lava" enhancement (retail_parity.hpp). Off unless the
+// application switched it on for an offline world; never on in a session.
+std::atomic<bool> surface_lava_passable_flag{false};
+} // namespace
+
+void set_surface_lava_passable(bool passable) noexcept
+{
+    surface_lava_passable_flag.store(passable, std::memory_order_relaxed);
+}
+
+bool surface_lava_passable() noexcept
+{
+    return surface_lava_passable_flag.load(std::memory_order_relaxed);
+}
+
 bool blocks_player(BlockType type) noexcept
 {
-    // A rendered/touchable voxel is not necessarily a full collision cube. This mirrors the
-    // original BlockPlayer contract, with both lava variants intentionally pass-through for the
-    // Rebirth gameplay rule requested by the project owner.
+    // A rendered/touchable voxel is not necessarily a full collision cube. This is the shipped
+    // BlockType table's blockPlayer column (1.6.3.8 and 1.9.9.8 agree): SurfaceLava is a SOLID
+    // block a player, enemy, pickup or grenade rests on, and only DeepLava is pass-through.
+    // Lava damage is unrelated to either block; it is the global plane below Y=-60
+    // (lava_submersion). A stock peer stands on surface lava, so anything else desynchronises.
+    if (type == BlockType::surface_lava)
+        return !surface_lava_passable();
     switch (type)
     {
     case BlockType::empty:
-    case BlockType::surface_lava:
     case BlockType::deep_lava:
     case BlockType::leaves:
     case BlockType::torch:
@@ -126,6 +148,15 @@ bool is_container(BlockType type) noexcept
            type == BlockType::crate_copper || type == BlockType::crate_iron ||
            type == BlockType::crate_gold || type == BlockType::crate_diamond ||
            type == BlockType::crate_bloodstone;
+}
+
+bool is_structure(BlockType type) noexcept
+{
+    // BlockType.IsStructure in 1.9.9.8: the four glass blocks, the four spawn
+    // point blocks and the teleport station.
+    return (type >= BlockType::glass_basic && type <= BlockType::glass_mystery) ||
+           (type >= BlockType::spawn_point_basic && type <= BlockType::spawn_point_explorer) ||
+           type == BlockType::teleport_station;
 }
 
 std::optional<FaceDirection> attached_face(BlockType type) noexcept
@@ -447,8 +478,10 @@ float bare_hand_break_seconds(BlockType type) noexcept
 {
     // InventoryItem.TimeToDig from the original bare-hand/base-item contract.
     // Its first branch returns two seconds for every IsContainer block, before
-    // considering any of the ordinary material cases below.
-    if (is_container(type))
+    // considering any of the ordinary material cases below. 1.9.9.8 adds the
+    // same two seconds for every IsStructure block; those ids do not exist in
+    // 1.6.3.8, so the check needs no generation switch.
+    if (is_container(type) || is_structure(type))
         return 2.0F;
     switch (type)
     {
@@ -763,163 +796,39 @@ BlockColor fallback_color(BlockType type) noexcept
     }
 }
 
+namespace
+{
+
+// BlockType.Name for every BlockTypeEnum value, as each shipped build's
+// BlockType table has it. Generated from the owned installs by
+// tools/OriginalClientInterop/PresentationParityProbe.
+struct RetailBlockName final
+{
+    const char *classic;
+    const char *modern;
+};
+
+constexpr RetailBlockName retail_block_names[]{
+#define OPENMINERZ_RETAIL_BLOCK(id, retail_enum, classic, modern) {classic, modern},
+#include "retail_block_names.inc"
+#undef OPENMINERZ_RETAIL_BLOCK
+};
+
+} // namespace
+
 std::string_view block_name(BlockType type) noexcept
 {
-    switch (type)
-    {
-    case BlockType::empty:
-        return "AIR";
-    case BlockType::dirt:
-        return "DIRT";
-    case BlockType::grass:
-        return "GRASS";
-    case BlockType::sand:
-        return "SAND";
-    case BlockType::lantern:
-        return "LANTERN";
-    case BlockType::fixed_lantern:
-        return "FIXED LANTERN";
-    case BlockType::rock:
-        return "ROCK";
-    case BlockType::gold_ore:
-        return "GOLD ORE";
-    case BlockType::iron_ore:
-        return "IRON ORE";
-    case BlockType::copper_ore:
-        return "COPPER ORE";
-    case BlockType::coal_ore:
-        return "COAL ORE";
-    case BlockType::diamond_ore:
-        return "DIAMOND ORE";
-    case BlockType::surface_lava:
-        return "SURFACE LAVA";
-    case BlockType::deep_lava:
-        return "DEEP LAVA";
-    case BlockType::snow:
-        return "SNOW";
-    case BlockType::ice:
-        return "ICE";
-    case BlockType::log:
-        return "LOG";
-    case BlockType::leaves:
-        return "LEAVES";
-    case BlockType::wood:
-        return "WOOD";
-    case BlockType::bedrock:
-        return "BEDROCK";
-    case BlockType::blood_stone:
-        return "BLOOD STONE";
-    case BlockType::space_rock:
-    case BlockType::space_rock_inventory:
-        return "SPACE ROCK";
-    case BlockType::iron_wall:
-        return "IRON WALL";
-    case BlockType::copper_wall:
-        return "COPPER WALL";
-    case BlockType::golden_wall:
-        return "GOLD WALL";
-    case BlockType::diamond_wall:
-        return "DIAMOND WALL";
-    case BlockType::torch:
-    case BlockType::torch_pos_x:
-    case BlockType::torch_neg_z:
-    case BlockType::torch_neg_x:
-    case BlockType::torch_pos_z:
-    case BlockType::torch_pos_y:
-    case BlockType::torch_neg_y:
-        return "TORCH";
-    case BlockType::crate:
-        return "CRATE";
-    case BlockType::lower_door_closed_z:
-    case BlockType::lower_door_closed_x:
-    case BlockType::lower_door:
-    case BlockType::upper_door_closed:
-    case BlockType::lower_door_open_z:
-    case BlockType::lower_door_open_x:
-    case BlockType::upper_door_open:
-        return "DOOR";
-    case BlockType::tnt:
-        return "TNT";
-    case BlockType::c4:
-        return "C4";
-    case BlockType::slime:
-        return "SLIME";
-    case BlockType::glass_basic:
-        return "STICK WINDOW";
-    case BlockType::glass_iron:
-        return "IRON WINDOW";
-    case BlockType::glass_strong:
-        return "BULLETPROOF GLASS";
-    case BlockType::glass_mystery:
-        return "CLEAR GLASS";
-    case BlockType::crate_stone:
-        return "STONE CRATE";
-    case BlockType::crate_copper:
-        return "COPPER CRATE";
-    case BlockType::crate_iron:
-        return "IRON CRATE";
-    case BlockType::crate_gold:
-        return "GOLD CRATE";
-    case BlockType::crate_diamond:
-        return "DIAMOND CRATE";
-    case BlockType::crate_bloodstone:
-        return "BLOODSTONE CRATE";
-    case BlockType::crate_safe:
-        return "SAFE CRATE";
-    case BlockType::spawn_point_basic:
-    case BlockType::spawn_point_builder:
-    case BlockType::spawn_point_combat:
-    case BlockType::spawn_point_explorer:
-        return "RESPAWN BEACON";
-    case BlockType::strong_lower_door_closed_z:
-    case BlockType::strong_lower_door_closed_x:
-    case BlockType::strong_lower_door:
-    case BlockType::strong_upper_door_closed:
-    case BlockType::strong_lower_door_open_z:
-    case BlockType::strong_lower_door_open_x:
-    case BlockType::strong_upper_door_open:
-        return "STRONG DOOR";
-    case BlockType::lantern_fancy:
-        return "FANCY LANTERN";
-    case BlockType::turret_block:
-        return "TURRET BLOCK";
-    case BlockType::loot_block:
-        return "LOOT BLOCK";
-    case BlockType::lucky_loot_block:
-        return "LUCKY LOOT BLOCK";
-    case BlockType::bomb_block:
-        return "BOMB BLOCK";
-    case BlockType::enemy_spawn_on:
-    case BlockType::enemy_spawn_off:
-    case BlockType::enemy_spawn_rare_on:
-    case BlockType::enemy_spawn_rare_off:
-    case BlockType::enemy_spawn_altar:
-    case BlockType::alien_spawn_on:
-    case BlockType::alien_spawn_off:
-    case BlockType::hell_spawn_on:
-    case BlockType::hell_spawn_off:
-    case BlockType::boss_spawn_on:
-    case BlockType::boss_spawn_off:
-    case BlockType::enemy_spawn_dim:
-    case BlockType::enemy_spawn_rare_dim:
-    case BlockType::alien_spawn_dim:
-    case BlockType::hell_spawn_dim:
-    case BlockType::boss_spawn_dim:
-    case BlockType::alien_horde_on:
-    case BlockType::alien_horde_off:
-    case BlockType::alien_horde_dim:
-        return "MONSTER SPAWNER";
-    case BlockType::teleport_station:
-        return "TELEPORT STATION";
-    case BlockType::crafting_station:
-        return "CRAFTING STATION";
-    case BlockType::hell_forge:
-        return "HELL FORGE";
-    case BlockType::uninitialized:
-        return "UNINITIALIZED";
-    default:
-        return "BLOCK";
-    }
+    // The 45 blocks 1.6.3.8 has carry the same name in 1.9.9.8, so the newer
+    // table answers for both. These are the words the aimed-block label draws,
+    // oddities included: coal ore is "Coal", diamond ore "Diamonds", both lavas
+    // "Lava", a lit spawner "Active Spawner!", and the blocks 1.9.9.8 never
+    // finished (turret, bomb, altar, crafting station, hell forge) still carry
+    // the "Space Goo" and "Door" they were copied from.
+    const auto index = static_cast<std::size_t>(type);
+    if (index >= std::size(retail_block_names))
+        return "Air"; // BlockTypeEnum.NumberOfBlocks resolves to the Empty entry
+    const RetailBlockName &entry = retail_block_names[index];
+    return entry.modern != nullptr ? entry.modern : entry.classic;
 }
 
 } // namespace openminerz::world

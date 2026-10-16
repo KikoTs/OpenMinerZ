@@ -1,0 +1,484 @@
+{
+ "asset": {
+  "version": "2.0",
+  "generator": "OpenMinerZ tools/ModSdk/make_example_animation_pack.py",
+  "copyright": "Original animation, OpenMinerZ examples"
+ },
+ "scene": 0,
+ "scenes": [
+  {
+   "nodes": [
+    0
+   ]
+  }
+ ],
+ "nodes": [
+  {
+   "name": "Root",
+   "children": [
+    1,
+    2,
+    3,
+    4
+   ]
+  },
+  {
+   "name": "BackLower",
+   "children": [
+    5,
+    10
+   ]
+  },
+  {
+   "name": "HipLeft",
+   "children": [
+    6,
+    7
+   ]
+  },
+  {
+   "name": "HipRight",
+   "children": [
+    8,
+    9
+   ]
+  },
+  {
+   "name": "4"
+  },
+  {
+   "name": "BackUpper",
+   "children": [
+    12,
+    14,
+    16,
+    18
+   ]
+  },
+  {
+   "name": "KneeLeft",
+   "children": [
+    11,
+    13
+   ]
+  },
+  {
+   "name": "7"
+  },
+  {
+   "name": "KneeRight",
+   "children": [
+    15,
+    17
+   ]
+  },
+  {
+   "name": "9"
+  },
+  {
+   "name": "10"
+  },
+  {
+   "name": "AnkleLeft",
+   "children": [
+    21
+   ]
+  },
+  {
+   "name": "CollarLeft",
+   "children": [
+    20
+   ]
+  },
+  {
+   "name": "13"
+  },
+  {
+   "name": "Neck",
+   "children": [
+    19,
+    24
+   ]
+  },
+  {
+   "name": "AnkleRight",
+   "children": [
+    23
+   ]
+  },
+  {
+   "name": "CollarRight",
+   "children": [
+    22
+   ]
+  },
+  {
+   "name": "17"
+  },
+  {
+   "name": "18"
+  },
+  {
+   "name": "Head"
+  },
+  {
+   "name": "ShoulderLeft",
+   "children": [
+    25,
+    26,
+    27
+   ]
+  },
+  {
+   "name": "ToeLeft"
+  },
+  {
+   "name": "ShoulderRight",
+   "children": [
+    28,
+    29,
+    30
+   ]
+  },
+  {
+   "name": "ToeRight"
+  },
+  {
+   "name": "24"
+  },
+  {
+   "name": "ElbowLeft",
+   "children": [
+    31,
+    32,
+    33
+   ]
+  },
+  {
+   "name": "26"
+  },
+  {
+   "name": "27"
+  },
+  {
+   "name": "ElbowRight",
+   "children": [
+    34,
+    35,
+    36
+   ]
+  },
+  {
+   "name": "29"
+  },
+  {
+   "name": "30"
+  },
+  {
+   "name": "31"
+  },
+  {
+   "name": "32"
+  },
+  {
+   "name": "WristLeft",
+   "children": [
+    37,
+    38,
+    39,
+    40,
+    41,
+    42,
+    43
+   ]
+  },
+  {
+   "name": "34"
+  },
+  {
+   "name": "35"
+  },
+  {
+   "name": "WristRight",
+   "children": [
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50
+   ]
+  },
+  {
+   "name": "FingerIndexLeft",
+   "children": [
+    51
+   ]
+  },
+  {
+   "name": "FingerMiddleLeft",
+   "children": [
+    52
+   ]
+  },
+  {
+   "name": "FingerRingLeft",
+   "children": [
+    53
+   ]
+  },
+  {
+   "name": "FingerSmallLeft",
+   "children": [
+    54
+   ]
+  },
+  {
+   "name": "PropLeft"
+  },
+  {
+   "name": "SpecialLeft"
+  },
+  {
+   "name": "FingerThumbLeft",
+   "children": [
+    55
+   ]
+  },
+  {
+   "name": "FingerIndexRight",
+   "children": [
+    56
+   ]
+  },
+  {
+   "name": "FingerMiddleRight",
+   "children": [
+    57
+   ]
+  },
+  {
+   "name": "FingerRingRight",
+   "children": [
+    58
+   ]
+  },
+  {
+   "name": "FingerSmallRight",
+   "children": [
+    59
+   ]
+  },
+  {
+   "name": "PropRight"
+  },
+  {
+   "name": "SpecialRight"
+  },
+  {
+   "name": "FingerThumbRight",
+   "children": [
+    60
+   ]
+  },
+  {
+   "name": "FingerIndex2Left",
+   "children": [
+    61
+   ]
+  },
+  {
+   "name": "FingerMiddle2Left",
+   "children": [
+    62
+   ]
+  },
+  {
+   "name": "FingerRing2Left",
+   "children": [
+    63
+   ]
+  },
+  {
+   "name": "FingerSmall2Left",
+   "children": [
+    64
+   ]
+  },
+  {
+   "name": "FingerThumb2Left",
+   "children": [
+    65
+   ]
+  },
+  {
+   "name": "FingerIndex2Right",
+   "children": [
+    66
+   ]
+  },
+  {
+   "name": "FingerMiddle2Right",
+   "children": [
+    67
+   ]
+  },
+  {
+   "name": "FingerRing2Right",
+   "children": [
+    68
+   ]
+  },
+  {
+   "name": "FingerSmall2Right",
+   "children": [
+    69
+   ]
+  },
+  {
+   "name": "FingerThumb2Right",
+   "children": [
+    70
+   ]
+  },
+  {
+   "name": "FingerIndex3Left"
+  },
+  {
+   "name": "FingerMiddle3Left"
+  },
+  {
+   "name": "FingerRing3Left"
+  },
+  {
+   "name": "FingerSmall3Left"
+  },
+  {
+   "name": "FingerThumb3Left"
+  },
+  {
+   "name": "FingerIndex3Right"
+  },
+  {
+   "name": "FingerMiddle3Right"
+  },
+  {
+   "name": "FingerRing3Right"
+  },
+  {
+   "name": "FingerSmall3Right"
+  },
+  {
+   "name": "FingerThumb3Right"
+  }
+ ],
+ "animations": [
+  {
+   "name": "PickUse",
+   "channels": [
+    {
+     "sampler": 0,
+     "target": {
+      "node": 22,
+      "path": "rotation"
+     }
+    },
+    {
+     "sampler": 1,
+     "target": {
+      "node": 28,
+      "path": "rotation"
+     }
+    },
+    {
+     "sampler": 2,
+     "target": {
+      "node": 36,
+      "path": "rotation"
+     }
+    }
+   ],
+   "samplers": [
+    {
+     "input": 0,
+     "output": 1,
+     "interpolation": "LINEAR"
+    },
+    {
+     "input": 0,
+     "output": 2,
+     "interpolation": "LINEAR"
+    },
+    {
+     "input": 0,
+     "output": 3,
+     "interpolation": "LINEAR"
+    }
+   ],
+   "extras": {
+    "openminerz": "A wave in place of the pickaxe swing, once per swing."
+   }
+  }
+ ],
+ "buffers": [
+  {
+   "byteLength": 520,
+   "uri": "data:application/octet-stream;base64,AAAAAImICD2JiIg9zczMPYmICD6rqio+zcxMPu/ubj6JiIg+mpmZPmj4A7+vOeQ+L9C4PkP4Ij+zohS/OinPPsUm0D6m7RM//4QdvxjcwT6+l9w+IG4KP+o+HL/y3sM+Fs/aPsXdCz8bGhG/ZwTUPvYzyz5eZRc/WKv+vjhV6T5EUrI+750mP6403L6+7/k+lTCaPiF5Mj+8k8u+r2AAP9aLjj6iVzc/iHvVvr7H/D5qe5U++IA0P0O09L77gO4++1erPjNPKj8oqM8+SUgUPyioz75JSBQ/KKjPPklIFD8oqM++SUgUPyiozz5JSBQ/KKjPvklIFD8oqM8+SUgUPyioz75JSBQ/KKjPPklIFD8oqM++SUgUPyiozz5JSBQ/KKjPvklIFD8oqM8+SUgUPyioz75JSBQ/KKjPPklIFD8oqM++SUgUPyiozz5JSBQ/KKjPvklIFD8oqM8+SUgUPyioz75JSBQ/AAAAANsqjT0AAAAAH2R/PwAAAIDx0vK7AAAAgDP+fz8AAACA4RClvQAAAIDJKn8/AAAAgLct9b0AAACArih+PwAAAICEat69AAAAgGF8fj8AAACACzVUvQAAAID8p38/AAAAAGbj3DwAAAAALOh/PwAAAADUE8E9AAAAABzcfj8AAAAAs3/5PQAAAADbF34/AAAAAIxIyT0AAAAAtcJ+Pw=="
+  }
+ ],
+ "bufferViews": [
+  {
+   "buffer": 0,
+   "byteOffset": 0,
+   "byteLength": 40
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 40,
+   "byteLength": 160
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 200,
+   "byteLength": 160
+  },
+  {
+   "buffer": 0,
+   "byteOffset": 360,
+   "byteLength": 160
+  }
+ ],
+ "accessors": [
+  {
+   "bufferView": 0,
+   "componentType": 5126,
+   "count": 10,
+   "type": "SCALAR",
+   "min": [
+    0.0
+   ],
+   "max": [
+    0.3
+   ]
+  },
+  {
+   "bufferView": 1,
+   "componentType": 5126,
+   "count": 10,
+   "type": "VEC4"
+  },
+  {
+   "bufferView": 2,
+   "componentType": 5126,
+   "count": 10,
+   "type": "VEC4"
+  },
+  {
+   "bufferView": 3,
+   "componentType": 5126,
+   "count": 10,
+   "type": "VEC4"
+  }
+ ]
+}

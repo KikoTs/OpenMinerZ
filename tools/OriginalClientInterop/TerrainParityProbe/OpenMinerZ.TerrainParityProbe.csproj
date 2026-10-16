@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <!-- The game is a 32-bit process. World generation is float arithmetic run
+         through the legacy x86 JIT on the x87 FPU, so the probe MUST be x86 too:
+         an AnyCPU/x64 host would evaluate the same IL with SSE and round
+         differently, which is exactly the class of error this probe exists to
+         catch in the native generator. -->
+    <PlatformTarget>x86</PlatformTarget>
+    <Prefer32Bit>true</Prefer32Bit>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- XNA is referenced from the machine's GAC, never copied. The owned game
+         assemblies are loaded by path at run time. -->
+    <Reference Include="Microsoft.Xna.Framework">
+      <HintPath>$(WINDIR)\Microsoft.NET\assembly\GAC_32\Microsoft.Xna.Framework\v4.0_4.0.0.0__842cf8be1de50553\Microsoft.Xna.Framework.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

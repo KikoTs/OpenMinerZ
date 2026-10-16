@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "bones": {
+    "CollarLeft": "CollarLeft",
+    "ShoulderLeft": "ShoulderLeft",
+    "ElbowLeft": "ElbowLeft",
+    "WristLeft": "WristLeft",
+    "PropLeft": "PropLeft",
+    "CollarRight": "CollarRight",
+    "ShoulderRight": "ShoulderRight",
+    "ElbowRight": "ElbowRight",
+    "WristRight": "WristRight",
+    "PropRight": "PropRight",
+    "Head": "Head",
+    "BackUpper": "BackUpper"
+  },
+  "palms": {
+    "Left": [
+      0.096,
+      -0.055,
+      0.004
+    ],
+    "Right": [
+      -0.062,
+      -0.042,
+      0.004
+    ]
+  },
+  "finger_curl": {
+    "Index": [
+      55,
+      78,
+      40
+    ],
+    "Middle": [
+      62,
+      82,
+      44
+    ],
+    "Ring": [
+      67,
+      86,
+      46
+    ],
+    "Small": [
+      71,
+      90,
+      48
+    ]
+  },
+  "clips": {},
+  "models": {}
+}

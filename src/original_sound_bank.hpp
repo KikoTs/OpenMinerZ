@@ -4,6 +4,7 @@
 #include "openminerz/world/player.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -30,6 +31,12 @@ class OriginalSoundBank final
 
     OriginalSoundBank(const OriginalSoundBank &) = delete;
     OriginalSoundBank &operator=(const OriginalSoundBank &) = delete;
+
+    // (Graphics area) A sound pack's replacement for a one-shot cue: called
+    // with the cue and, for a 3D cue, where it plays; true when the pack
+    // played it and the original must not. Unset (no pack): never called.
+    using CueOverride = std::function<bool(std::string_view cue, const world::Vec3 *position)>;
+    static void set_cue_override(CueOverride hook);
 
     [[nodiscard]] bool available() const noexcept;
     [[nodiscard]] std::string_view output_name() const noexcept;

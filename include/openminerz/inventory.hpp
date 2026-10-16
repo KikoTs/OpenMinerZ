@@ -228,17 +228,56 @@ enum class PlayerAnimationMode : std::uint8_t
     rpg = 16,
 };
 
+// InventoryItemClass.Name as the shipped builds register it ("Stone PickAxe",
+// "Sub Machine Gun", "Wood Stick"): mixed case, exactly what the original HUD,
+// inventory and crafting screens draw. 1.6.3.8 and 1.9.9.8 give every item they
+// share the same name, so no generation is needed. Note what retail really
+// calls things: the four laser-gun tiers are all "Laser Rifle" etc., the three
+// 1.9.9.8 doors are all "Strong Door", the fancy lantern is "Lantern" and both
+// laser drills are "Laser Drill".
 [[nodiscard]] std::string_view item_name(InventoryItemId item) noexcept;
+// Name and description as one shipped build shows them. 1.6.3.8 keeps two
+// lines (Description1 / Description2) and draws them one under the other;
+// 1.9.9.8 registers a single Description (the same two joined with ". "), so
+// for InventoryProfile::modern everything is in `description1` and
+// `description2` is empty. An item only one build has is described by that
+// build whichever profile asks. BareHands' lines are a single space, as shipped.
+struct ItemText final
+{
+    std::string_view name;
+    std::string_view description1;
+    std::string_view description2;
+};
+[[nodiscard]] ItemText item_text(InventoryItemId item, InventoryProfile profile) noexcept;
 [[nodiscard]] PlayerAnimationMode item_player_animation_mode(InventoryItemId item) noexcept;
 // InventoryItemClass._category from the original registrations: 1 Tools,
 // 2 Special, 3 Firearms, 4 Components, 5 Blocks, 6 Ammo (-1 matches everything).
 [[nodiscard]] int item_category(InventoryItemId item) noexcept;
-// One-line flavor text for the crafting detail pane, in the spirit of the
-// original Description1 strings.
+// 1.9.9.8's InventoryItemClass.Description: the whole description on one line
+// (1.6.3.8's two lines joined with ". "). Use item_text for the two-line form.
 [[nodiscard]] std::string_view item_description(InventoryItemId item) noexcept;
-[[nodiscard]] std::uint16_t item_stack_limit(InventoryItemId item) noexcept;
+// InventoryItemClass.MaxStackCount. The two generations disagree for most
+// items (blocks 64 vs 999, ores 64 vs 255, rocket launchers 1 vs 3), so there
+// is deliberately no profile-less form: a caller that forgets the generation
+// merges stacks with the other game's limits.
 [[nodiscard]] std::uint16_t item_stack_limit(InventoryItemId item,
                                              InventoryProfile profile) noexcept;
+// True when InventoryItem.Initalize registers a class for this id in that
+// generation's shipped executable (122 classes in 1.6.3.8, 143 in 1.9.9.8).
+// The enums are larger than the registrations: SpaceKnife exists in both enums
+// and in neither game, and Modern never registers Chainsaw2/3, the three extra
+// spawn flags, the advanced launcher, MegaPickAxe, Snowball, Iceball,
+// MultiLaser or MonsterBlock. InventoryItem.CreateItem indexes AllItems
+// directly, so a stock peer that is handed one of those ids throws while
+// reading the message. Project-owned ids are never registered.
+[[nodiscard]] bool item_registered(InventoryItemId item, InventoryProfile profile) noexcept;
+// InventoryItem.ProcessInput (the base implementation) is the only code that
+// digs, melees and lights TNT/C4 from the held item. BlockInventoryItem (every
+// block, the torch and the doors), GunInventoryItem, GPSItem and GrenadeItem
+// override it without calling the base, so with one of those in hand neither
+// trigger can dig or strike anything. Picks, spades, axes, knives, laser
+// swords, bare hands, compass, clock and every material use the base.
+[[nodiscard]] bool item_uses_tool_input(InventoryItemId item) noexcept;
 [[nodiscard]] float item_use_cooldown_seconds(InventoryItemId item) noexcept;
 // Duration of the authored channel-3 firing clip chosen by Player.OnUpdate.
 // Automatic fire may restart the clip before it completes, exactly as vanilla.
@@ -246,10 +285,23 @@ enum class PlayerAnimationMode : std::uint8_t
 // InventoryItem.TimeToDig with the Pick/Spade/Axe and laser-sword overrides:
 // seconds for `tool` to dig `block`; infinity when that tool can never break
 // it (ores need the right pick tier, TNT/C4 need a spade, and so on).
-[[nodiscard]] float dig_time_seconds(InventoryItemId tool, world::BlockType block) noexcept;
+//
+// The generations use different rules. 1.6.3.8 has one authored table per
+// pick material and a single laser-sword table that wins over the material.
+// 1.9.9.8 replaced the pick tables with a tier formula (see
+// modern_pick_dig_seconds), lets picks dig soft blocks, loot blocks and lower
+// tier walls, and gives every item two seconds on glass, spawn points and
+// teleport stations.
+[[nodiscard]] float dig_time_seconds(InventoryItemId tool, world::BlockType block,
+                                     InventoryProfile profile) noexcept;
+// PickInventoryItem.ComputeDigTime (1.9.9.8) for a tool tier against a block
+// tier it can dig, rounded to whole milliseconds as TimeSpan.FromSeconds does.
+[[nodiscard]] float modern_pick_dig_seconds(int tool_tier, int block_tier) noexcept;
 // Original melee contract: InventoryItemClass.EnemyDamage per item, including
-// the authored bare-hand and BlockInventoryItemClass values.
-[[nodiscard]] float item_enemy_damage(InventoryItemId item) noexcept;
+// the authored bare-hand and BlockInventoryItemClass values. Modern laser
+// swords deal 1 (SaberInventoryItemClass discards its damage argument), and
+// Modern authored different values for Ice, TNT, the fancy lantern and doors.
+[[nodiscard]] float item_enemy_damage(InventoryItemId item, InventoryProfile profile) noexcept;
 // MeleePlayerMessage applies 0.21 normalized health for every item except the
 // five laser swords, which intentionally deal 1.1 (an instant lethal hit).
 [[nodiscard]] float item_player_melee_damage(InventoryItemId item) noexcept;
@@ -322,6 +374,79 @@ struct GunReloadCycle final
 [[nodiscard]] GunReloadCycle gun_reload_cycle(const GunStats &stats, std::uint16_t rounds_in_clip,
                                               std::uint32_t reserve_ammo) noexcept;
 
+// GunInventoryItem.ProcessInput reduced to its decision, so the trigger rules
+// have exactly one implementation and can be exercised without a window.
+//
+// `reloading` is Player.Reloading (a request; the reload clip is tracked
+// separately by GunReloadClip). `released` is the original's per-item
+// gunReleased flag. Only a Reload press writes it (true when the trigger was up
+// at that instant) and it is never cleared, so it stays with the item: until a
+// gun has been reloaded by hand once, a trigger pull cannot interrupt its
+// reloads at all.
+struct GunTriggerState final
+{
+    bool reloading{};
+    bool released{};
+};
+
+// One input sample. `use_pressed` is the trigger edge and implies `use_held`.
+struct GunTriggerInput final
+{
+    bool use_pressed{};
+    bool use_held{};
+    bool reload_pressed{};
+    // InventoryItem.CoolDownTimer.Expired.
+    bool cooldown_expired{true};
+    // False only for a guided launcher that has not locked on to a dragon.
+    bool fire_permitted{true};
+};
+
+struct GunTriggerDecision final
+{
+    GunTriggerState state{};
+    // The sample fires one round: the caller drains the clip, starts the
+    // cooldown and applies wear. `state.reloading` already includes the
+    // automatic reload the original requests after the last round.
+    bool fire{};
+};
+
+[[nodiscard]] GunTriggerDecision gun_trigger_step(const GunStats &stats, GunTriggerState state,
+                                                  std::uint16_t rounds_in_clip,
+                                                  std::uint32_t reserve_ammo,
+                                                  GunTriggerInput input) noexcept;
+
+// Player.UpdateAnimation's channel-2 reload clip (currentAnimState ==
+// Reloading). A requested reload may only begin once the weapon is fully
+// unshouldered and the channel-3 fire clip has finished; it is abandoned, with
+// its cue, the moment the request is withdrawn; and a request that is withdrawn
+// and re-issued inside one input sample never disturbs a running clip.
+struct GunReloadClip final
+{
+    bool active{};
+    float seconds_left{};
+};
+
+enum class GunReloadEvent : std::uint8_t
+{
+    none,
+    // Play the reload clip and cue from the start.
+    started,
+    // Stop the cue; no round was inserted.
+    cancelled,
+    // Player.FinishReload: insert this cycle's rounds via gun_reload_cycle.
+    completed,
+};
+
+struct GunReloadStep final
+{
+    GunReloadClip clip{};
+    GunReloadEvent event{GunReloadEvent::none};
+};
+
+[[nodiscard]] GunReloadStep gun_reload_step(GunReloadClip clip, bool reloading, bool unshouldered,
+                                            bool fire_animation_playing, float reload_seconds,
+                                            float delta_seconds) noexcept;
+
 struct GunRecoil final
 {
     float yaw_radians{};
@@ -342,12 +467,50 @@ struct GunRecoil final
 // CMZColors.GetMaterialcColor applied through the item's ToolMaterialTypes tier;
 // white for untinted items. Recolor-flagged mesh parts multiply by this.
 [[nodiscard]] std::array<float, 3> item_material_tint(InventoryItemId item) noexcept;
+// Stable tier colours: display names deliberately omit several material names.
+[[nodiscard]] std::array<float, 3> projectile_tint(InventoryItemId item) noexcept;
 
 // One entry of Receipe.CookBook. Unused ingredient slots have count zero.
 struct CraftingIngredient final
 {
     InventoryItemId item{InventoryItemId::bare_hands};
     std::uint16_t count{};
+    // (Polish) The mod item (InventoryStack::mod_item) whose fallback is
+    // `item`, in a mod recipe; 0 in every retail recipe.
+    std::uint32_t mod_item{};
+};
+
+// Recipe.RecipeTypes from 1.9.9.8, in enum order. Modern's crafting screen is
+// a fixed two-level tree over these; 1.6.3.8's Receipe has no type at all, so
+// every Classic recipe carries `none`.
+enum class RecipeType : std::uint8_t
+{
+    ores = 0,
+    components = 1,
+    pickaxes = 2,
+    spades = 3,
+    axes = 4,
+    special_tools = 5,
+    ammo = 6,
+    knives = 7,
+    pistols = 8,
+    shotguns = 9,
+    rifles = 10,
+    assault_rifles = 11,
+    smgs = 12,
+    lmgs = 13,
+    rpg = 14,
+    laser_swords = 15,
+    walls = 16,
+    doors = 17,
+    other_structure = 18,
+    explosives = 19,
+    containers = 20,
+    spawn_points = 21,
+    // Declared for the Precision Laser recipe only. CraftingScreen builds no
+    // tab for it, so the recipe exists in the cookbook and can never be made.
+    advanced = 22,
+    none = 255,
 };
 
 struct CraftingRecipe final
@@ -355,10 +518,35 @@ struct CraftingRecipe final
     InventoryItemId result{InventoryItemId::bare_hands};
     std::uint16_t result_count{1U};
     std::array<CraftingIngredient, 4> ingredients{};
+    RecipeType type{RecipeType::none};
+    // (Polish) A mod recipe (recipes.add) the crafting screens list after the
+    // retail cookbook: its id for the server, and the mod item it makes (0: a
+    // retail item; `result` is always a retail item, the fallback). Both 0 in
+    // every retail recipe. PlayerInventory never crafts a mod recipe: the
+    // server does (GameplayService::client_craft).
+    std::uint32_t mod_recipe{};
+    std::uint32_t result_mod_item{};
 };
 
+// CraftingScreen (1.9.9.8): the four Tier1Items and the Tier2Item recipe types
+// each one lists, in the order the screen constructs them.
+struct RecipeGroup final
+{
+    const char *label{""};
+    std::array<RecipeType, 11> types{};
+    std::size_t type_count{};
+};
+[[nodiscard]] const std::array<RecipeGroup, 4> &modern_recipe_groups() noexcept;
+[[nodiscard]] const char *recipe_type_label(RecipeType type) noexcept;
+// False for Modern's `advanced` type: no crafting tab lists it.
+[[nodiscard]] constexpr bool recipe_listed(const CraftingRecipe &recipe) noexcept
+{
+    return recipe.type != RecipeType::advanced;
+}
+
 // The complete vanilla cookbook in authored order.
-[[nodiscard]] const std::vector<CraftingRecipe> &crafting_recipes() noexcept;
+[[nodiscard]] const std::vector<CraftingRecipe> &crafting_recipes(
+    InventoryProfile profile = InventoryProfile::classic) noexcept;
 
 struct InventoryStack final
 {
@@ -366,6 +554,9 @@ struct InventoryStack final
     world::BlockType block{world::BlockType::empty};
     std::uint16_t count{};
     std::uint16_t rounds_in_clip{};
+    // GunInventoryItem.gunReleased (see GunTriggerState::released). Runtime
+    // only: like the original field it is never saved or sent.
+    bool trigger_released{};
     // InventoryItem.ItemHealthLevel. One is pristine; item classes with
     // ItemSelfDamagePerUse display a bar and may remove themselves at zero.
     float durability{1.0F};
@@ -374,6 +565,13 @@ struct InventoryStack final
     std::array<float, 3> waypoint{};
     std::string waypoint_name{"Alpha"};
     bool waypoint_valid{};
+    // Modding, gameplay area (openminerz/modding/gameplay.hpp): the session id
+    // of the mod item this stack is, 0 for every retail stack - which, with no
+    // server mod running, is every stack. Like trigger_released it is never
+    // saved in the world file or sent in a stock message: those carry `item`,
+    // the mod item's retail fallback, and the identity lives in the gameplay
+    // sidecar. Stacks only merge with stacks of the same mod item.
+    std::uint32_t mod_item{};
 
     InventoryStack() noexcept = default;
     // A freshly created gun starts with a full clip, exactly like
@@ -391,6 +589,12 @@ struct InventoryStack final
     // A copy of this stack with a different count, preserving per-instance state
     // such as a gun's loaded rounds. Splitting or moving an existing stack MUST
     // use this instead of the constructor, or a spent clip silently refills.
+    // Whether two stacks may merge: the same item, and the same mod item.
+    [[nodiscard]] bool same_kind(const InventoryStack &other) const noexcept
+    {
+        return item == other.item && mod_item == other.mod_item;
+    }
+
     [[nodiscard]] InventoryStack with_count(std::uint16_t stack_count) const noexcept
     {
         InventoryStack result = *this;
@@ -404,11 +608,34 @@ struct InventoryStack final
     }
 };
 
+// (Polish) What a recipe makes, and one of its ingredients, as stacks that
+// keep a mod recipe's mod items (for icons and names).
+[[nodiscard]] inline InventoryStack recipe_result_stack(const CraftingRecipe &recipe) noexcept
+{
+    InventoryStack stack{recipe.result, recipe.result_count};
+    stack.mod_item = recipe.result_mod_item;
+    return stack;
+}
+[[nodiscard]] inline InventoryStack ingredient_stack(const CraftingIngredient &ingredient) noexcept
+{
+    InventoryStack stack{ingredient.item, ingredient.count};
+    stack.mod_item = ingredient.mod_item;
+    return stack;
+}
+// Whether two recipes make the same thing (the same item, the same mod item).
+[[nodiscard]] constexpr bool same_result(const CraftingRecipe &left, const CraftingRecipe &right) noexcept
+{
+    return left.result == right.result && left.result_mod_item == right.result_mod_item;
+}
+
 // InventoryItemClass.ItemSelfDamagePerUse plus InventoryItem.InflictDamage.
 // Covers tool material tiers, knives, conventional/laser guns and locators;
 // the return value is true when the item reached zero and must be removed.
-[[nodiscard]] float item_self_damage_per_use(InventoryItemId item) noexcept;
-[[nodiscard]] bool inflict_item_damage(InventoryStack &stack, bool infinite_resource_mode) noexcept;
+// (1.9.9.8 retuned one cell: its stone pickaxe wears 0.002 per use, not 0.0025.)
+[[nodiscard]] float item_self_damage_per_use(InventoryItemId item,
+                                             InventoryProfile profile) noexcept;
+[[nodiscard]] bool inflict_item_damage(InventoryStack &stack, bool infinite_resource_mode,
+                                       InventoryProfile profile) noexcept;
 
 class PlayerInventory final
 {
@@ -495,13 +722,29 @@ class PlayerInventory final
     [[nodiscard]] Slot &slot(std::size_t linear_index) noexcept;
     [[nodiscard]] const Slot &slot(std::size_t linear_index) const noexcept;
     [[nodiscard]] bool move_to_other_section(std::size_t linear_index) noexcept;
+    // The inventory screen's shift-click targets (AddItemToTray /
+    // AddItemToInventory): merge into that section only and return the count
+    // that did not fit.
+    [[nodiscard]] std::uint16_t add_stack_to_section(const InventoryStack &stack,
+                                                     bool to_tray) noexcept;
 
     // Receipe/PlayerInventory crafting contract: CanCraft checks the aggregate
     // count of each ingredient; Craft removes ingredients (storage first, then
     // tray, like the original) and adds the result. Returns the part of the
     // result that did not fit so the caller can drop it as a pickup.
     [[nodiscard]] bool can_craft(const CraftingRecipe &recipe) const noexcept;
+    [[nodiscard]] bool recipe_discovered(const CraftingRecipe &recipe) const noexcept;
     [[nodiscard]] std::uint16_t craft(const CraftingRecipe &recipe) noexcept;
+
+    // Placed navigation objects belong to the player profile, not carried slots.
+    [[nodiscard]] Slot &spawn_point() noexcept { return spawn_point_; }
+    [[nodiscard]] const Slot &spawn_point() const noexcept { return spawn_point_; }
+    [[nodiscard]] std::vector<InventoryStack> &teleport_stations() noexcept { return teleport_stations_; }
+    [[nodiscard]] const std::vector<InventoryStack> &teleport_stations() const noexcept { return teleport_stations_; }
+    [[nodiscard]] bool register_spawn_point(std::array<float, 3> point);
+    [[nodiscard]] bool register_teleport_station(std::array<float, 3> point, std::string name);
+    [[nodiscard]] bool valid_travel_destinations() const noexcept;
+    void remove_travel_destination(std::array<float, 3> point);
 
   private:
     template <std::size_t Size>
@@ -521,6 +764,13 @@ class PlayerInventory final
     std::size_t current_tray_index_{};
     std::size_t selected_index_{};
     InventoryProfile profile_{InventoryProfile::classic};
+    Slot spawn_point_;
+    std::vector<InventoryStack> teleport_stations_;
 };
+
+// Fold the UI cursor into a copy for the original fixed-slot PINV contract.
+// Failure leaves both live inputs untouched, including a partially mergeable stack.
+[[nodiscard]] std::optional<PlayerInventory> inventory_checkpoint(
+    const PlayerInventory &inventory, const PlayerInventory::Slot &held);
 
 } // namespace openminerz

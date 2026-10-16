@@ -28,6 +28,8 @@ struct SkyState final
     SkyColor specular{};
     std::string period;
     bool lightning{};
+    float hell{};
+    float lightning_strength{};
 };
 
 struct LightningUpdate final
@@ -45,6 +47,24 @@ enum class SkyModel
     classic,
     rebirth,
 };
+
+enum class SkyTexture
+{
+    night,
+    dawn,
+    day,
+    sunset
+};
+struct SkyBlend final
+{
+    SkyTexture first{SkyTexture::night};
+    SkyTexture second{SkyTexture::night};
+    float amount{};
+};
+[[nodiscard]] SkyBlend rebirth_sky_blend(float time_of_day) noexcept;
+[[nodiscard]] float lightning_envelope(float previous, bool flashing, float elapsed_seconds,
+                                       float cloud_cover, bool exposed) noexcept;
+void apply_lightning_illumination(SkyState &sky) noexcept;
 
 // InGameHUD's recurring surface-lightning timer. It intentionally preserves
 // the shipped one-frame dark gaps and the effectively unreachable high-thunder

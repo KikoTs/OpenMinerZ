@@ -32,6 +32,7 @@ bool valid_message_type(SteamBridgeMessageType value) noexcept
     case SteamBridgeMessageType::stopped:
     case SteamBridgeMessageType::failure:
     case SteamBridgeMessageType::heartbeat:
+    case SteamBridgeMessageType::peer_entered:
     case SteamBridgeMessageType::discover_request:
     case SteamBridgeMessageType::discovery_results:
     case SteamBridgeMessageType::join_request:
@@ -749,6 +750,52 @@ bool decode_steam_bridge_peer(std::span<const std::uint8_t> payload, PeerId &pee
         return false;
     }
     peer = decoded;
+    error = SteamBridgeProtocolError::none;
+    return true;
+}
+
+std::optional<std::vector<std::uint8_t>> encode_steam_bridge_member(
+    const SteamBridgeMember &member, SteamBridgeProtocolError &error)
+{
+    error = SteamBridgeProtocolError::none;
+    if (member.peer == 0U || member.persona_name.size() > maximum_bridge_persona_bytes ||
+        !printable(member.persona_name))
+    {
+        error = SteamBridgeProtocolError::out_of_range;
+        return std::nullopt;
+    }
+    Writer writer;
+    if (!writer.u64(member.peer) ||
+        !writer.string(member.persona_name, maximum_bridge_persona_bytes))
+    {
+        error = SteamBridgeProtocolError::too_large;
+        return std::nullopt;
+    }
+    return writer.take();
+}
+
+bool decode_steam_bridge_member(std::span<const std::uint8_t> payload, SteamBridgeMember &member,
+                                SteamBridgeProtocolError &error)
+{
+    Reader reader{payload};
+    SteamBridgeMember decoded;
+    if (!reader.u64(decoded.peer) ||
+        !reader.string(maximum_bridge_persona_bytes, decoded.persona_name))
+    {
+        error = SteamBridgeProtocolError::malformed_payload;
+        return false;
+    }
+    if (decoded.peer == 0U || !printable(decoded.persona_name))
+    {
+        error = SteamBridgeProtocolError::out_of_range;
+        return false;
+    }
+    if (!reader.exhausted())
+    {
+        error = SteamBridgeProtocolError::trailing_data;
+        return false;
+    }
+    member = std::move(decoded);
     error = SteamBridgeProtocolError::none;
     return true;
 }

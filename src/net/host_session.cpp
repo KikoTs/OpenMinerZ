@@ -84,7 +84,7 @@ bool HostSessionSettings::validate(std::string &error) const noexcept
     return true;
 }
 
-SessionProperties make_session_properties(const HostSessionSettings &settings, bool game_begun,
+SessionProperties make_session_properties(const HostSessionSettings &settings, bool join_closed,
                                           std::int32_t game_mode, std::int32_t difficulty,
                                           bool infinite_resources)
 {
@@ -98,7 +98,7 @@ SessionProperties make_session_properties(const HostSessionSettings &settings, b
 
     SessionProperties properties{};
     properties[0] = static_cast<std::int32_t>(settings.protocol);
-    properties[1] = game_begun ? 1 : 0;
+    properties[1] = join_closed ? 1 : 0;
     properties[2] = game_mode;
     properties[3] = difficulty;
     properties[4] = infinite_resources ? 1 : 0;
@@ -113,9 +113,9 @@ const char *protocol_label(ProtocolVersion protocol) noexcept
     switch (protocol)
     {
     case ProtocolVersion::classic_v3:
-        return "CLASSIC V3";
+        return "Classic";
     case ProtocolVersion::modern_v4:
-        return "MODERN V4";
+        return "Modern";
     }
     return "UNKNOWN";
 }

@@ -24,6 +24,7 @@ enum class ExplosiveKind : std::uint8_t
     rocket,
     laser,
     he_grenade,
+    harvest,
 };
 
 // TracerManager arms neither a fuse nor a mining action when a bullet strikes
@@ -84,6 +85,7 @@ inline constexpr ExplosiveDamageBands he_grenade_damage_bands{2.5F, 5.0F, 8.0F};
     case ExplosiveKind::rocket:
         return {1, rocket_damage_bands};
     case ExplosiveKind::laser:
+    case ExplosiveKind::harvest:
         return {0, {1.0F, 1.0F, 1.0F}};
     case ExplosiveKind::he_grenade:
         return {1, he_grenade_damage_bands};
@@ -105,6 +107,9 @@ inline constexpr ExplosiveDamageBands he_grenade_damage_bands{2.5F, 5.0F, 8.0F};
 
 // Compatibility helper for the already-ported rocket path.
 [[nodiscard]] bool rocket_breaks_block(BlockType block) noexcept;
+
+// Harvest lasers recover ores; other destroyed terrain is cleared without a drop.
+[[nodiscard]] std::optional<BlockType> harvested_block(BlockType block) noexcept;
 
 // Original per-material BounceRestitution used by the grenade trace.
 [[nodiscard]] float grenade_bounce_restitution(BlockType block) noexcept;

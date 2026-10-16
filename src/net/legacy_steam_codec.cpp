@@ -383,8 +383,12 @@ bool read_application_packet(std::span<const std::uint8_t> encoded, std::size_t 
 
 bool uses_unreliable_native_send(SteamDeliveryMethod delivery) noexcept
 {
-    return delivery == SteamDeliveryMethod::unknown ||
-           delivery == SteamDeliveryMethod::unreliable ||
+    // The original's SteamWorks.SendPacket selects k_EP2PSendUnreliable with an
+    // unsigned `deliveryMethod - Unreliable <= 1`, so only Unreliable and
+    // UnreliableSequenced qualify. Unknown is zero, underflows that
+    // subtraction, and is therefore sent reliably - which matters because
+    // SendDataOptions.Chat (chat and voice) maps to Unknown.
+    return delivery == SteamDeliveryMethod::unreliable ||
            delivery == SteamDeliveryMethod::unreliable_sequenced;
 }
 

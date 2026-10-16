@@ -28,6 +28,20 @@ class PerlinNoise final
 {
   public:
     explicit PerlinNoise(std::int32_t seed) noexcept;
+    // The value retail's callers actually see. The shipped game is a 32-bit
+    // process whose legacy JIT evaluates ComputeNoise on the x87 FPU at 53-bit
+    // precision and returns the result on the FPU stack WITHOUT narrowing it to
+    // float; the world builder then truncates or compares that unrounded value.
+    // These reproduce the JIT's exact sequence of double-precision operations
+    // and float stores (verified against the disassembled retail code and, block
+    // for block, by TerrainParityProbe), so `(int)(noise * scale)` lands on the
+    // same side of every integer boundary as it does in the original.
+    [[nodiscard]] double noise_x87(float x, float y) const noexcept;
+    // PerlinNoise.ComputeNoise(Vector3): unlike the 2D overload the JIT keeps
+    // the three fractional coordinates and the last gradient on the FPU stack.
+    [[nodiscard]] double noise_x87(float x, float y, float z) const noexcept;
+    // The same values narrowed to float, as retail gets when it stores a result
+    // into a float local that lives in memory.
     [[nodiscard]] float noise(float x, float y) const noexcept;
     [[nodiscard]] float noise(float x, float y, float z) const noexcept;
 

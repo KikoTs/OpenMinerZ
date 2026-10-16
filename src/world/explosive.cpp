@@ -1,5 +1,7 @@
 #include "openminerz/world/explosive.hpp"
 
+#include "openminerz/world/liquid.hpp" // mod-liquid
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -21,6 +23,25 @@ float explosive_damage_fraction(float distance, ExplosiveDamageBands bands) noex
 bool rocket_breaks_block(BlockType block) noexcept
 {
     return explosive_breaks_block(ExplosiveKind::rocket, block, 0, 0, 0);
+}
+
+std::optional<BlockType> harvested_block(BlockType block) noexcept
+{
+    switch (block)
+    {
+    case BlockType::coal_ore:
+    case BlockType::iron_ore:
+    case BlockType::copper_ore:
+    case BlockType::gold_ore:
+    case BlockType::diamond_ore:
+    case BlockType::copper_wall:
+    case BlockType::iron_wall:
+    case BlockType::golden_wall:
+    case BlockType::diamond_wall:
+        return block;
+    default:
+        return std::nullopt;
+    }
 }
 
 std::uint8_t explosive_block_hardness(BlockType block) noexcept
@@ -46,6 +67,7 @@ std::uint8_t explosive_block_hardness(BlockType block) noexcept
     case BlockType::upper_door_open:
     case BlockType::tnt:
     case BlockType::c4:
+    case BlockType::teleport_station:
         return 1U;
     case BlockType::dirt:
     case BlockType::grass:
@@ -56,6 +78,15 @@ std::uint8_t explosive_block_hardness(BlockType block) noexcept
     case BlockType::crate:
     case BlockType::crate_stone:
     case BlockType::crate_copper:
+    case BlockType::lantern_fancy:
+    case BlockType::glass_basic:
+    case BlockType::strong_lower_door_closed_z:
+    case BlockType::strong_lower_door_closed_x:
+    case BlockType::strong_lower_door:
+    case BlockType::strong_upper_door_closed:
+    case BlockType::strong_lower_door_open_z:
+    case BlockType::strong_lower_door_open_x:
+    case BlockType::strong_upper_door_open:
         return 2U;
     case BlockType::rock:
     case BlockType::gold_ore:
@@ -67,6 +98,7 @@ std::uint8_t explosive_block_hardness(BlockType block) noexcept
     case BlockType::deep_lava:
     case BlockType::crate_iron:
     case BlockType::crate_gold:
+    case BlockType::glass_iron:
         return 3U;
     case BlockType::blood_stone:
     case BlockType::space_rock:
@@ -78,6 +110,12 @@ std::uint8_t explosive_block_hardness(BlockType block) noexcept
     case BlockType::space_rock_inventory:
     case BlockType::crate_diamond:
     case BlockType::crate_bloodstone:
+    case BlockType::glass_strong:
+    case BlockType::glass_mystery:
+    case BlockType::loot_block:
+    case BlockType::lucky_loot_block:
+    case BlockType::bomb_block:
+    case BlockType::turret_block:
         return 4U;
     case BlockType::empty:
     case BlockType::fixed_lantern:
@@ -106,6 +144,11 @@ bool explosive_breaks_block(ExplosiveKind kind, BlockType block, int offset_x, i
         switch (block)
         {
         case BlockType::lantern:
+        case BlockType::lantern_fancy:
+        case BlockType::glass_basic:
+        case BlockType::glass_iron:
+        case BlockType::glass_strong:
+        case BlockType::glass_mystery:
         case BlockType::gold_ore:
         case BlockType::iron_ore:
         case BlockType::copper_ore:
@@ -123,7 +166,17 @@ bool explosive_breaks_block(ExplosiveKind kind, BlockType block, int offset_x, i
     }
 
     // Upper door halves are intentionally skipped by ProcessOneExplosion.
-    if (block == BlockType::upper_door_closed || block == BlockType::upper_door_open)
+    if (kind == ExplosiveKind::harvest &&
+        (block == BlockType::lantern || block == BlockType::lantern_fancy ||
+         block == BlockType::blood_stone || block == BlockType::iron_wall ||
+         block == BlockType::copper_wall || block == BlockType::golden_wall ||
+         block == BlockType::diamond_wall || block == BlockType::glass_basic ||
+         block == BlockType::glass_iron || block == BlockType::glass_strong ||
+         block == BlockType::glass_mystery || block == BlockType::spawn_point_basic ||
+         block == BlockType::spawn_point_builder || block == BlockType::spawn_point_combat ||
+         block == BlockType::spawn_point_explorer))
+        return false;
+    if (is_upper_door(block))
         return false;
 
     const std::uint8_t hardness = explosive_block_hardness(block);
@@ -149,6 +202,12 @@ float grenade_bounce_restitution(BlockType block) noexcept
     case BlockType::deep_lava:
     case BlockType::leaves:
     case BlockType::slime:
+    // 1.9.9.8 block table (ids that exist only there): the turret, both loot
+    // blocks and the bomb block are "dead" bounces like slime.
+    case BlockType::turret_block:
+    case BlockType::loot_block:
+    case BlockType::lucky_loot_block:
+    case BlockType::bomb_block:
         return 0.1F;
     case BlockType::dirt:
     case BlockType::grass:
@@ -160,7 +219,16 @@ float grenade_bounce_restitution(BlockType block) noexcept
     case BlockType::lower_door_open_z:
     case BlockType::lower_door_open_x:
     case BlockType::upper_door_open:
+    // The seven strong-door pieces are authored soft exactly like wood doors.
+    case BlockType::strong_lower_door_closed_z:
+    case BlockType::strong_lower_door_closed_x:
+    case BlockType::strong_lower_door:
+    case BlockType::strong_upper_door_closed:
+    case BlockType::strong_lower_door_open_z:
+    case BlockType::strong_lower_door_open_x:
+    case BlockType::strong_upper_door_open:
     case BlockType::tnt:
+    case BlockType::torch_neg_y: // The one torch variant authored "soft".
         return 0.4F;
     default:
         return 0.6F;
@@ -241,7 +309,8 @@ std::optional<GrenadeTerrainHit> grenade_terrain_sweep(const WorldRegion &region
                 if (!region.contains(x, y, z))
                     continue;
                 const BlockType block = region.block(x, y, z);
-                if (!blocks_player(block))
+                // (mod-liquid) A grenade sinks through a liquid.
+                if (!blocks_player(block) || liquid_at(region, x, y, z))
                     continue;
                 const auto hit = sweep_expanded_block(start, end, x, y, z, block);
                 if (hit.has_value() && (!earliest.has_value() || hit->time < earliest->time))

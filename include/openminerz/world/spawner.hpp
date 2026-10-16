@@ -143,6 +143,12 @@ constexpr int any_maximum_world_level = 1000;
 [[nodiscard]] std::optional<SpawnerSpawnChoice> select_spawner_spawn(
     EnemyInstanceRng &random, int world_level, int minimum_tier, int maximum_tier, bool rare_loot,
     int maximum_value, SpawnerPackageFlags permitted_flags) noexcept;
+// (mod-ai) Every enemy type (Modern's EnemyTypeEnum, as SpawnEnemyMessage
+// carries it) a spawner block's waves can bring at this height, whatever the
+// value left: what a server mod's enemy rules are asked about before the
+// block may start.
+[[nodiscard]] std::vector<std::uint8_t> spawner_wave_enemy_types(const SpawnerDefinition &definition,
+                                                                 int world_level);
 [[nodiscard]] std::optional<net::EnemyInitPayload> make_spawner_enemy_initialization(
     std::uint8_t enemy_type, float midnight, EnemyInstanceRng &random) noexcept;
 

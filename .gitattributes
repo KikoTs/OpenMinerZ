@@ -19,3 +19,19 @@
 *.omavatar binary
 *.png binary
 *.xnb binary
+
+# Release media is hash-reviewed. Preserve exact bytes on every platform,
+# including JSON glTF files with embedded buffers.
+*.gltf binary
+*.glb binary
+*.bin binary
+*.wav binary
+*.ogg binary
+*.mp3 binary
+*.flac binary
+*.ttf binary
+*.otf binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary

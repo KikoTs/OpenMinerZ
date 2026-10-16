@@ -2,9 +2,16 @@
 
 #include "avatar_viewmodel.hpp"
 #include "depth_voxel_renderer.hpp"
+#include "openminerz/post_math.hpp"
+#include "openminerz/view_projection.hpp"
 #include "openminerz/world/biome_atmosphere.hpp"
 #include "openminerz/world/block.hpp"
 #include "openminerz/world/dynamic_radiance.hpp"
+#include "openminerz/world/hell_atmosphere.hpp"
+#include "openminerz/world/movement_probe.hpp"
+#include "modding/graphics/mod_surfaces.hpp"
+#include "openminerz/modding/held_item.hpp" // (Items)
+#include "openminerz/modding/icon_model.hpp" // Modding, visuals area
 #include "static_model_asset.hpp"
 
 #include <algorithm>
@@ -33,10 +40,34 @@ int floor_divide(int value, int divisor) noexcept
     return value >= 0 ? value / divisor : (value - divisor + 1) / divisor;
 }
 
+// How long one frame may spend creating terrain vertex buffers. Eight dense
+// sections cost several milliseconds together, which is a visible hitch while
+// walking; spread over consecutive frames the same work is invisible, and the
+// sections still appear well before the player reaches them.
+constexpr float mesh_upload_budget_milliseconds = 0.8F;
+
+// Diagnostic A/B switch: queue the purely geometric light-influence apron that
+// preceded the measured probe, so one build can benchmark both.
+bool legacy_light_apron() noexcept
+{
+    static const bool enabled = SDL_getenv("OPENMINERZ_LEGACY_APRON") != nullptr;
+    return enabled;
+}
+
+// PickupEntity.OnUpdate, the last five seconds of a pickup's life:
+//     else if (_timeLeft < 5f) Visible = ((int)Math.Floor(_timeLeft * 8f) & 1) == 0;
+// It is shown and hidden for an eighth of a second each (four blinks a second),
+// counted from the time LEFT, so every peer blinks it in step.
+bool pickup_blinked_out(float time_left) noexcept
+{
+    return time_left < 5.0F && (static_cast<int>(std::floor(time_left * 8.0F)) & 1) != 0;
+}
+
+// How many columns across the View distance setting MESHES. What is resident
+// does not depend on it: see world::resident_chunk_window.
 int active_span_for(int view_distance) noexcept
 {
-    const int visible_radius = (std::clamp(view_distance, 4, 32) + 3) / 4;
-    return std::max(10, (visible_radius + 2) * 2);
+    return world::meshed_span_chunks(view_distance);
 }
 
 float visibility_for(int view_distance) noexcept
@@ -150,6 +181,54 @@ world::SkyColor graded_sky_color(world::SkyColor color, float exposure, int curv
             tone_curve_channel(color.blue * tint[2] * exposure, curve)};
 }
 
+// Match the terrain composite for the fully fogged horizon. The sky's cloud
+// exposure is intentionally independent, but the streaming curtain cannot be.
+world::SkyColor display_fog_color(world::SkyColor fog, const DisplayGrading &grading,
+                                  const world::BiomeAtmosphere &atmosphere, float daylight,
+                                  float hell)
+{
+    const world::SkyColor linear{fog.red * fog.red, fog.green * fog.green, fog.blue * fog.blue};
+    const auto balance = fog_white_balance(linear, 1.0F, 1.25F);
+    const float strength = std::clamp(grading.color_grading, 0.0F, 1.0F);
+    std::array color{linear.red, linear.green, linear.blue};
+    for (std::size_t i = 0; i < color.size(); ++i)
+        color[i] *= grading.exposure * std::lerp(1.0F, balance[i], strength);
+    const float luminance = color[0] * 0.2126F + color[1] * 0.7152F + color[2] * 0.0722F;
+    for (float &channel : color)
+    {
+        if (grading.tone_curve == 1)
+        {
+            const float per_channel = channel / (1.0F + channel);
+            channel = std::lerp(channel / (1.0F + luminance), per_channel, per_channel);
+        }
+        else if (grading.tone_curve == 0)
+            channel =
+                std::clamp(channel / (1.0F + std::max(0.0F, luminance - 1.0F) * 0.45F), 0.0F, 1.0F);
+        else
+            channel = tone_curve_channel(channel * (grading.tone_curve == 3 ? 0.725F : 1.0F),
+                                         grading.tone_curve);
+        channel = std::sqrt(std::clamp(channel, 0.0F, 1.0F));
+    }
+    const float display_luma = color[0] * 0.2126F + color[1] * 0.7152F + color[2] * 0.0722F;
+    for (float &channel : color)
+    {
+        const float desaturated = std::lerp(display_luma, channel, 0.79F);
+        const float contrasted = desaturated < 0.5F
+                                     ? 0.5F * std::pow(2.0F * desaturated, 1.18F)
+                                     : 1.0F - 0.5F * std::pow(2.0F - 2.0F * desaturated, 1.18F);
+        channel = std::lerp(channel, contrasted, strength);
+    }
+    const float graded_luma = color[0] * 0.2126F + color[1] * 0.7152F + color[2] * 0.0722F;
+    const std::array tint{atmosphere.grade_multiplier.red, atmosphere.grade_multiplier.green,
+                          atmosphere.grade_multiplier.blue};
+    for (std::size_t i = 0; i < color.size(); ++i)
+        color[i] = std::clamp(
+            std::lerp(color[i], std::lerp(graded_luma, color[i], atmosphere.saturation) * tint[i],
+                      atmosphere.grade_strength * (0.35F + 0.65F * daylight) * (1.0F - hell)),
+            0.0F, 1.0F);
+    return {color[0], color[1], color[2]};
+}
+
 SDL_Color mix(SDL_Color left, SDL_Color right, float amount)
 {
     amount = std::clamp(amount, 0.0F, 1.0F);
@@ -247,9 +326,8 @@ SDL_Color face_color(const world::WorldFace &face, const world::SkyState &sky, b
     const float torch_blue = torch_gain * (190.0F / 255.0F);
     const bool glowing_ore =
         ore_glow && face.block >= world::BlockType::gold_ore &&
-        face.block <= world::BlockType::diamond_ore;
-    const float ore_lift = glowing_ore ? (face.block == world::BlockType::coal_ore ? 0.08F : 0.18F)
-                                        : 0.0F;
+        face.block <= world::BlockType::diamond_ore && face.block != world::BlockType::coal_ore;
+    const float ore_lift = glowing_ore ? 0.18F : 0.0F;
     const auto illumination = [](float ambient, float direct) {
         return std::min(1.0F, (ambient * 0.35F + direct * 0.65F) * 1.2F);
     };
@@ -285,7 +363,8 @@ SDL_Color face_color(const world::WorldFace &face, const world::SkyState &sky, b
             255U};
 }
 
-float local_emissive_light(const world::WorldRegion &region, world::Vec3 sample_position) noexcept
+float local_emissive_light(const world::WorldRegion &region, world::Vec3 sample_position,
+                           std::array<float, 2> *source_levels = nullptr) noexcept
 {
     // Match the fifteen-level voxel-light reach closely enough for dynamic
     // actors and the first-person rig without rebuilding the mesh LightMap on
@@ -300,13 +379,17 @@ float local_emissive_light(const world::WorldRegion &region, world::Vec3 sample_
     const int center_y = static_cast<int>(std::floor(sample_position.y));
     const int center_z = static_cast<int>(std::floor(sample_position.z));
     float result{};
-    for (int y = center_y - below_radius; y <= center_y + above_radius && result < 0.999F; ++y)
+    if (source_levels != nullptr)
+        *source_levels = {};
+    for (int y = center_y - below_radius;
+         y <= center_y + above_radius && (source_levels != nullptr || result < 0.999F); ++y)
         for (int z = center_z - horizontal_radius; z <= center_z + horizontal_radius; ++z)
             for (int x = center_x - horizontal_radius; x <= center_x + horizontal_radius; ++x)
             {
                 if (!region.contains(x, y, z))
                     continue;
-                const std::uint8_t emission = world::self_illumination(region.block(x, y, z));
+                const auto block = region.block(x, y, z);
+                const std::uint8_t emission = world::self_illumination(block);
                 if (emission == 0U)
                     continue;
                 const float dx = static_cast<float>(x) + 0.5F - sample_position.x;
@@ -316,8 +399,15 @@ float local_emissive_light(const world::WorldRegion &region, world::Vec3 sample_
                 if (distance_squared >= light_radius_squared)
                     continue;
                 const float source = static_cast<float>(emission) / 15.0F;
-                result =
-                    std::max(result, source * (1.0F - std::sqrt(distance_squared) / light_radius));
+                const float level = source * (1.0F - std::sqrt(distance_squared) / light_radius);
+                result = std::max(result, level);
+                if (source_levels != nullptr)
+                {
+                    const bool lava = block == world::BlockType::surface_lava ||
+                                      block == world::BlockType::deep_lava;
+                    auto &channel = (*source_levels)[lava ? 1U : 0U];
+                    channel = std::max(channel, level);
+                }
             }
     return std::clamp(result, 0.0F, 1.0F);
 }
@@ -383,6 +473,9 @@ WorldPreviewRenderer::WorldPreviewRenderer(SDL_Renderer *renderer, std::int32_t 
       visibility_distance_(visibility_for(view_distance))
 {
     const world::BiomeKind launch_biome = preview_biome(initial_biome);
+    focus_chunk_x_ = preview_biome_center_chunk(launch_biome);
+    focus_chunk_z_ = 0;
+    simulation_window_.center_on(static_cast<float>(focus_chunk_x_ * world::chunk_width), 0.0F);
     rebuild_region(preview_biome_origin(launch_biome, 4), -2, launch_biome);
     stats_.seed = seed;
     load_original_atlas();
@@ -416,7 +509,6 @@ WorldPreviewRenderer::WorldPreviewRenderer(SDL_Renderer *renderer, std::int32_t 
     door_iron_ = std::make_unique<StaticModelAsset>(renderer_, derived / "door_iron.omsm");
     door_diamond_ = std::make_unique<StaticModelAsset>(renderer_, derived / "door_diamond.omsm");
     door_tech_ = std::make_unique<StaticModelAsset>(renderer_, derived / "door_tech.omsm");
-    fireball_model_ = std::make_unique<StaticModelAsset>(renderer_, derived / "fireball.omsm");
     rocket_model_ = std::make_unique<StaticModelAsset>(renderer_, derived / "rocket.omsm");
     avatar_viewmodel_ = std::make_unique<AvatarViewmodel>(renderer_, default_avatar_path());
     if (!avatar_viewmodel_->loaded())
@@ -432,6 +524,17 @@ WorldPreviewRenderer::WorldPreviewRenderer(SDL_Renderer *renderer, std::int32_t 
             avatar_viewmodel_ = std::make_unique<AvatarViewmodel>(renderer_, staged);
         }
     }
+    // An Xbox-avatar skin's textures come and go while the world is drawn; the
+    // entity pass caches a shader view per texture and must let go with them.
+    avatar_viewmodel_->set_skin_texture_release_hook([this](SDL_Texture *texture) {
+        if (depth_renderer_ != nullptr)
+            depth_renderer_->forget_entity_texture(texture);
+    });
+    // (Items) A held mod model's materials: the same textures the props and
+    // creatures use, alive as long as this renderer.
+    avatar_viewmodel_->set_mod_material_textures(
+        [this](const std::shared_ptr<const modding::graphics::Model> &model,
+               const modding::graphics::ModelMaterial &material) { return mod_material_texture(model, material); });
     enemy_models_ = std::make_unique<EnemyModelLibrary>(renderer_, derived);
     // Untextured white surface for projectile streaks (tracers/arrows).
     {
@@ -462,26 +565,204 @@ WorldPreviewRenderer::WorldPreviewRenderer(SDL_Renderer *renderer, std::int32_t 
         }
         if (stats_.depth_buffered)
         {
-            depth_renderer_->rebuild_chunks(mesh_batches_, region_.minimum_x(), region_.minimum_z(),
-                                            region_.maximum_x(), region_.maximum_z());
+            depth_renderer_->rebuild_chunks(
+                mesh_batches_, render_window_.minimum_x * world::chunk_width,
+                render_window_.minimum_z * world::chunk_depth,
+                (render_window_.maximum_x + 1) * world::chunk_width - 1,
+                (render_window_.maximum_z + 1) * world::chunk_depth - 1);
             stats_.depth_buffered = depth_renderer_->available();
+            // (Graphics area) mod block tiles after the retail 64; none
+            // without a mod that registered block textures.
+            mod_install_tiles();
         }
     }
-    if (active_span_ > region_.chunks_x())
+    // The four-by-four window above is only what the loading screen stands on.
+    // The simulation window is generated on the worker, and the columns inside
+    // the view distance are meshed as it lands.
+    begin_stream_to_simulation_window(launch_biome);
+}
+
+namespace
+{
+// The resident window is the shipped game's BlockTerrain: MAX_CHUNK_X by
+// MAX_CHUNK_Z columns, always (world::resident_chunk_window).
+//
+// Diagnostic A/B switch: size the resident window by the view distance and
+// centre it on the player's chunk, as it was before the simulation window was
+// fixed at the original's, so one build can measure what the fixed window
+// costs in frame time and memory. Never set in play: it is the desync.
+bool view_sized_resident_window() noexcept
+{
+    static const bool enabled = SDL_getenv("OPENMINERZ_VIEW_SIZED_WINDOW") != nullptr;
+    return enabled;
+}
+} // namespace
+
+WorldPreviewRenderer::ChunkRect WorldPreviewRenderer::region_rect() const noexcept
+{
+    return {region_.origin_chunk_x(), region_.origin_chunk_z(),
+            region_.origin_chunk_x() + region_.chunks_x() - 1,
+            region_.origin_chunk_z() + region_.chunks_z() - 1};
+}
+
+WorldPreviewRenderer::ChunkRect WorldPreviewRenderer::desired_resident_window() const noexcept
+{
+    if (view_sized_resident_window())
+        return desired_render_window();
+    // The original's window, whatever the view distance is (the second
+    // argument is there to say so; nothing reads it).
+    const world::ChunkWindow resident = world::resident_chunk_window(simulation_window_, 0);
+    return {resident.origin_x, resident.origin_z, resident.origin_x + resident.span - 1,
+            resident.origin_z + resident.span - 1};
+}
+
+WorldPreviewRenderer::ChunkRect WorldPreviewRenderer::desired_render_window() const noexcept
+{
+    const world::ChunkWindow meshed =
+        world::meshed_chunk_window_of_span(focus_chunk_x_, focus_chunk_z_, active_span_);
+    return {meshed.origin_x, meshed.origin_z, meshed.origin_x + meshed.span - 1,
+            meshed.origin_z + meshed.span - 1};
+}
+
+void WorldPreviewRenderer::set_focus(float world_x, float world_z) noexcept
+{
+    focus_chunk_x_ = floor_divide(static_cast<int>(std::floor(world_x)), world::chunk_width);
+    focus_chunk_z_ = floor_divide(static_cast<int>(std::floor(world_z)), world::chunk_depth);
+}
+
+bool WorldPreviewRenderer::region_loaded(float world_x, float world_z) const noexcept
+{
+    const int x = static_cast<int>(std::floor(world_x));
+    const int z = static_cast<int>(std::floor(world_z));
+    return simulation_window_.contains(world_x, world_z) && x >= region_.minimum_x() &&
+           x <= region_.maximum_x() && z >= region_.minimum_z() && z <= region_.maximum_z();
+}
+
+void WorldPreviewRenderer::begin_stream_to_simulation_window(world::BiomeKind biome)
+{
+    const ChunkRect target = desired_resident_window();
+    if (stream_job_active_ || target.same_columns(region_rect()))
+        return;
+    world::WorldRegion current = region_;
+    const world::WorldGenerator generator = generator_;
+    stream_job_ = std::async(std::launch::async, [generator, current = std::move(current),
+                                                  target]() mutable {
+        return generator.stream_region(current, target.minimum_x, target.minimum_z,
+                                       target.maximum_x - target.minimum_x + 1,
+                                       target.maximum_z - target.minimum_z + 1);
+    });
+    stream_job_active_ = true;
+    pending_biome_ = biome;
+    stats_.stream_pending = true;
+}
+
+void WorldPreviewRenderer::cancel_stream_job()
+{
+    if (!stream_job_active_)
+        return;
+    stream_job_.wait();
+    (void)stream_job_.get();
+    stream_job_active_ = false;
+}
+
+void WorldPreviewRenderer::sync_render_window(const ChunkRect *previous_region)
+{
+    const ChunkRect resident = region_rect();
+    const ChunkRect next = desired_render_window().intersect(resident);
+    const ChunkRect previous = render_window_;
+    if (!next.same_columns(previous))
     {
-        world::WorldRegion current = region_;
-        const world::WorldGenerator generator = generator_;
-        const int target_span = active_span_;
-        const int target_origin_x = preview_biome_origin(launch_biome, target_span);
-        stream_job_ = std::async(std::launch::async, [generator, current = std::move(current),
-                                                      target_origin_x, target_span]() mutable {
-            return generator.stream_region(current, target_origin_x, -target_span / 2, target_span,
-                                           target_span);
+        render_window_ = next;
+        const auto outside = [&](world::ChunkCoordinate coordinate) {
+            return !next.contains(coordinate.x, coordinate.z);
+        };
+        // Columns that left the view distance keep their blocks and lose
+        // everything else: the face batch, a queued upload, a queued rebuild
+        // and the GPU buffers.
+        const std::size_t batches_before = mesh_batches_.size();
+        std::erase_if(mesh_batches_, [&](const world::ChunkFaceBatch &batch) {
+            return outside(batch.coordinate);
         });
-        stream_job_active_ = true;
-        pending_biome_ = launch_biome;
-        stats_.stream_pending = true;
+        if (mesh_batches_.size() != batches_before)
+        {
+            reindex_mesh_batches();
+            faces_dirty_ = true;
+        }
+        std::erase_if(pending_uploads_, [&](const PackedChunkMesh &upload) {
+            return outside(upload.coordinate);
+        });
+        stats_.mesh_install_deferred = pending_uploads_.size();
+        std::size_t kept{};
+        std::size_t kept_priority{};
+        for (std::size_t index = 0U; index < pending_mesh_rebuilds_.size(); ++index)
+        {
+            const world::ChunkCoordinate coordinate = pending_mesh_rebuilds_[index];
+            if (outside(coordinate))
+            {
+                pending_lookup_.erase(coordinate);
+                edit_waiting_since_.erase(coordinate);
+                continue;
+            }
+            if (index < pending_priority_)
+                ++kept_priority;
+            pending_mesh_rebuilds_[kept++] = coordinate;
+        }
+        pending_mesh_rebuilds_.resize(kept);
+        pending_priority_ = kept_priority;
+        if (depth_renderer_ != nullptr && depth_renderer_->available())
+        {
+            if (next.empty())
+                depth_renderer_->retain_chunks(0, 0, -1, -1);
+            else
+            {
+                depth_renderer_->retain_chunks(next.minimum_x, next.minimum_z, next.maximum_x,
+                                               next.maximum_z);
+                depth_renderer_->set_world_bounds(next.minimum_x * world::chunk_width,
+                                                  next.minimum_z * world::chunk_depth,
+                                                  (next.maximum_x + 1) * world::chunk_width - 1,
+                                                  (next.maximum_z + 1) * world::chunk_depth - 1);
+            }
+        }
     }
+    if (next.empty())
+        return;
+    // What still needs a mesh: every section of the window that has none, and
+    // -- after the resident window itself moved -- every column whose ring of
+    // neighbours is not the one it was baked against. While the view distance
+    // sits inside the resident window, which is always once it has loaded, a
+    // step of either window bakes exactly the columns that entered the view.
+    std::vector<world::ChunkCoordinate> wanted;
+    const auto neighbourhood = [](int chunk_x, int chunk_z, const ChunkRect &within) {
+        return ChunkRect{chunk_x - 1, chunk_z - 1, chunk_x + 1, chunk_z + 1}.intersect(within);
+    };
+    for (int chunk_z = next.minimum_z; chunk_z <= next.maximum_z; ++chunk_z)
+    {
+        for (int chunk_x = next.minimum_x; chunk_x <= next.maximum_x; ++chunk_x)
+        {
+            const bool rebake =
+                previous_region != nullptr &&
+                !neighbourhood(chunk_x, chunk_z, *previous_region)
+                     .same_columns(neighbourhood(chunk_x, chunk_z, resident));
+            for (int section_y = 0; section_y < world::chunk_section_count; ++section_y)
+            {
+                const world::ChunkCoordinate coordinate{chunk_x, chunk_z, section_y};
+                if (rebake)
+                {
+                    wanted.push_back(coordinate);
+                    continue;
+                }
+                if (mesh_batch_indices_.contains(coordinate))
+                    continue;
+                // A worker already holds it; its result is installed as usual.
+                if (std::find(active_mesh_rebuilds_.begin(), active_mesh_rebuilds_.end(),
+                              coordinate) != active_mesh_rebuilds_.end())
+                    continue;
+                wanted.push_back(coordinate);
+            }
+        }
+    }
+    if (!wanted.empty())
+        queue_chunk_rebuilds(std::move(wanted));
 }
 
 std::size_t WorldPreviewRenderer::BlockCoordinateHash::operator()(
@@ -515,94 +796,57 @@ void WorldPreviewRenderer::rebuild_region(int origin_chunk_x, int origin_chunk_z
 
 void WorldPreviewRenderer::install_region(world::WorldRegion next, world::BiomeKind biome)
 {
-    std::vector<world::ChunkCoordinate> previous;
-    previous.reserve(mesh_batches_.size());
-    for (const auto &batch : mesh_batches_)
+    struct InstallTimer final
     {
-        previous.push_back(batch.coordinate);
-    }
+        WorldPreviewStats &stats;
+        std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
+        ~InstallTimer()
+        {
+            const float elapsed = std::chrono::duration<float, std::milli>(
+                                      std::chrono::steady_clock::now() - started)
+                                      .count();
+            ++stats.region_install_count;
+            stats.region_install_total_milliseconds += elapsed;
+            stats.region_install_peak_milliseconds =
+                std::max(stats.region_install_peak_milliseconds, elapsed);
+        }
+    } install_timer{stats_};
+    const bool first_install = mesh_batches_.empty() && stats_.chunk_count == 0U;
+    const ChunkRect previous_region = region_rect();
     region_ = std::move(next);
     apply_saved_edits();
-    if (previous.empty())
-    {
-        rebuild_mesh();
-    }
-    else
-    {
-        struct CoordinateHash final
-        {
-            std::size_t operator()(world::ChunkCoordinate coordinate) const noexcept
-            {
-                std::size_t result = std::hash<int>{}(coordinate.x);
-                result ^=
-                    std::hash<int>{}(coordinate.z) + 0x9e3779b9U + (result << 6U) + (result >> 2U);
-                result ^=
-                    std::hash<int>{}(coordinate.y) + 0x9e3779b9U + (result << 6U) + (result >> 2U);
-                return result;
-            }
-        };
-        const std::unordered_set<world::ChunkCoordinate, CoordinateHash> previous_set{
-            previous.begin(), previous.end()};
-        std::vector<world::ChunkCoordinate> current;
-        current.reserve(region_.chunks().size() *
-                        static_cast<std::size_t>(world::chunk_section_count));
-        for (const auto &chunk : region_.chunks())
-        {
-            for (int section_y = 0; section_y < world::chunk_section_count; ++section_y)
-                current.push_back({chunk.chunk_x(), chunk.chunk_z(), section_y});
-        }
-        const std::unordered_set<world::ChunkCoordinate, CoordinateHash> current_set{
-            current.begin(), current.end()};
-        std::vector<world::ChunkCoordinate> changed;
-        const auto add_neighborhood = [&](world::ChunkCoordinate center) {
-            for (int dz = -1; dz <= 1; ++dz)
-            {
-                for (int dx = -1; dx <= 1; ++dx)
-                {
-                    const world::ChunkCoordinate coordinate{center.x + dx, center.z + dz, center.y};
-                    if (current_set.contains(coordinate))
-                    {
-                        changed.push_back(coordinate);
-                    }
-                }
-            }
-        };
-        for (const auto coordinate : current)
-        {
-            if (!previous_set.contains(coordinate))
-            {
-                add_neighborhood(coordinate);
-            }
-        }
-        for (const auto coordinate : previous)
-        {
-            if (!current_set.contains(coordinate))
-            {
-                add_neighborhood(coordinate);
-            }
-        }
-        std::erase_if(mesh_batches_, [&](const world::ChunkFaceBatch &batch) {
-            return !current_set.contains(batch.coordinate);
-        });
-        reindex_mesh_batches();
-        if (depth_renderer_ != nullptr && depth_renderer_->available())
-        {
-            depth_renderer_->retain_chunks(region_.origin_chunk_x(), region_.origin_chunk_z(),
-                                           region_.origin_chunk_x() + region_.chunks_x() - 1,
-                                           region_.origin_chunk_z() + region_.chunks_z() - 1);
-            depth_renderer_->set_world_bounds(region_.minimum_x(), region_.minimum_z(),
-                                              region_.maximum_x(), region_.maximum_z());
-        }
-        queue_chunk_rebuilds(std::move(changed));
-    }
     biome_ = biome;
     stats_.chunk_count = region_.chunks().size();
+    if (first_install)
+    {
+        // Nothing is on screen yet: bake the bootstrap window where it stands.
+        render_window_ = desired_render_window().intersect(region_rect());
+        rebuild_mesh();
+        return;
+    }
+    // The resident window moved, and that is all. Which sections have a mesh
+    // is decided by the view distance, so a scroll of the simulation window
+    // bakes nothing unless it also changed what a meshed column can see.
+    sync_render_window(&previous_region);
 }
 
 void WorldPreviewRenderer::discard_pending_stream()
 {
     pending_mesh_rebuilds_.clear();
+    pending_lookup_.clear();
+    pending_priority_ = 0U;
     defer_mesh_rebuild_once_ = false;
+    // The queued rebuilds this drops include the shading aprons they stand for,
+    // so the unmeasured edits go with them; the caller reinstalls the window.
+    pending_light_edits_.clear();
+    pending_light_previous_.clear();
+    pending_light_previous_known_ = true;
+    if (light_probe_active_)
+    {
+        light_probe_job_.wait();
+        (void)light_probe_job_.get();
+        light_probe_active_ = false;
+    }
     discard_pending_mesh();
     if (!stream_job_active_)
     {
@@ -632,7 +876,11 @@ void WorldPreviewRenderer::apply_saved_edits()
 {
     for (const auto &[coordinate, block] : saved_edits_)
     {
-        if (region_.contains(coordinate.x, coordinate.y, coordinate.z))
+        // Only where the cell differs: a write copies the whole column if a
+        // worker still shares it, and almost every edit is already in place
+        // (a scroll keeps all but one row of the columns it had).
+        if (region_.contains(coordinate.x, coordinate.y, coordinate.z) &&
+            region_.block(coordinate.x, coordinate.y, coordinate.z) != block)
         {
             region_.set_block(coordinate.x, coordinate.y, coordinate.z, block);
         }
@@ -642,9 +890,40 @@ void WorldPreviewRenderer::apply_saved_edits()
 void WorldPreviewRenderer::rebuild_mesh()
 {
     discard_pending_mesh();
+    // rebuild_chunks below replaces every GPU mesh, so anything still queued
+    // from the previous window would only reinstate a stale section.
+    pending_uploads_.clear();
+    stats_.mesh_install_deferred = 0U;
     pending_mesh_rebuilds_.clear();
+    pending_lookup_.clear();
+    pending_priority_ = 0U;
     defer_mesh_rebuild_once_ = false;
-    mesh_batches_ = region_.visible_faces_by_chunk();
+    // Only the columns inside the view distance are ever baked; the rest of
+    // the resident window is blocks alone.
+    render_window_ = desired_render_window().intersect(region_rect());
+    std::vector<world::ChunkCoordinate> selection;
+    if (!render_window_.empty())
+    {
+        selection.reserve(static_cast<std::size_t>(render_window_.maximum_x -
+                                                   render_window_.minimum_x + 1) *
+                          static_cast<std::size_t>(render_window_.maximum_z -
+                                                   render_window_.minimum_z + 1) *
+                          static_cast<std::size_t>(world::chunk_section_count));
+        for (int chunk_z = render_window_.minimum_z; chunk_z <= render_window_.maximum_z; ++chunk_z)
+            for (int chunk_x = render_window_.minimum_x; chunk_x <= render_window_.maximum_x;
+                 ++chunk_x)
+                for (int section_y = 0; section_y < world::chunk_section_count; ++section_y)
+                    selection.push_back({chunk_x, chunk_z, section_y});
+    }
+    mesh_batches_ = region_.visible_faces_by_chunk(selection, liquids_.get()); // (mod-liquid)
+    // mod-world: generated mod blocks, then (Visuals) placed ones, wear their
+    // own tiles; nothing else changes.
+    if (mod_palette_ != nullptr)
+        for (world::ChunkFaceBatch &batch : mesh_batches_)
+            (void)world::apply_mod_palette(region_, batch, *mod_palette_);
+    if (mod_block_overlay_ != nullptr)
+        for (world::ChunkFaceBatch &batch : mesh_batches_)
+            (void)mod_block_overlay_->apply(batch);
     reindex_mesh_batches();
     std::size_t exposed_count{};
     for (const auto &batch : mesh_batches_)
@@ -672,8 +951,11 @@ void WorldPreviewRenderer::rebuild_mesh()
     faces_dirty_ = false;
     if (depth_renderer_ != nullptr && depth_renderer_->available())
     {
-        depth_renderer_->rebuild_chunks(mesh_batches_, region_.minimum_x(), region_.minimum_z(),
-                                        region_.maximum_x(), region_.maximum_z());
+        depth_renderer_->rebuild_chunks(
+            mesh_batches_, render_window_.minimum_x * world::chunk_width,
+            render_window_.minimum_z * world::chunk_depth,
+            (render_window_.maximum_x + 1) * world::chunk_width - 1,
+            (render_window_.maximum_z + 1) * world::chunk_depth - 1);
         stats_.depth_buffered = depth_renderer_->available();
     }
 }
@@ -683,98 +965,286 @@ void WorldPreviewRenderer::rebuild_block_edit(int world_x, int world_y, int worl
     rebuild_block_edits({{world_x, world_y, world_z}});
 }
 
-void WorldPreviewRenderer::rebuild_block_edits(const std::vector<std::array<int, 3>> &edits)
+void WorldPreviewRenderer::rebuild_block_edits(const std::vector<std::array<int, 3>> &edits,
+                                               const std::vector<world::BlockType> &previous_blocks)
 {
-    // Flood-filled lighting reaches fifteen cells; Rebirth then traces a six-cell
-    // primary bounce, a three-cell secondary bounce, and one surface-light sample.
-    // Remesh every section in the union of the complete 25-cell influence volumes.
-    // A blast or an enemy dig wave enters the queue once, so overlapping volumes
-    // never cause repeated sorts or repeated whole-world light bakes.
-    constexpr int light_reach = 25;
-    std::unordered_set<world::ChunkCoordinate, ChunkCoordinateHash> selected;
-    selected.reserve(edits.size() * 64U);
-    for (const auto &edit : edits)
+    if (previous_blocks.size() == edits.size() && pending_light_previous_known_)
+        pending_light_previous_.insert(pending_light_previous_.end(), previous_blocks.begin(),
+                                       previous_blocks.end());
+    else
     {
-        const int minimum_chunk_x = floor_divide(edit[0] - light_reach, world::chunk_width);
-        const int maximum_chunk_x = floor_divide(edit[0] + light_reach, world::chunk_width);
-        const int minimum_chunk_z = floor_divide(edit[2] - light_reach, world::chunk_depth);
-        const int maximum_chunk_z = floor_divide(edit[2] + light_reach, world::chunk_depth);
-        const int local_y = edit[1] - world::world_min_y;
-        const int maximum_section =
-            std::clamp((local_y + light_reach) / world::chunk_section_height, 0,
-                       world::chunk_section_count - 1);
-        for (int chunk_z = minimum_chunk_z; chunk_z <= maximum_chunk_z; ++chunk_z)
-            for (int chunk_x = minimum_chunk_x; chunk_x <= maximum_chunk_x; ++chunk_x)
-                for (int section_y = 0; section_y <= maximum_section; ++section_y)
-                    selected.insert({chunk_x, chunk_z, section_y});
+        pending_light_previous_known_ = false;
+        pending_light_previous_.clear();
     }
-    std::vector<world::ChunkCoordinate> selection{selected.begin(), selected.end()};
-    queue_chunk_rebuilds(std::move(selection));
+    queue_block_edits(edits);
 }
 
-void WorldPreviewRenderer::queue_chunk_rebuilds(std::vector<world::ChunkCoordinate> selection)
+void WorldPreviewRenderer::rebuild_block_edits(const std::vector<std::array<int, 3>> &edits)
 {
-    std::sort(selection.begin(), selection.end(), [](const auto &left, const auto &right) {
-        if (left.z != right.z)
-            return left.z < right.z;
+    // Nothing told us what these cells held, so the probe has to bracket the
+    // previous light field for the whole pending batch.
+    pending_light_previous_known_ = false;
+    pending_light_previous_.clear();
+    queue_block_edits(edits);
+}
+
+void WorldPreviewRenderer::queue_block_edits(const std::vector<std::array<int, 3>> &edits)
+{
+    // Two tiers. The sections that actually contain the changed cells carry the
+    // hole the player just made, so they jump the queue and are on screen on the
+    // next frame. The wider light-influence volume only shifts shading, so it
+    // trails behind at the ordinary bounded rate instead of stalling the frame.
+    // The union of both is exactly WorldRegion::edited_sections, so the settled
+    // result still matches a full rebuild.
+    const auto edit_time = std::chrono::steady_clock::now();
+    for (const auto &edit : edits)
+    {
+        const world::ChunkCoordinate section{
+            floor_divide(edit[0], world::chunk_width), floor_divide(edit[2], world::chunk_depth),
+            std::clamp((edit[1] - world::world_min_y) / world::chunk_section_height, 0,
+                       world::chunk_section_count - 1)};
+        // A change beyond the view distance (another player digging far away)
+        // has no mesh to wait for; its column is baked if it ever comes into view.
+        if (render_window_.contains(section.x, section.z))
+            edit_waiting_since_.try_emplace(section, edit_time);
+    }
+    queue_chunk_rebuilds(world::WorldRegion::edited_geometry_sections(edits), true);
+    // The shading apron is measured off the game thread by pump_light_probe:
+    // the geometric rule names every section whose bake *could* differ, which
+    // is around sixty per block, while almost all of them are already at their
+    // final brightness.
+    pending_light_edits_.insert(pending_light_edits_.end(), edits.begin(), edits.end());
+    stats_.stream_pending = true;
+}
+
+void WorldPreviewRenderer::pump_light_probe()
+{
+    if (light_probe_active_)
+    {
+        if (light_probe_job_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
+            return;
+        light_probe_active_ = false;
+        LightProbeResult probe = light_probe_job_.get();
+        stats_.light_probe_sections += probe.sections.size();
+        stats_.light_probe_candidate_sections += probe.candidates;
+        stats_.light_probe_peak_milliseconds =
+            std::max(stats_.light_probe_peak_milliseconds, probe.milliseconds);
+        queue_chunk_rebuilds(std::move(probe.sections), false);
+        return;
+    }
+    // A scroll of the resident window in flight is no reason to wait: it adds
+    // and drops whole columns at the far edge and changes no cell near an edit.
+    if (pending_light_edits_.empty())
+        return;
+    // One probe covers a batch of nearby edits; a sustained laser produces a
+    // handful of cells per frame, so this keeps up without ever queuing an
+    // apron it has not measured.
+    std::vector<std::array<int, 3>> edits = std::move(pending_light_edits_);
+    pending_light_edits_.clear();
+    std::vector<world::BlockType> previous =
+        pending_light_previous_known_ && pending_light_previous_.size() == edits.size()
+            ? std::move(pending_light_previous_)
+            : std::vector<world::BlockType>{};
+    pending_light_previous_.clear();
+    pending_light_previous_known_ = true;
+    // Shading only matters where something is meshed. An edit further from the
+    // view distance than light can carry is not measured at all, so distant
+    // digging by other players costs no light bake here.
+    {
+        const int reach =
+            (world::light_influence_radius + world::chunk_width - 1) / world::chunk_width;
+        const ChunkRect lit{render_window_.minimum_x - reach, render_window_.minimum_z - reach,
+                            render_window_.maximum_x + reach, render_window_.maximum_z + reach};
+        std::size_t kept{};
+        for (std::size_t index = 0U; index < edits.size(); ++index)
+        {
+            if (render_window_.empty() ||
+                !lit.contains(floor_divide(edits[index][0], world::chunk_width),
+                              floor_divide(edits[index][2], world::chunk_depth)))
+                continue;
+            edits[kept] = edits[index];
+            if (!previous.empty())
+                previous[kept] = previous[index];
+            ++kept;
+        }
+        edits.resize(kept);
+        if (!previous.empty())
+            previous.resize(kept);
+        if (edits.empty())
+            return;
+    }
+    world::WorldRegion snapshot = region_;
+    ++stats_.light_probe_jobs;
+    light_probe_job_ = std::async(
+        std::launch::async, [snapshot = std::move(snapshot), edits = std::move(edits),
+                             previous = std::move(previous)]() mutable {
+            const auto started = std::chrono::steady_clock::now();
+            LightProbeResult result;
+            std::vector<world::ChunkCoordinate> candidates = snapshot.edited_sections(edits);
+            result.candidates = candidates.size();
+            result.sections =
+                legacy_light_apron()
+                    ? std::move(candidates)
+                    : snapshot.light_changed_sections(edits,
+                                                      previous.empty() ? nullptr : &previous);
+            result.milliseconds =
+                std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - started)
+                    .count();
+            return result;
+        });
+    light_probe_active_ = true;
+}
+
+void WorldPreviewRenderer::queue_chunk_rebuilds(std::vector<world::ChunkCoordinate> selection,
+                                                bool immediate)
+{
+    // Order the incoming batch nearest-first, then merge it into the queue.
+    // Only the new entries are sorted: re-sorting the whole queue on every
+    // edit made a sustained laser cost more in bookkeeping than in meshing.
+    const int center_twice_x = render_window_.minimum_x + render_window_.maximum_x;
+    const int center_twice_z = render_window_.minimum_z + render_window_.maximum_z;
+    std::sort(selection.begin(), selection.end(), [&](const auto &left, const auto &right) {
+        const int left_x = left.x * 2 - center_twice_x;
+        const int left_z = left.z * 2 - center_twice_z;
+        const int right_x = right.x * 2 - center_twice_x;
+        const int right_z = right.z * 2 - center_twice_z;
+        const int left_distance = left_x * left_x + left_z * left_z;
+        const int right_distance = right_x * right_x + right_z * right_z;
+        if (left_distance != right_distance)
+            return left_distance < right_distance;
         if (left.x != right.x)
             return left.x < right.x;
-        return left.y < right.y;
+        if (left.z != right.z)
+            return left.z < right.z;
+        const int left_height = std::abs(left.y - 5);
+        const int right_height = std::abs(right.y - 5);
+        return left_height != right_height ? left_height < right_height : left.y < right.y;
     });
     selection.erase(std::unique(selection.begin(), selection.end()), selection.end());
-    std::unordered_set<world::ChunkCoordinate, ChunkCoordinateHash> queued{
-        pending_mesh_rebuilds_.begin(), pending_mesh_rebuilds_.end()};
-    queued.reserve(queued.size() + selection.size());
+    pending_lookup_.reserve(pending_lookup_.size() + selection.size());
     bool added{};
     for (const auto coordinate : selection)
     {
-        if (coordinate.x < region_.origin_chunk_x() ||
-            coordinate.x >= region_.origin_chunk_x() + region_.chunks_x() ||
-            coordinate.z < region_.origin_chunk_z() ||
-            coordinate.z >= region_.origin_chunk_z() + region_.chunks_z() || coordinate.y < 0 ||
+        // Only columns inside the view distance are ever baked. The rest of
+        // the resident window holds blocks and nothing else.
+        if (!render_window_.contains(coordinate.x, coordinate.z) || coordinate.y < 0 ||
             coordinate.y >= world::chunk_section_count)
         {
             continue;
         }
-        if (queued.insert(coordinate).second)
+        const bool fresh = pending_lookup_.insert(coordinate).second;
+        if (!fresh && !immediate)
+            continue;
+        if (!fresh)
         {
-            pending_mesh_rebuilds_.push_back(coordinate);
-            added = true;
+            // Already waiting behind a light-influence backlog: pull it forward
+            // so the newest hole is still the next thing rebuilt.
+            const auto queued = std::find(pending_mesh_rebuilds_.begin() +
+                                              static_cast<std::ptrdiff_t>(pending_priority_),
+                                          pending_mesh_rebuilds_.end(), coordinate);
+            if (queued == pending_mesh_rebuilds_.end())
+                continue;
+            pending_mesh_rebuilds_.erase(queued);
         }
+        if (immediate)
+            pending_mesh_rebuilds_.insert(pending_mesh_rebuilds_.begin() +
+                                              static_cast<std::ptrdiff_t>(pending_priority_++),
+                                          coordinate);
+        else
+            pending_mesh_rebuilds_.push_back(coordinate);
+        added = true;
     }
-    const int center_twice_x = region_.origin_chunk_x() * 2 + region_.chunks_x() - 1;
-    const int center_twice_z = region_.origin_chunk_z() * 2 + region_.chunks_z() - 1;
-    std::stable_sort(pending_mesh_rebuilds_.begin(), pending_mesh_rebuilds_.end(),
-                     [&](const auto &left, const auto &right) {
-                         const int left_x = left.x * 2 - center_twice_x;
-                         const int left_z = left.z * 2 - center_twice_z;
-                         const int right_x = right.x * 2 - center_twice_x;
-                         const int right_z = right.z * 2 - center_twice_z;
-                         const int left_distance = left_x * left_x + left_z * left_z;
-                         const int right_distance = right_x * right_x + right_z * right_z;
-                         if (left_distance != right_distance)
-                             return left_distance < right_distance;
-                         if (left.x != right.x)
-                             return left.x < right.x;
-                         if (left.z != right.z)
-                             return left.z < right.z;
-                         const int left_height = std::abs(left.y - 5);
-                         const int right_height = std::abs(right.y - 5);
-                         return left_height != right_height ? left_height < right_height
-                                                            : left.y < right.y;
-                     });
-    defer_mesh_rebuild_once_ = defer_mesh_rebuild_once_ || added;
-    stats_.stream_pending =
-        stream_job_active_ || mesh_job_active_ || !pending_mesh_rebuilds_.empty();
+    defer_mesh_rebuild_once_ = defer_mesh_rebuild_once_ || (added && !immediate);
+    stats_.stream_pending = stream_job_active_ || mesh_job_active_ ||
+                            !pending_mesh_rebuilds_.empty() || !pending_uploads_.empty();
 }
 
-void WorldPreviewRenderer::pump_chunk_rebuilds(std::size_t budget)
+WorldPreviewRenderer::MeshJobResult WorldPreviewRenderer::build_mesh_job(
+    const world::WorldRegion &snapshot, const std::vector<world::ChunkCoordinate> &selection,
+    const modding::graphics::ModBlockOverlay *mod_blocks, const world::ModPaletteLooks *mod_palette,
+    const world::LiquidTable *liquids)
 {
+    MeshJobResult result;
+    result.batches = snapshot.visible_faces_by_chunk(selection, liquids); // (mod-liquid)
+    if (mod_palette != nullptr) // mod-world
+        for (world::ChunkFaceBatch &batch : result.batches)
+            (void)world::apply_mod_palette(snapshot, batch, *mod_palette);
+    if (mod_blocks != nullptr) // (Visuals)
+        for (world::ChunkFaceBatch &batch : result.batches)
+            (void)mod_blocks->apply(batch);
+    // Interleaving each section's GPU vertices is pure arithmetic over an
+    // immutable face batch, so it belongs here rather than in the frame that
+    // installs it. The game thread is left with CreateBuffer alone.
+    result.uploads.reserve(result.batches.size());
+    for (const world::ChunkFaceBatch &batch : result.batches)
+        result.uploads.push_back(DepthVoxelRenderer::pack_chunk(batch));
+    return result;
+}
+
+void WorldPreviewRenderer::pump_mesh_uploads(float budget_milliseconds)
+{
+    stats_.mesh_install_peak_deferred =
+        std::max(stats_.mesh_install_peak_deferred, pending_uploads_.size());
+    if (pending_uploads_.empty())
+    {
+        stats_.mesh_install_deferred = 0U;
+        return;
+    }
+    if (depth_renderer_ == nullptr || !depth_renderer_->available())
+    {
+        pending_uploads_.clear();
+        stats_.mesh_install_deferred = 0U;
+        return;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t installed{};
+    while (!pending_uploads_.empty())
+    {
+        depth_renderer_->install_packed_chunk(std::move(pending_uploads_.front()));
+        pending_uploads_.pop_front();
+        ++installed;
+        // Always make one section of progress, then stop as soon as the budget
+        // is gone: a dense section must never be split across frames, but a
+        // whole column of them must never land in one.
+        if (std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - started)
+                .count() >= budget_milliseconds)
+            break;
+    }
+    const float elapsed =
+        std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - started)
+            .count();
+    // (What far terrain's uploads may still use of this frame's budget.)
+    mesh_upload_spent_milliseconds_ += elapsed;
+    stats_.mesh_install_sections += installed;
+    stats_.mesh_install_total_milliseconds += elapsed;
+    stats_.mesh_install_peak_milliseconds =
+        std::max(stats_.mesh_install_peak_milliseconds, elapsed);
+    stats_.mesh_install_deferred = pending_uploads_.size();
+    stats_.depth_buffered = depth_renderer_->available();
+}
+
+void WorldPreviewRenderer::pump_chunk_rebuilds(std::size_t budget, float upload_budget_milliseconds)
+{
+    struct PumpTimer final
+    {
+        WorldPreviewStats &stats;
+        std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
+        ~PumpTimer()
+        {
+            stats.edit_mesh_peak_pump_milliseconds =
+                std::max(stats.edit_mesh_peak_pump_milliseconds,
+                         std::chrono::duration<float, std::milli>(
+                             std::chrono::steady_clock::now() - started)
+                             .count());
+        }
+    } pump_timer{stats_};
+    pump_mesh_uploads(upload_budget_milliseconds);
+    pump_light_probe();
     if (defer_mesh_rebuild_once_)
     {
         defer_mesh_rebuild_once_ = false;
-        stats_.stream_pending =
-            stream_job_active_ || mesh_job_active_ || !pending_mesh_rebuilds_.empty();
+        stats_.stream_pending = stream_job_active_ || mesh_job_active_ ||
+                                !pending_mesh_rebuilds_.empty() || !pending_uploads_.empty();
         return;
     }
 
@@ -787,6 +1257,22 @@ void WorldPreviewRenderer::pump_chunk_rebuilds(std::size_t budget)
         }
         install_chunk_batches(mesh_job_.get());
         mesh_job_active_ = false;
+        // A section's edit is on screen once a worker whose snapshot was taken
+        // after that edit has delivered the section's replacement mesh.
+        const auto installed_at = std::chrono::steady_clock::now();
+        for (const world::ChunkCoordinate coordinate : active_mesh_rebuilds_)
+        {
+            const auto waiting = edit_waiting_since_.find(coordinate);
+            if (waiting == edit_waiting_since_.end() || waiting->second > mesh_job_started_)
+                continue;
+            const float latency =
+                std::chrono::duration<float, std::milli>(installed_at - waiting->second).count();
+            stats_.edit_mesh_peak_latency_milliseconds =
+                std::max(stats_.edit_mesh_peak_latency_milliseconds, latency);
+            stats_.edit_mesh_total_latency_milliseconds += latency;
+            ++stats_.edit_mesh_latency_samples;
+            edit_waiting_since_.erase(waiting);
+        }
         active_mesh_rebuilds_.clear();
     }
 
@@ -803,8 +1289,11 @@ void WorldPreviewRenderer::pump_chunk_rebuilds(std::size_t budget)
 
     if (!pending_mesh_rebuilds_.empty())
     {
-        const std::size_t count =
+        std::size_t count =
             std::min(std::max<std::size_t>(budget, 1U), pending_mesh_rebuilds_.size());
+        // Never split a batch of fresh holes across jobs: they are what the
+        // player is waiting to see, and there are only a handful of them.
+        count = std::max(count, std::min(pending_priority_, pending_mesh_rebuilds_.size()));
         std::vector<world::ChunkCoordinate> selection;
         selection.reserve(count);
         selection.insert(selection.end(), pending_mesh_rebuilds_.begin(),
@@ -812,22 +1301,41 @@ void WorldPreviewRenderer::pump_chunk_rebuilds(std::size_t budget)
         pending_mesh_rebuilds_.erase(pending_mesh_rebuilds_.begin(),
                                      pending_mesh_rebuilds_.begin() +
                                          static_cast<std::ptrdiff_t>(count));
+        for (const auto coordinate : selection)
+            pending_lookup_.erase(coordinate);
+        pending_priority_ -= std::min(pending_priority_, count);
         world::WorldRegion snapshot = region_;
         active_mesh_rebuilds_ = selection;
+        mesh_job_started_ = std::chrono::steady_clock::now();
+        ++stats_.edit_mesh_jobs;
+        stats_.edit_mesh_sections += count;
+        stats_.edit_mesh_peak_queue =
+            std::max(stats_.edit_mesh_peak_queue, pending_mesh_rebuilds_.size() + count);
         mesh_job_ = std::async(std::launch::async, [snapshot = std::move(snapshot),
-                                                    selection = std::move(selection)]() mutable {
-            return snapshot.visible_faces_by_chunk(selection);
+                                                    selection = std::move(selection),
+                                                    mod_blocks = mod_block_overlay_,
+                                                    mod_palette = mod_palette_,
+                                                    liquids = liquids_]() mutable {
+            return build_mesh_job(snapshot, selection, mod_blocks.get(), mod_palette.get(),
+                                  liquids.get());
         });
         mesh_job_active_ = true;
     }
-    stats_.stream_pending =
-        stream_job_active_ || mesh_job_active_ || !pending_mesh_rebuilds_.empty();
+    stats_.edit_mesh_queue_depth = pending_mesh_rebuilds_.size();
+    stats_.stream_pending = stream_job_active_ || mesh_job_active_ || light_probe_active_ ||
+                            !pending_mesh_rebuilds_.empty() || !pending_uploads_.empty() ||
+                            !pending_light_edits_.empty();
 }
 
-void WorldPreviewRenderer::install_chunk_batches(std::vector<world::ChunkFaceBatch> rebuilt)
+void WorldPreviewRenderer::install_chunk_batches(MeshJobResult result)
 {
+    std::vector<world::ChunkFaceBatch> rebuilt = std::move(result.batches);
     for (auto &batch : rebuilt)
     {
+        // The view may have moved on while the worker ran; a column that left
+        // it gets no mesh back.
+        if (!render_window_.contains(batch.coordinate.x, batch.coordinate.z))
+            continue;
         const auto indexed = mesh_batch_indices_.find(batch.coordinate);
         std::size_t batch_index{};
         std::size_t previous_face_count{};
@@ -846,11 +1354,12 @@ void WorldPreviewRenderer::install_chunk_batches(std::vector<world::ChunkFaceBat
         const auto &installed = mesh_batches_[batch_index];
         stats_.visible_face_count =
             stats_.visible_face_count - previous_face_count + installed.faces.size();
-        if (depth_renderer_ != nullptr && depth_renderer_->available())
-        {
-            depth_renderer_->replace_chunk(installed);
-        }
     }
+    // The GPU side is already packed; queue it so the frame budget decides when
+    // each buffer is created.
+    for (PackedChunkMesh &upload : result.uploads)
+        if (render_window_.contains(upload.coordinate.x, upload.coordinate.z))
+            pending_uploads_.push_back(std::move(upload));
     faces_dirty_ = true;
     stats_.depth_buffered = depth_renderer_ != nullptr && depth_renderer_->available();
 }
@@ -901,31 +1410,18 @@ bool WorldPreviewRenderer::finish_stream_if_ready()
     {
         return false;
     }
-    // A completed stream supersedes meshes produced from the old resident
-    // window, but its edit coordinates still matter. Preserve and re-filter
-    // them against the new window after installation instead of letting a long
-    // local-edit queue stall movement indefinitely.
-    std::vector<world::ChunkCoordinate> interrupted_rebuilds = std::move(pending_mesh_rebuilds_);
-    if (mesh_job_active_)
-    {
-        if (mesh_job_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
-        {
-            pending_mesh_rebuilds_ = std::move(interrupted_rebuilds);
-            return false;
-        }
-        (void)mesh_job_.get();
-        mesh_job_active_ = false;
-        interrupted_rebuilds.insert(interrupted_rebuilds.end(), active_mesh_rebuilds_.begin(),
-                                    active_mesh_rebuilds_.end());
-        active_mesh_rebuilds_.clear();
-    }
-    defer_mesh_rebuild_once_ = false;
+    // A scroll of the resident window adds and drops columns at its far edge,
+    // well outside the view distance, so it supersedes nothing: the queue, a
+    // mesh worker in flight and every baked section stay valid, and the edits
+    // waiting in the queue keep their order. (When the view distance does
+    // reach the edge -- the first frames of a world -- install_region queues
+    // the affected columns again behind whatever the worker returns.)
     const auto install_started = std::chrono::steady_clock::now();
     auto next = stream_job_.get();
     stream_job_active_ = false;
     install_region(std::move(next), pending_biome_);
-    queue_chunk_rebuilds(std::move(interrupted_rebuilds));
-    stats_.stream_pending = mesh_job_active_ || !pending_mesh_rebuilds_.empty();
+    stats_.stream_pending =
+        mesh_job_active_ || !pending_mesh_rebuilds_.empty() || !pending_uploads_.empty();
     stats_.last_stream_milliseconds =
         std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - install_started)
             .count();
@@ -936,16 +1432,19 @@ bool WorldPreviewRenderer::finish_stream_if_ready()
 bool WorldPreviewRenderer::preload_step(std::size_t mesh_budget)
 {
     const bool installed = finish_stream_if_ready();
-    pump_chunk_rebuilds(std::max<std::size_t>(mesh_budget, 1U));
+    // A loading screen has no camera to stutter, so admit every finished
+    // upload there; a paused world behind an overlay keeps the frame budget.
+    pump_chunk_rebuilds(std::max<std::size_t>(mesh_budget, 1U),
+                        mesh_budget >= 16U ? 1000.0F : mesh_upload_budget_milliseconds);
     return installed;
 }
 
 bool WorldPreviewRenderer::preload_complete() const noexcept
 {
-    const std::size_t expected_chunks =
-        static_cast<std::size_t>(active_span_) * static_cast<std::size_t>(active_span_);
+    // The whole simulation window is resident and everything inside the view
+    // distance has its mesh.
     return !stream_job_active_ && !mesh_job_active_ && pending_mesh_rebuilds_.empty() &&
-           region_.chunks().size() == expected_chunks;
+           pending_uploads_.empty() && desired_resident_window().same_columns(region_rect());
 }
 
 float WorldPreviewRenderer::preload_progress() const noexcept
@@ -1030,96 +1529,191 @@ bool WorldPreviewRenderer::stream_around(const world::PlayerState &player)
     // Face extraction runs from an immutable snapshot. Group the eight vertical
     // sections of one horizontal chunk into each worker so its shared light map
     // is computed once, while GPU installation remains a bounded per-frame slice.
-    if (finish_stream_if_ready())
-        return true;
-    pump_chunk_rebuilds(static_cast<std::size_t>(world::chunk_section_count));
-    const int player_x = static_cast<int>(std::floor(player.position.x));
-    const int player_z = static_cast<int>(std::floor(player.position.z));
-    const int player_chunk_x = floor_divide(player_x, world::chunk_width);
-    const int player_chunk_z = floor_divide(player_z, world::chunk_depth);
-    const int desired_origin_x = player_chunk_x - region_.chunks_x() / 2;
-    const int desired_origin_z = player_chunk_z - region_.chunks_z() / 2;
-
-    if (stream_job_active_)
+    //
+    // Two windows follow the player. The RESIDENT one is the shipped game's
+    // 24 x 24 chunks of blocks, scrolled by its rule (CenterOn, then
+    // TryShiftTerrain's one-chunk hysteresis) and generated a row at a time on
+    // a worker. The MESHED one is the view distance, centred on the player's
+    // own chunk, and only it ever costs a light bake or a GPU buffer.
+    bool changed = finish_stream_if_ready();
+    if (!changed)
+        pump_chunk_rebuilds(static_cast<std::size_t>(world::chunk_section_count),
+                            mesh_upload_budget_milliseconds);
+    const int previous_focus_x = focus_chunk_x_;
+    const int previous_focus_z = focus_chunk_z_;
+    simulation_window_.follow(player.position.x, player.position.z);
+    set_focus(player.position.x, player.position.z);
+    if (focus_chunk_x_ != previous_focus_x || focus_chunk_z_ != previous_focus_z)
     {
-        if (!finish_stream_if_ready())
-            return false;
-        return true;
+        biome_ = generator_.biome_at(static_cast<int>(std::floor(player.position.x)),
+                                     static_cast<int>(std::floor(player.position.z)));
+        pending_biome_ = biome_;
+        // The columns that came into view are already resident, so they are
+        // queued now instead of when the resident window catches up.
+        sync_render_window();
+        changed = true;
     }
-
-    if (desired_origin_x == region_.origin_chunk_x() &&
-        desired_origin_z == region_.origin_chunk_z())
-    {
-        return false;
-    }
-    world::WorldRegion current = region_;
-    const world::WorldGenerator generator = generator_;
-    pending_biome_ = generator_.biome_at(player_x, player_z);
-    stream_job_ = std::async(std::launch::async, [generator, current = std::move(current),
-                                                  desired_origin_x, desired_origin_z]() mutable {
-        return generator.stream_region(current, desired_origin_x, desired_origin_z);
-    });
-    stream_job_active_ = true;
-    stats_.stream_pending = true;
-    return false;
+    begin_stream_to_simulation_window(biome_);
+    return changed;
 }
 
 void WorldPreviewRenderer::recenter_on(const world::PlayerState &player)
 {
-    const int player_chunk_x =
-        floor_divide(static_cast<int>(std::floor(player.position.x)), world::chunk_width);
-    const int player_chunk_z =
-        floor_divide(static_cast<int>(std::floor(player.position.z)), world::chunk_depth);
-    const int target_origin_x = player_chunk_x - active_span_ / 2;
-    const int target_origin_z = player_chunk_z - active_span_ / 2;
+    // GameScreen.TeleportToLocation: CenterOn(position, scrollIfPossible). A
+    // destination inside the window scrolls it; one outside resets it around
+    // the new centre (StockTerrainWindow::follow makes the same choice).
+    simulation_window_.follow(player.position.x, player.position.z);
+    set_focus(player.position.x, player.position.z);
     const world::BiomeKind biome =
         generator_.biome_at(static_cast<int>(std::floor(player.position.x)),
                             static_cast<int>(std::floor(player.position.z)));
-    // A load or very early teleport can cancel the constructor's expanded-view
-    // stream while region_ is still the four-chunk bootstrap window. Always
-    // recenter at the configured active span so its loading screen can finish.
-    if (region_.chunks_x() != active_span_ || region_.chunks_z() != active_span_)
+    // A scroll still in flight was generating for where the player no longer is.
+    cancel_stream_job();
+    pending_biome_ = biome;
+    const ChunkRect target = desired_resident_window();
+    if (target.same_columns(region_rect()))
     {
-        discard_pending_stream();
-        auto next = generator_.stream_region(region_, target_origin_x, target_origin_z,
-                                             active_span_, active_span_);
-        install_region(std::move(next), biome);
+        biome_ = biome;
+        sync_render_window();
         return;
     }
-    rebuild_region(target_origin_x, target_origin_z, biome);
+    // Synchronous on purpose (see the header); a whole window is generated
+    // across the machine's cores, so this stays a fraction of a second.
+    auto next = generator_.stream_region(region_, target.minimum_x, target.minimum_z,
+                                         target.maximum_x - target.minimum_x + 1,
+                                         target.maximum_z - target.minimum_z + 1);
+    install_region(std::move(next), biome);
 }
 
 void WorldPreviewRenderer::set_view_distance(int view_distance)
 {
-    discard_pending_stream();
+    // A graphics setting: it moves the fog and decides which resident columns
+    // are meshed. The simulated terrain does not change with it.
     visibility_distance_ = visibility_for(view_distance);
     const int next_span = active_span_for(view_distance);
     if (next_span == active_span_)
     {
         return;
     }
-    const int center_chunk_x = floor_divide(center_x(), world::chunk_width);
-    const int center_chunk_z = floor_divide(center_z(), world::chunk_depth);
     active_span_ = next_span;
-    world::WorldRegion current = region_;
-    const world::WorldGenerator generator = generator_;
-    const int target_origin_x = center_chunk_x - next_span / 2;
-    const int target_origin_z = center_chunk_z - next_span / 2;
-    stream_job_ =
-        std::async(std::launch::async, [generator, current = std::move(current), target_origin_x,
-                                        target_origin_z, next_span]() mutable {
-            return generator.stream_region(current, target_origin_x, target_origin_z, next_span,
-                                           next_span);
-        });
-    stream_job_active_ = true;
-    pending_biome_ = biome_;
-    stats_.stream_pending = true;
+    sync_render_window();
+    // A no-op unless the diagnostic view-sized window is on.
+    begin_stream_to_simulation_window(biome_);
+    stats_.stream_pending = stream_job_active_ || mesh_job_active_ ||
+                            !pending_mesh_rebuilds_.empty() || !pending_uploads_.empty();
 }
 
 void WorldPreviewRenderer::remember_edit(int world_x, int world_y, int world_z,
                                          world::BlockType block)
 {
     saved_edits_.insert_or_assign({world_x, world_y, world_z}, block);
+    if (far_terrain_ != nullptr)
+        far_terrain_->set_edit(world_x, world_y, world_z, block);
+}
+
+// --- Far terrain (openminerz/world/far_terrain.hpp). Presentation only: it
+// reads the generator and the edits this client already knows, and writes
+// nothing the simulation, the save or the network ever sees.
+
+void WorldPreviewRenderer::set_far_terrain(const world::FarTerrainSettings &settings)
+{
+    if (!settings.enabled() && far_terrain_ == nullptr)
+        return;
+    if (far_terrain_ == nullptr)
+    {
+        // mod-world: the generator itself, so a mod's terrain reaches the horizon.
+        far_terrain_ = std::make_unique<world::FarTerrain>(generator_);
+        for (const auto &[coordinate, block] : saved_edits_)
+            far_terrain_->set_edit(coordinate.x, coordinate.y, coordinate.z, block);
+    }
+    far_terrain_->set_settings(settings);
+}
+
+world::FarTerrainStats WorldPreviewRenderer::far_terrain_stats() const
+{
+    return far_terrain_ != nullptr ? far_terrain_->stats() : world::FarTerrainStats{};
+}
+
+world::FarTerrainGpuStats WorldPreviewRenderer::far_terrain_gpu_stats() const
+{
+    return depth_renderer_ != nullptr ? depth_renderer_->far_terrain_stats()
+                                      : world::FarTerrainGpuStats{};
+}
+
+void WorldPreviewRenderer::update_far_terrain(const ui::UiMetrics &metrics,
+                                              const world::SkyState &sky,
+                                              const world::PlayerState &camera,
+                                              float vertical_fov_degrees, float elapsed_seconds,
+                                              bool rebirth_presentation)
+{
+    if (depth_renderer_ == nullptr)
+        return;
+    const bool wanted = far_terrain_ != nullptr && far_terrain_->settings().enabled() &&
+                        rebirth_presentation && post_effects_.enabled && stats_.depth_buffered;
+    if (!wanted)
+    {
+        // Tell the renderer once; an inactive frame draws exactly as before.
+        if (far_terrain_submitted_)
+            depth_renderer_->submit_far_terrain({});
+        far_terrain_submitted_ = false;
+        return;
+    }
+    // The same camera the depth pass builds from this player state.
+    world::FarView view;
+    view.eye_x = static_cast<double>(camera.position.x);
+    view.eye_y = static_cast<double>(camera.position.y + world::PlayerSimulation::eye_height);
+    view.eye_z = static_cast<double>(camera.position.z);
+    const float sine_yaw = std::sin(camera.yaw);
+    const float cosine_yaw = std::cos(camera.yaw);
+    const float sine_pitch = std::sin(camera.pitch);
+    const float cosine_pitch = std::cos(camera.pitch);
+    view.right = {cosine_yaw, 0.0F, sine_yaw};
+    view.up = {-sine_yaw * sine_pitch, cosine_pitch, cosine_yaw * sine_pitch};
+    view.forward = {sine_yaw * cosine_pitch, sine_pitch, -cosine_yaw * cosine_pitch};
+    view.tangent_y = std::tan(view::sanitized_fov_degrees(vertical_fov_degrees) *
+                              std::numbers::pi_v<float> / 360.0F);
+    view.tangent_x = view.tangent_y * static_cast<float>(metrics.output_width) /
+                     static_cast<float>(std::max(metrics.output_height, 1));
+    // Cell maps share the frame's upload budget with the detailed terrain's
+    // vertex buffers: whatever the section uploads left of it, at about a
+    // twentieth of a millisecond a tile, and never less than one tile so the
+    // far landscape keeps arriving while the window streams.
+    constexpr float tile_upload_milliseconds = 0.05F;
+    const float remaining = mesh_upload_budget_milliseconds - mesh_upload_spent_milliseconds_;
+    const int maximum_uploads =
+        std::clamp(static_cast<int>(remaining / tile_upload_milliseconds), 1, 12);
+    mesh_upload_spent_milliseconds_ = 0.0F;
+    // The landscape arrives, fades in and settles on wall time, not on the
+    // draw clock: that one stands still while a single-player game is paused,
+    // so a pause menu opened before the landscape was there kept the flat fog
+    // behind it for as long as it stayed open (tiles were admitted but their
+    // fade and the shadow field never advanced), and a paused capture waited
+    // out its whole frame allowance for a landscape that could not settle.
+    static_cast<void>(elapsed_seconds);
+    static const std::chrono::steady_clock::time_point far_clock_origin =
+        std::chrono::steady_clock::now();
+    const double far_seconds_exact =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - far_clock_origin).count();
+    const float far_seconds = static_cast<float>(far_seconds_exact);
+    // mod-world (wave 5): a mod generator's trees in their own blocks.
+    far_terrain_->set_mod_palette(mod_palette_);
+    world::FarTerrainFrame frame =
+        far_terrain_->update(view, visibility_distance_, {sky.sun_x, sky.sun_y, sky.sun_z},
+                             far_seconds_exact, maximum_uploads);
+    // For captures: the landscape counts as settled once nothing has been on
+    // its way for a moment and its shadows are there.
+    const bool busy = !frame.uploads.empty() || frame.opacity < 1.0F ||
+                      frame.shadows[0] == nullptr || far_terrain_->stats().tiles_pending > 0U;
+    if (busy || far_terrain_quiet_since_ < 0.0F || far_seconds < far_terrain_quiet_since_)
+        far_terrain_quiet_since_ = far_seconds;
+    far_terrain_settled_ = !busy && far_seconds - far_terrain_quiet_since_ > 0.9F;
+    depth_renderer_->submit_far_terrain(std::move(frame));
+    far_terrain_submitted_ = true;
+}
+
+bool WorldPreviewRenderer::far_terrain_settled() const noexcept
+{
+    return !far_terrain_submitted_ || far_terrain_settled_;
 }
 
 std::optional<world::BlockType> WorldPreviewRenderer::remembered_block(int world_x, int world_y,
@@ -1174,6 +1768,9 @@ void WorldPreviewRenderer::import_edits(const std::vector<std::array<int, 4>> &e
     {
         saved_edits_.insert_or_assign({edit[0], edit[1], edit[2]},
                                       static_cast<world::BlockType>(edit[3]));
+        if (far_terrain_ != nullptr)
+            far_terrain_->set_edit(edit[0], edit[1], edit[2],
+                                   static_cast<world::BlockType>(edit[3]));
     }
     apply_saved_edits();
     rebuild_mesh();
@@ -1194,6 +1791,14 @@ void WorldPreviewRenderer::replace_chunk_edits(
     for (const auto &edit : edits)
         saved_edits_.insert_or_assign({edit[0], edit[1], edit[2]},
                                       static_cast<world::BlockType>(edit[3]));
+    if (far_terrain_ != nullptr)
+    {
+        // The same replacement for the far landscape's copy of the edits.
+        far_terrain_->erase_edits(corner_x, corner_z, maximum_x - 1, maximum_z - 1);
+        for (const auto &edit : edits)
+            far_terrain_->set_edit(edit[0], edit[1], edit[2],
+                                   static_cast<world::BlockType>(edit[3]));
+    }
 
     const int region_x = chunk_x - region_.origin_chunk_x();
     const int region_z = chunk_z - region_.origin_chunk_z();
@@ -1211,16 +1816,30 @@ void WorldPreviewRenderer::replace_chunk_edits(
         region_.set_block(edit[0], edit[1], edit[2],
                           static_cast<world::BlockType>(edit[3]));
 
-    // A high-Y edit selects every vertical mesh section after the lighting
-    // influence expansion, while also remeshing neighbouring chunk borders.
-    rebuild_block_edits({{corner_x, world::world_min_y + world::chunk_height - 1, corner_z}});
+    // The whole resident column was replaced, so this is not a cell edit and
+    // no light-influence rule covers it. Queue every section of the column
+    // outright, plus the neighbours within the influence radius whose borders
+    // and shading it changes.
+    const int neighbour_chunks =
+        (world::light_influence_radius + world::chunk_width - 1) / world::chunk_width;
+    std::vector<world::ChunkCoordinate> replaced;
+    for (int dz = -neighbour_chunks; dz <= neighbour_chunks; ++dz)
+        for (int dx = -neighbour_chunks; dx <= neighbour_chunks; ++dx)
+            for (int section_y = 0; section_y < world::chunk_section_count; ++section_y)
+                replaced.push_back({chunk_x + dx, chunk_z + dz, section_y});
+    queue_chunk_rebuilds(std::move(replaced), false);
 }
 
 void WorldPreviewRenderer::spawn_mining_impact(const world::BlockBreakUpdate &impact)
 {
+    // Enhanced presentation: chips of the block itself, its dust and its
+    // sparks, and the block coming apart when this swing removed it
+    // (world_preview_combat_vfx.cpp).
+    if (combat_vfx_mining_impact(impact))
+        return;
     // Preserve the original 54-particle impact burst while bounding accumulated work when
     // several impacts overlap. The oldest particles are visually the least significant.
-    constexpr std::size_t retained_before_burst = 162U;
+    constexpr std::size_t retained_before_burst = 1536U;
     if (mining_particles_.size() > retained_before_burst)
     {
         mining_particles_.erase(
@@ -1300,7 +1919,12 @@ void WorldPreviewRenderer::spawn_mining_impact(const world::BlockBreakUpdate &im
                 // four giant quads under the crosshair. Its colour comes from
                 // the mined material, making sand, snow, bloodstone and rock
                 // impacts read differently without requiring new textures.
-                const world::BlockColor material = world::fallback_color(impact.block);
+                world::BlockColor material = world::fallback_color(impact.block);
+                // (Visuals) a mod block's dust is its own texture's colour.
+                if (const auto mod = mod_block_color(impact.x, impact.y, impact.z, impact.block))
+                    material = {static_cast<std::uint8_t>((*mod)[0] * 255.0F),
+                                static_cast<std::uint8_t>((*mod)[1] * 255.0F),
+                                static_cast<std::uint8_t>((*mod)[2] * 255.0F)};
                 particle.position.x += normal.x * 0.09F;
                 particle.position.y += normal.y * 0.09F;
                 particle.position.z += normal.z * 0.09F;
@@ -1309,12 +1933,12 @@ void WorldPreviewRenderer::spawn_mining_impact(const world::BlockBreakUpdate &im
                 particle.velocity.y =
                     random_range(0.18F, 0.68F) + normal.y * random_range(0.20F, 0.48F);
                 particle.velocity.z += normal.z * random_range(0.28F, 0.62F);
-                particle.lifetime = random_range(1.25F, 1.65F);
-                particle.size = random_range(0.16F, 0.25F);
-                particle.end_size = random_range(1.05F, 1.65F);
+                particle.lifetime = random_range(0.40F, 0.65F);
+                particle.size = random_range(0.10F, 0.16F);
+                particle.end_size = random_range(0.38F, 0.60F);
                 particle.rotation = random_range(0.0F, 360.0F);
                 particle.angular_velocity = random_range(-0.55F, 0.55F) * 57.29578F;
-                particle.opacity = random_range(0.80F, 0.96F);
+                particle.opacity = random_range(0.28F, 0.40F);
                 particle.tint = {0.40F + 0.50F * static_cast<float>(material.red) / 255.0F,
                                  0.40F + 0.50F * static_cast<float>(material.green) / 255.0F,
                                  0.40F + 0.50F * static_cast<float>(material.blue) / 255.0F};
@@ -1349,13 +1973,18 @@ void WorldPreviewRenderer::spawn_mining_impact(const world::BlockBreakUpdate &im
                                            : metal_or_ore                           ? 20
                                            : impact.block == world::BlockType::rock ? 8
                                                                                     : 6));
-    emit(ParticleKind::mining_dust, scaled_count(powder ? 7 : timber ? 5 : 6));
+    emit(ParticleKind::mining_dust, scaled_count(powder ? 3 : 2));
     stats_.mining_particle_count = mining_particles_.size();
 }
 
 void WorldPreviewRenderer::set_particle_density(float density) noexcept
 {
     particle_density_ = std::clamp(density, 0.20F, 1.50F);
+}
+
+void WorldPreviewRenderer::set_presentation_lag(float seconds) noexcept
+{
+    presentation_lag_seconds_ = std::isfinite(seconds) ? std::clamp(seconds, 0.0F, 0.05F) : 0.0F;
 }
 
 void WorldPreviewRenderer::set_grading(int tone_curve, bool auto_exposure,
@@ -1366,9 +1995,29 @@ void WorldPreviewRenderer::set_grading(int tone_curve, bool auto_exposure,
                                      color_grading);
 }
 
+void WorldPreviewRenderer::set_quality(int shadow_resolution, float shadow_distance,
+                                       int anisotropy, bool fxaa, bool bloom,
+                                       bool sun_shafts) noexcept
+{
+    if (depth_renderer_ != nullptr)
+        depth_renderer_->set_quality(shadow_resolution, shadow_distance, anisotropy, fxaa, bloom,
+                                     sun_shafts);
+}
+
+void WorldPreviewRenderer::set_post_effects(const PostEffects &effects) noexcept
+{
+    post_effects_ = effects;
+    if (depth_renderer_ != nullptr)
+        depth_renderer_->set_post_effects(effects);
+}
+
+
 void WorldPreviewRenderer::spawn_impact_smoke(world::Vec3 position,
                                               const std::array<float, 3> &tint)
 {
+    // Enhanced presentation: the effects layer's lit puff (world_preview_vfx.cpp).
+    if (vfx_spawn_impact_smoke(position, tint))
+        return;
     const auto random_unit = [&]() {
         effect_random_state_ ^= effect_random_state_ << 13U;
         effect_random_state_ ^= effect_random_state_ >> 17U;
@@ -1408,7 +2057,11 @@ void WorldPreviewRenderer::spawn_impact_smoke(world::Vec3 position,
 
 void WorldPreviewRenderer::spawn_tracer_impact(const world::BlockBreakUpdate &impact)
 {
-    constexpr std::size_t retained_before_burst = 162U;
+    // Enhanced presentation: what a round knocks off that kind of surface
+    // (world_preview_combat_vfx.cpp).
+    if (combat_vfx_tracer_impact(impact))
+        return;
+    constexpr std::size_t retained_before_burst = 1536U;
     if (mining_particles_.size() > retained_before_burst)
     {
         mining_particles_.erase(
@@ -1448,9 +2101,14 @@ void WorldPreviewRenderer::spawn_tracer_impact(const world::BlockBreakUpdate &im
     stats_.mining_particle_count = mining_particles_.size();
 }
 
-void WorldPreviewRenderer::spawn_blaster_impact(const world::BlockBreakUpdate &impact)
+void WorldPreviewRenderer::spawn_blaster_impact(const world::BlockBreakUpdate &impact,
+                                                std::array<float, 3> tint)
 {
-    constexpr std::size_t retained_before_burst = 162U;
+    // Enhanced presentation: the bolt's flash and molten sparks in its own
+    // colour, and what it burns off the surface (world_preview_combat_vfx.cpp).
+    if (combat_vfx_blaster_impact(impact, tint))
+        return;
+    constexpr std::size_t retained_before_burst = 1536U;
     if (mining_particles_.size() > retained_before_burst)
     {
         mining_particles_.erase(
@@ -1469,23 +2127,7 @@ void WorldPreviewRenderer::spawn_blaster_impact(const world::BlockBreakUpdate &i
                              static_cast<float>(impact.normal_y),
                              static_cast<float>(impact.normal_z)};
 
-    // BlasterFlash: five particles, 1s life, +/-1 velocity, full size 1 ->
-    // 3..5, and BlasterShot applies LocalScale=.01 to this emitter only.
-    for (int index = 0; index < 5; ++index)
-    {
-        MiningParticle particle;
-        particle.kind = ParticleKind::flash;
-        particle.position = impact.intersection;
-        particle.velocity = {random01() * 2.0F - 1.0F, random01() * 2.0F - 1.0F,
-                             random01() * 2.0F - 1.0F};
-        particle.lifetime = 1.0F;
-        particle.size = 0.005F;
-        particle.end_size = (3.0F + random01() * 2.0F) * 0.005F;
-        particle.rotation = random01() * 360.0F;
-        mining_particles_.push_back(particle);
-    }
-
-    const int spark_count = std::max(1, static_cast<int>(std::lround(25.0F * particle_density_)));
+    const int spark_count = std::max(1, static_cast<int>(std::lround(14.0F * particle_density_)));
     for (int index = 0; index < spark_count; ++index)
     {
         const float angle = random01() * std::numbers::pi_v<float> * 2.0F;
@@ -1498,17 +2140,42 @@ void WorldPreviewRenderer::spawn_blaster_impact(const world::BlockBreakUpdate &i
         particle.velocity = {std::cos(angle) * horizontal + normal.x * 2.0F,
                              1.0F + random01() * 4.0F + normal.y * 2.0F,
                              std::sin(angle) * horizontal + normal.z * 2.0F};
-        particle.lifetime = std::max(0.08F, random01() * 2.0F);
-        particle.size = 0.01F + random01() * 0.04F;
-        particle.end_size = 0.05F + random01() * 0.15F;
+        particle.lifetime = 0.18F + random01() * 0.32F;
+        particle.size = 0.025F + random01() * 0.025F;
+        particle.end_size = 0.008F;
+        particle.tint = tint;
         mining_particles_.push_back(particle);
     }
-    spawn_impact_smoke(impact.intersection, {1.0F, 1.0F, 1.0F});
+    // A laser cuts chips and a brief vapour plume from the struck surface.
+    // These are impact particles, not an explosive block-destruction event.
+    for (int index = 0; index < 9; ++index)
+    {
+        MiningParticle particle;
+        particle.kind = index < 6 ? ParticleKind::rock : ParticleKind::impact_smoke;
+        particle.position = {impact.intersection.x + normal.x*0.10F,
+                             impact.intersection.y + normal.y*0.10F,
+                             impact.intersection.z + normal.z*0.10F};
+        particle.velocity = {normal.x*1.2F + (random01()-0.5F)*1.4F,
+                             0.7F + random01()*1.2F + normal.y,
+                             normal.z*1.2F + (random01()-0.5F)*1.4F};
+        particle.block = impact.block;
+        particle.tile = world::atlas_tile(impact.block, world::FaceDirection::positive_y);
+        particle.lifetime = index < 6 ? 0.65F : 0.75F;
+        particle.size = index < 6 ? 0.035F + random01()*0.045F : 0.16F;
+        particle.end_size = index < 6 ? particle.size : 0.65F;
+        particle.opacity = index < 6 ? 1.0F : 0.65F;
+        particle.tint = {0.60F, 0.62F, 0.65F};
+        mining_particles_.push_back(particle);
+    }
     stats_.mining_particle_count = mining_particles_.size();
 }
 
 void WorldPreviewRenderer::spawn_flash_effect(world::Vec3 position, std::array<float, 3> tint)
 {
+    // Enhanced presentation: a shot landing on the dragon. (The fireball's own
+    // detonation never reaches this function there.)
+    if (combat_vfx_dragon_hit(position))
+        return;
     const auto random01 = [&]() {
         effect_random_state_ ^= effect_random_state_ << 13U;
         effect_random_state_ ^= effect_random_state_ >> 17U;
@@ -1525,9 +2192,9 @@ void WorldPreviewRenderer::spawn_flash_effect(world::Vec3 position, std::array<f
         particle.position = position;
         particle.velocity = {random01() * 2.0F - 1.0F, random01() * 2.0F - 1.0F,
                              random01() * 2.0F - 1.0F};
-        particle.lifetime = 1.0F;
-        particle.size = (3.0F + random01() * 3.0F) * 0.5F;
-        particle.end_size = (20.0F + random01() * 30.0F) * 0.5F;
+        particle.lifetime = 0.22F;
+        particle.size = 0.45F + random01() * 0.35F;
+        particle.end_size = 1.4F + random01() * 0.8F;
         particle.rotation = random01() * 360.0F;
         particle.tint = tint;
         mining_particles_.push_back(particle);
@@ -1536,8 +2203,19 @@ void WorldPreviewRenderer::spawn_flash_effect(world::Vec3 position, std::array<f
 }
 
 void WorldPreviewRenderer::spawn_fireball_explosion(world::Vec3 position, bool ice,
-                                                    bool rock_chunks)
+                                                    bool rock_chunks, ExplosionStyle style)
 {
+    // Enhanced presentation: TNT, C4, grenades and rockets each have their own
+    // sequence in the effects layer (world_preview_vfx.cpp). A dragon's
+    // fireball, and every style in the Original presentation, keeps the recipe
+    // below.
+    if (vfx_spawn_explosion(position, style, rock_chunks))
+        return;
+    // Enhanced presentation, a dragon's fireball: that same explosion at a
+    // dragon's size (or the ice dragon's burst), a rain of embers and ground
+    // left burning or frosted (world_preview_combat_vfx.cpp).
+    if (combat_vfx_fireball_detonation(position, ice, rock_chunks, style))
+        return;
     const auto random01 = [&]() {
         effect_random_state_ ^= effect_random_state_ << 13U;
         effect_random_state_ ^= effect_random_state_ >> 17U;
@@ -1545,46 +2223,75 @@ void WorldPreviewRenderer::spawn_fireball_explosion(world::Vec3 position, bool i
         return static_cast<float>(effect_random_state_ & 0x00FFFFFFU) /
                static_cast<float>(0x00FFFFFFU);
     };
-    // Detonate: FlashEffect + FirePuff + BigSmokePuff + BigRockBlast, one each.
+    // A fast expanding burst, rolling secondary flames, sparks, then a longer
+    // smoke plume. Laser excavation never calls this explosion recipe.
     const std::array<float, 3> fire_tint =
         ice ? std::array<float, 3>{0.65F, 0.85F, 1.0F} : std::array<float, 3>{1.0F, 1.0F, 1.0F};
     spawn_flash_effect(position, fire_tint);
-    // FirePuff: 50/s for 2 seconds, life 3s (variation 1), rises 0-3.
+    for (int index = 0; index < 18; ++index)
+    {
+        const bool smoke = index >= 10;
+        MiningParticle particle;
+        particle.kind = smoke ? ParticleKind::smoke : ice ? ParticleKind::ice_soft : ParticleKind::fire_soft;
+        const float angle = random01() * 6.2831853F;
+        const float speed = smoke ? 1.5F + random01()*2.0F : 3.0F + random01()*5.0F;
+        particle.position = {position.x, position.y + 0.25F, position.z};
+        particle.velocity = {std::cos(angle)*speed, 1.5F+random01()*3.0F, std::sin(angle)*speed};
+        particle.lifetime = smoke ? 4.0F+random01()*1.5F : 0.8F+random01()*0.7F;
+        particle.size = smoke ? 0.9F : 1.0F+random01();
+        particle.end_size = smoke ? 4.5F+random01()*2.0F : 3.0F+random01()*2.5F;
+        particle.tint = smoke ? (ice ? std::array<float,3>{0.36F,0.46F,0.60F} : std::array<float,3>{0.34F,0.32F,0.30F}) : fire_tint;
+        mining_particles_.push_back(particle);
+    }
+    for (int index = 0; index < 36; ++index)
+    {
+        MiningParticle particle;
+        particle.kind = ParticleKind::spark;
+        particle.position = position;
+        const float angle = random01()*6.2831853F, speed = 4.0F+random01()*12.0F;
+        particle.velocity = {std::cos(angle)*speed, 3.0F+random01()*10.0F, std::sin(angle)*speed};
+        particle.lifetime = 0.45F+random01()*0.9F;
+        particle.size = 0.03F+random01()*0.04F;
+        particle.end_size = 0.006F;
+        particle.tint = ice ? std::array<float,3>{0.12F,0.6F,1.0F} : std::array<float,3>{1.0F,0.38F,0.055F};
+        mining_particles_.push_back(particle);
+    }
     EffectEmitter fire_puff;
     fire_puff.kind = ice ? ParticleKind::ice_soft : ParticleKind::fire_soft;
     fire_puff.position = position;
-    fire_puff.rate = 50.0F * particle_density_;
-    fire_puff.time_left = 2.0F;
-    fire_puff.life_base = 3.0F;
-    fire_puff.life_variation = 1.0F;
+    fire_puff.rate = 36.0F * particle_density_;
+    fire_puff.time_left = 0.65F;
+    fire_puff.life_base = 1.6F;
+    fire_puff.life_variation = 0.3F;
     fire_puff.horizontal_min = 0.0F;
-    fire_puff.horizontal_max = 2.0F;
+    fire_puff.horizontal_max = 3.0F;
     fire_puff.vertical_min = 0.0F;
     fire_puff.vertical_max = 3.0F;
-    fire_puff.start_min = 0.0F;
-    fire_puff.start_max = 1.0F;
-    fire_puff.end_min = 0.5F;
-    fire_puff.end_max = 7.5F;
+    fire_puff.start_min = 0.6F;
+    fire_puff.start_max = 1.3F;
+    fire_puff.end_min = 2.0F;
+    fire_puff.end_max = 4.0F;
     fire_puff.rotate_min = -0.5F * 57.29578F;
     fire_puff.rotate_max = 0.5F * 57.29578F;
     fire_puff.tint = fire_tint;
     effect_emitters_.push_back(fire_puff);
-    // BigSmokePuff: 10/s for 3 seconds, life 5s (variation 1), drifts 0-5.
+    // Smoke outlives the fire, expands with drag and keeps readable billows.
     EffectEmitter big_smoke;
     big_smoke.kind = ParticleKind::smoke;
     big_smoke.position = position;
-    big_smoke.rate = 10.0F * particle_density_;
-    big_smoke.time_left = 3.0F;
-    big_smoke.life_base = 5.0F;
-    big_smoke.life_variation = 1.0F;
+    big_smoke.rate = 16.0F * particle_density_;
+    big_smoke.time_left = 1.0F;
+    big_smoke.life_base = 5.5F;
+    big_smoke.life_variation = 0.25F;
     big_smoke.horizontal_min = 0.0F;
-    big_smoke.horizontal_max = 5.0F;
+    big_smoke.horizontal_max = 1.7F;
     big_smoke.vertical_min = 0.0F;
-    big_smoke.vertical_max = 5.0F;
-    big_smoke.start_min = 2.5F;
-    big_smoke.start_max = 5.0F;
-    big_smoke.end_min = 10.0F;
-    big_smoke.end_max = 25.0F;
+    big_smoke.vertical_max = 2.5F;
+    big_smoke.start_min = 0.8F;
+    big_smoke.start_max = 1.4F;
+    big_smoke.end_min = 3.5F;
+    big_smoke.end_max = 6.0F;
+    big_smoke.tint = ice ? std::array<float, 3>{0.36F, 0.46F, 0.60F} : std::array<float, 3>{0.34F, 0.32F, 0.30F};
     effect_emitters_.push_back(big_smoke);
     // BigRockBlast: 2000/s for 0.05s, shrapnel at 1-60 units/s under gravity,
     // warm 255,200,128..white tint. Scaled by the particle-density setting.
@@ -1606,6 +2313,8 @@ void WorldPreviewRenderer::spawn_fireball_explosion(world::Vec3 position, bool i
         particle.angular_velocity = random01() * 20.0F * 57.29578F;
         const float mix = random01();
         particle.tint = {1.0F, (200.0F + 55.0F * mix) / 255.0F, (128.0F + 127.0F * mix) / 255.0F};
+        if (ice)
+            particle.tint = {0.15F, 0.55F + 0.3F * mix, 1.0F};
         mining_particles_.push_back(particle);
     }
     stats_.mining_particle_count = mining_particles_.size();
@@ -1656,6 +2365,13 @@ void WorldPreviewRenderer::update_effect_emitters(float delta)
 
 void WorldPreviewRenderer::emit_fireball_trails(float delta)
 {
+    // Enhanced presentation: a fireball in flight is one effect that follows
+    // it (combat_vfx_update), not a trail of the older particles.
+    if (enhanced_effects_)
+    {
+        fireball_trails_.clear();
+        return;
+    }
     const auto random01 = [&]() {
         effect_random_state_ ^= effect_random_state_ << 13U;
         effect_random_state_ ^= effect_random_state_ >> 17U;
@@ -1669,73 +2385,55 @@ void WorldPreviewRenderer::emit_fireball_trails(float delta)
     {
         FireballTrailState &state = fireball_trails_[fireball.id];
         state.seen = true;
+        if (!state.initialized)
+            state.previous = fireball.position;
+        state.initialized = true;
+        const auto trail_point = [&](float remainder, float rate) {
+            const float fraction = std::clamp(1.0F - remainder / std::max(rate * delta, 0.0001F), 0.0F, 1.0F);
+            return world::Vec3{std::lerp(state.previous.x, fireball.position.x, fraction),
+                               std::lerp(state.previous.y, fireball.position.y, fraction),
+                               std::lerp(state.previous.z, fireball.position.z, fraction)};
+        };
         const std::array<float, 3> fire_tint = fireball.ice
                                                    ? std::array<float, 3>{0.65F, 0.85F, 1.0F}
                                                    : std::array<float, 3>{1.0F, 1.0F, 1.0F};
-        // FireTrail: 50/s, life 0-1s, shrinks from up to 7.5 to nothing.
-        state.fire += 50.0F * particle_density_ * delta;
+        // Connected hot wake with guaranteed readable lifetimes.
+        state.fire += 128.0F * particle_density_ * delta;
         while (state.fire >= 1.0F)
         {
             state.fire -= 1.0F;
             MiningParticle particle;
-            particle.kind = ParticleKind::fire_soft;
-            particle.position = fireball.position;
-            particle.lifetime = std::max(0.1F, 1.0F * (1.0F - random01()));
-            particle.size = (1.0F + random01() * 14.0F) * 0.5F * 0.35F;
-            particle.end_size = 0.0F;
+            particle.kind = fireball.ice ? ParticleKind::ice_soft : ParticleKind::fire_soft;
+            particle.position = trail_point(state.fire, 128.0F * particle_density_);
+            particle.position.x += (random01()-0.5F)*0.18F;
+            particle.position.y += (random01()-0.5F)*0.18F;
+            particle.position.z += (random01()-0.5F)*0.18F;
+            particle.lifetime = 0.35F + random01()*0.35F;
+            particle.size = 0.7F + random01()*0.5F;
+            particle.end_size = 1.2F + random01()*0.6F;
+            particle.velocity = {0, 0.6F, 0};
             particle.rotation = random01() * 360.0F;
             particle.angular_velocity = (random01() * 4.0F - 2.0F) * 57.29578F;
             particle.tint = fire_tint;
             mining_particles_.push_back(particle);
         }
-        // SmokeTrail: 50/s, life 0-3s, grows to ~7.
-        state.smoke += 50.0F * particle_density_ * delta;
+        // Cool smoke remains behind the hot wake.
+        state.smoke += 30.0F * particle_density_ * delta;
         while (state.smoke >= 1.0F)
         {
             state.smoke -= 1.0F;
             MiningParticle particle;
             particle.kind = ParticleKind::smoke;
-            particle.position = fireball.position;
-            particle.lifetime = std::max(0.15F, 3.0F * (1.0F - random01()));
-            particle.size = random01() * 1.5F * 0.35F;
-            particle.end_size = (6.5F + random01() * 1.0F) * 0.35F;
+            particle.position = trail_point(state.smoke, 30.0F * particle_density_);
+            particle.lifetime = 1.5F + random01()*0.8F;
+            particle.size = 0.45F + random01()*0.3F;
+            particle.end_size = 1.4F + random01()*0.7F;
             particle.rotation = random01() * 360.0F;
-            particle.tint = {0.75F, 0.75F, 0.75F};
+            particle.tint = fireball.ice ? std::array<float,3>{0.4F,0.5F,0.65F} : std::array<float,3>{0.32F,0.30F,0.28F};
             mining_particles_.push_back(particle);
         }
-        // FireGlow + FireBallEffect are LocalSpace: they ride the fireball, so
-        // the particles inherit its velocity.
-        state.glow += 10.0F * particle_density_ * delta;
-        while (state.glow >= 1.0F)
-        {
-            state.glow -= 1.0F;
-            MiningParticle particle;
-            particle.kind = ParticleKind::flash;
-            particle.position = fireball.position;
-            particle.velocity = fireball.velocity;
-            particle.lifetime = 1.0F;
-            particle.size = (6.0F + random01() * 6.0F) * 0.5F * 0.35F;
-            particle.end_size = (10.0F + random01() * 20.0F) * 0.5F * 0.35F;
-            particle.rotation = random01() * 360.0F;
-            particle.tint = fire_tint;
-            mining_particles_.push_back(particle);
-        }
-        state.ball += 10.0F * particle_density_ * delta;
-        while (state.ball >= 1.0F)
-        {
-            state.ball -= 1.0F;
-            MiningParticle particle;
-            particle.kind = ParticleKind::fire_soft;
-            particle.position = fireball.position;
-            particle.velocity = fireball.velocity;
-            particle.lifetime = 1.0F;
-            particle.size = (3.0F + random01() * 2.0F) * 0.5F * 0.35F;
-            particle.end_size = (5.0F + random01() * 15.0F) * 0.5F * 0.35F;
-            particle.rotation = random01() * 360.0F;
-            particle.angular_velocity = (random01() * 4.0F - 2.0F) * 57.29578F;
-            particle.tint = fire_tint;
-            mining_particles_.push_back(particle);
-        }
+
+        state.previous = fireball.position;
     }
     std::erase_if(fireball_trails_, [](const auto &entry) { return !entry.second.seen; });
     stats_.mining_particle_count = mining_particles_.size();
@@ -1876,6 +2574,36 @@ void WorldPreviewRenderer::set_remote_players(
     visible_remote_players_ = players;
 }
 
+void WorldPreviewRenderer::forget_remote_player(std::uint8_t gid) noexcept
+{
+    if (avatar_viewmodel_ != nullptr)
+        avatar_viewmodel_->forget_world_player(gid);
+}
+
+void WorldPreviewRenderer::clear_player_animations() noexcept
+{
+    if (avatar_viewmodel_ != nullptr)
+        avatar_viewmodel_->clear_world_players();
+}
+
+void WorldPreviewRenderer::set_player_avatar(std::uint16_t gid,
+                                             std::shared_ptr<const xbox_avatar::Skin> skin)
+{
+    if (avatar_viewmodel_ != nullptr)
+        avatar_viewmodel_->set_player_skin(gid, std::move(skin));
+}
+
+bool WorldPreviewRenderer::player_avatar_applied(std::uint16_t gid) const noexcept
+{
+    return avatar_viewmodel_ != nullptr && avatar_viewmodel_->player_skin_applied(gid);
+}
+
+void WorldPreviewRenderer::finish_player_avatars()
+{
+    if (avatar_viewmodel_ != nullptr)
+        avatar_viewmodel_->pump_skin_uploads(true);
+}
+
 void WorldPreviewRenderer::set_dragon(const world::Dragon *dragon) noexcept
 {
     visible_dragon_ = dragon;
@@ -1919,6 +2647,7 @@ void WorldPreviewRenderer::set_network_pickups_enabled(bool enabled,
     if (!enabled)
     {
         spawned_network_pickups_.clear();
+        deferred_pickups_.clear();
         for (BlockPickup &pickup : block_pickups_)
         {
             pickup.pickup_id.reset();
@@ -1932,9 +2661,21 @@ bool WorldPreviewRenderer::register_spawned_network_pickup(BlockPickup &pickup, 
 {
     if (!network_pickups_enabled_)
         return true;
-    if (local_pickup_spawner_id_ < 0 || local_pickup_spawner_id_ > 255 ||
-        block_pickups_.size() >= 1000U)
+    if (local_pickup_spawner_id_ < 0 || local_pickup_spawner_id_ > 255)
         return false;
+    // PickupManager.CreatePickup defers past the world bound instead of dropping
+    // the request. The caller has already debited the stack from an inventory, a
+    // crate or a mined block, so refusing it here destroys the item. False still
+    // means "do not add an entity now"; the queue owns the request until a slot
+    // frees up.
+    if (!deferred_pickups_.releasing() &&
+        world::PickupOverflowQueue<DeferredPickup>::at_capacity(block_pickups_.size()))
+    {
+        if (!deferred_pickups_.defer({pickup, dropped, false}))
+            std::cerr << "world.pickup.deferred-queue-full item="
+                      << static_cast<int>(pickup.item) << " count=" << pickup.count << '\n';
+        return false;
+    }
     if (next_local_pickup_id_ == std::numeric_limits<std::int32_t>::max())
         next_local_pickup_id_ = 0;
     while (std::ranges::any_of(block_pickups_, [&](const BlockPickup &existing) {
@@ -1977,9 +2718,14 @@ bool WorldPreviewRenderer::spawn_network_pickup(const InventoryStack &stack, wor
                                                 bool display_on_pickup)
 {
     if (!stack.valid() || pickup_id < 0 || spawner_id < 0 || spawner_id > 255 ||
-        block_pickups_.size() >= 1000U ||
-        std::ranges::any_of(block_pickups_, [&](const BlockPickup &pickup) {
-            return pickup.pickup_id == pickup_id && pickup.spawner_id == spawner_id;
+        std::ranges::any_of(block_pickups_,
+                            [&](const BlockPickup &existing) {
+                                return existing.pickup_id == pickup_id &&
+                                       existing.spawner_id == spawner_id;
+                            }) ||
+        deferred_pickups_.any([&](const DeferredPickup &waiting) {
+            return waiting.networked && waiting.pickup.pickup_id == pickup_id &&
+                   waiting.pickup.spawner_id == spawner_id;
         }))
         return false;
     BlockPickup pickup;
@@ -1993,14 +2739,39 @@ bool WorldPreviewRenderer::spawn_network_pickup(const InventoryStack &stack, wor
     pickup.waypoint = stack.waypoint;
     pickup.waypoint_name = stack.waypoint_name;
     pickup.waypoint_valid = stack.waypoint_valid;
+    pickup.mod_item = stack.mod_item; // Modding, visuals area
     pickup.pickup_id = pickup_id;
     pickup.spawner_id = spawner_id;
     pickup.ready_for_pickup = !dropped || spawner_id != local_pickup_spawner_id_;
     pickup.display_on_pickup = display_on_pickup;
     pickup.bounce_phase = 1.57079632679F;
+    // HandleCreatePickupMessage queues a remote create past the world bound too.
+    // Accepting it here keeps the sender's item alive instead of making the host
+    // refuse to relay a drop that has already left the sender's inventory.
+    if (!deferred_pickups_.releasing() &&
+        world::PickupOverflowQueue<DeferredPickup>::at_capacity(block_pickups_.size()))
+        return deferred_pickups_.defer({std::move(pickup), dropped, true});
     block_pickups_.push_back(std::move(pickup));
     stats_.block_pickup_count = block_pickups_.size();
     return true;
+}
+
+void WorldPreviewRenderer::release_deferred_pickups()
+{
+    if (deferred_pickups_.empty())
+        return;
+    deferred_pickups_.release(
+        block_pickups_.size(), [&](DeferredPickup &request) -> std::optional<std::size_t> {
+            // A networked request keeps the identity its sender assigned; a local
+            // one only earns its pickup id and CreatePickupMessage now, exactly as
+            // RemovePickup sends the queued message at release time.
+            if (!request.networked &&
+                !register_spawned_network_pickup(request.pickup, request.dropped))
+                return std::nullopt;
+            block_pickups_.push_back(std::move(request.pickup));
+            return block_pickups_.size();
+        });
+    stats_.block_pickup_count = block_pickups_.size();
 }
 
 std::optional<CollectedBlockStack> WorldPreviewRenderer::find_network_pickup(
@@ -2017,6 +2788,7 @@ std::optional<CollectedBlockStack> WorldPreviewRenderer::find_network_pickup(
     stack.waypoint = found->waypoint;
     stack.waypoint_name = found->waypoint_name;
     stack.waypoint_valid = found->waypoint_valid;
+    stack.mod_item = found->mod_item; // Modding, visuals area
     return CollectedBlockStack{std::move(stack), found->position, found->pickup_id,
                                found->spawner_id, found->display_on_pickup};
 }
@@ -2034,6 +2806,9 @@ std::optional<CollectedBlockStack> WorldPreviewRenderer::consume_network_pickup(
         return std::nullopt;
     block_pickups_.erase(found);
     stats_.block_pickup_count = block_pickups_.size();
+    // PickupManager.RemovePickup releases a queued request as soon as the entity
+    // it was waiting behind leaves the world.
+    release_deferred_pickups();
     return result;
 }
 
@@ -2080,7 +2855,12 @@ void WorldPreviewRenderer::spawn_dropped_stack_at(const InventoryStack &stack, w
     pickup.waypoint = stack.waypoint;
     pickup.waypoint_name = stack.waypoint_name;
     pickup.waypoint_valid = stack.waypoint_valid;
-    pickup.ready_for_pickup = false;
+    pickup.mod_item = stack.mod_item; // Modding, visuals area
+    // PickupEntity: `_readyForPickup = !dropped || sid != LocalPlayer.Gamer.Id`.
+    // CreateUpwardPickup always sends dropped: false, so enemy, dragon and
+    // crate loot can be collected at once; only a stack the local player threw
+    // (spawn_dropped_stack) waits until they have stepped two blocks away.
+    pickup.ready_for_pickup = true;
     pickup.bounce_phase = 1.57079632679F;
     if (!register_spawned_network_pickup(pickup, false))
         return;
@@ -2094,6 +2874,24 @@ void WorldPreviewRenderer::spawn_created_stack_at(const InventoryStack &stack, w
         return;
     BlockPickup pickup;
     pickup.position = position;
+    // PickupManager.CreateUpwardPickup(item, location, 1.5f), which every
+    // non-dropped CreatePickup goes through: a random sideways direction with a
+    // slight lift, normalized to 1.5 units a second. The vector travels in
+    // CreatePickupMessage, so every peer sees the same hop.
+    {
+        const auto roll = [&]() {
+            effect_random_state_ ^= effect_random_state_ << 13U;
+            effect_random_state_ ^= effect_random_state_ >> 17U;
+            effect_random_state_ ^= effect_random_state_ << 5U;
+            return static_cast<float>(effect_random_state_ & 0x00FFFFFFU) /
+                   static_cast<float>(0x01000000U);
+        };
+        world::Vec3 direction{-0.5F + 1.001F * roll(), 0.1F, -0.5F + 1.001F * roll()};
+        const float length = std::sqrt(direction.x * direction.x + direction.y * direction.y +
+                                       direction.z * direction.z);
+        pickup.velocity = {direction.x / length * 1.5F, direction.y / length * 1.5F,
+                           direction.z / length * 1.5F};
+    }
     pickup.item = stack.item;
     pickup.block = stack.block;
     pickup.count = stack.count;
@@ -2102,7 +2900,8 @@ void WorldPreviewRenderer::spawn_created_stack_at(const InventoryStack &stack, w
     pickup.waypoint = stack.waypoint;
     pickup.waypoint_name = stack.waypoint_name;
     pickup.waypoint_valid = stack.waypoint_valid;
-    pickup.ready_for_pickup = false;
+    pickup.mod_item = stack.mod_item; // Modding, visuals area
+    pickup.ready_for_pickup = true; // created with dropped: false, see above
     pickup.display_on_pickup = false;
     pickup.bounce_phase = 1.57079632679F;
     if (!register_spawned_network_pickup(pickup, false))
@@ -2127,7 +2926,8 @@ void WorldPreviewRenderer::spawn_loot_stack_at(const InventoryStack &stack, worl
     pickup.waypoint = stack.waypoint;
     pickup.waypoint_name = stack.waypoint_name;
     pickup.waypoint_valid = stack.waypoint_valid;
-    pickup.ready_for_pickup = false;
+    pickup.mod_item = stack.mod_item; // Modding, visuals area
+    pickup.ready_for_pickup = true; // created with dropped: false, see above
     pickup.display_on_pickup = true;
     pickup.bounce_phase = 1.57079632679F;
     if (!register_spawned_network_pickup(pickup, false))
@@ -2168,6 +2968,7 @@ void WorldPreviewRenderer::spawn_dropped_stack(const InventoryStack &stack,
     pickup.waypoint = stack.waypoint;
     pickup.waypoint_name = stack.waypoint_name;
     pickup.waypoint_valid = stack.waypoint_valid;
+    pickup.mod_item = stack.mod_item; // Modding, visuals area
     pickup.ready_for_pickup = false;
     pickup.bounce_phase = 1.57079632679F;
     if (!register_spawned_network_pickup(pickup, true))
@@ -2272,6 +3073,7 @@ void WorldPreviewRenderer::update_torch_props(float delta, world::Vec3 player_po
         effect_random_state_ ^= effect_random_state_ << 5U;
         return static_cast<float>(effect_random_state_ & 0xFFFFFFU) / 16777215.0F;
     };
+    vfx_torch_begin();
     for (TorchInstance &torch : torch_cache_)
     {
         const float dx = static_cast<float>(torch.x) + 0.5F - player_position.x;
@@ -2284,6 +3086,10 @@ void WorldPreviewRenderer::update_torch_props(float delta, world::Vec3 player_po
             static_cast<float>(torch.x) + 0.5F + placement.offset_x + flame_local.x,
             static_cast<float>(torch.y) + 0.5F + placement.offset_y + flame_local.y,
             static_cast<float>(torch.z) + 0.5F + placement.offset_z + flame_local.z};
+        // Enhanced presentation: a looping flame of the effects layer burns
+        // here instead of the TorchFire/TorchSmoke emitters below.
+        if (vfx_torch(torch.x, torch.y, torch.z, flame))
+            continue;
         torch.fire_accumulator += 10.0F * delta;
         while (torch.fire_accumulator >= 1.0F)
         {
@@ -2322,10 +3128,12 @@ void WorldPreviewRenderer::update_torch_props(float delta, world::Vec3 player_po
             mining_particles_.push_back(particle);
         }
     }
+    vfx_torch_end();
 }
 
 std::vector<CollectedBlockStack> WorldPreviewRenderer::update_effects(float delta_seconds,
-                                                                      world::Vec3 player_position)
+                                                                      world::Vec3 player_position,
+                                                                      bool player_alive)
 {
     const float delta = std::clamp(delta_seconds, 0.0F, 0.1F);
     for (auto &particle : mining_particles_)
@@ -2350,10 +3158,26 @@ std::vector<CollectedBlockStack> WorldPreviewRenderer::update_effects(float delt
                  particle.kind == ParticleKind::fire_soft ||
                  particle.kind == ParticleKind::ice_soft)
         {
-            // Flash/fire recipes keep their launch velocity (VelocityEnd 0).
+            // Expansion slows after the initial burst while hot gas rises.
+            if (particle.kind == ParticleKind::fire_soft || particle.kind == ParticleKind::ice_soft)
+            {
+                const float drag = std::exp(-delta*2.0F);
+                particle.velocity.x *= drag;
+                particle.velocity.z *= drag;
+                particle.velocity.y = std::lerp(particle.velocity.y, 1.2F, 1.0F-drag);
+            }
         }
         else
         {
+            if (particle.kind == ParticleKind::smoke || particle.kind == ParticleKind::torch_smoke ||
+                particle.kind == ParticleKind::impact_smoke)
+            {
+                // Buoyant plumes drift and roll instead of leaving stationary
+                // camera-facing stacks behind an extinguished fireball.
+                particle.velocity.y = std::min(2.2F, particle.velocity.y + delta * 0.65F);
+                particle.velocity.x += std::sin(particle.age * 2.1F + particle.position.z) * delta * 0.12F;
+                particle.velocity.z += std::cos(particle.age * 1.7F + particle.position.x) * delta * 0.12F;
+            }
             particle.velocity.x *= std::pow(0.3F, delta);
             particle.velocity.z *= std::pow(0.3F, delta);
         }
@@ -2362,61 +3186,17 @@ std::vector<CollectedBlockStack> WorldPreviewRenderer::update_effects(float delt
                   [](const MiningParticle &particle) { return particle.age >= particle.lifetime; });
     update_effect_emitters(delta);
     emit_fireball_trails(delta);
-    emit_rocket_and_fuse_trails(delta);
+    // Enhanced presentation: rocket exhaust and fuse smoke come from the
+    // effects layer, which this advances (world_preview_vfx.cpp).
+    if (!enhanced_effects_)
+        emit_rocket_and_fuse_trails(delta);
+    // Fireballs in flight, the dragon's breath and thrown grenades are effects
+    // that follow something: moved here, then advanced with the rest.
+    combat_vfx_update(delta, player_position);
+    vfx_update(delta, player_position);
     update_torch_props(delta, player_position);
 
     std::vector<CollectedBlockStack> collected;
-    const auto pickup_collides = [&](world::Vec3 center) {
-        constexpr float radius = 0.3F;
-        constexpr float inset = 0.0001F;
-        const int minimum_x = static_cast<int>(std::floor(center.x - radius + inset));
-        const int maximum_x = static_cast<int>(std::floor(center.x + radius - inset));
-        const int minimum_y = static_cast<int>(std::floor(center.y - radius + inset));
-        const int maximum_y = static_cast<int>(std::floor(center.y + radius - inset));
-        const int minimum_z = static_cast<int>(std::floor(center.z - radius + inset));
-        const int maximum_z = static_cast<int>(std::floor(center.z + radius - inset));
-        for (int z = minimum_z; z <= maximum_z; ++z)
-            for (int y = minimum_y; y <= maximum_y; ++y)
-                for (int x = minimum_x; x <= maximum_x; ++x)
-                    if (world::blocks_player(region_.block(x, y, z)))
-                        return true;
-        return false;
-    };
-    const auto pickup_axis = [](world::Vec3 &point, int axis) -> float & {
-        if (axis == 0)
-            return point.x;
-        if (axis == 1)
-            return point.y;
-        return point.z;
-    };
-    const auto move_pickup_axis = [&](world::Vec3 &position, float amount, int axis) {
-        if (std::abs(amount) <= 0.000001F)
-            return false;
-        world::Vec3 candidate = position;
-        pickup_axis(candidate, axis) += amount;
-        if (!pickup_collides(candidate))
-        {
-            position = candidate;
-            return false;
-        }
-        // BasicPhysics performs a swept AABB trace and slides along the collision plane. A short
-        // binary contact solve is equivalent at the fixed 60 Hz pickup speeds and avoids wall
-        // tunnelling without coupling pickup motion to the player's much taller collider.
-        float clear_fraction{};
-        float blocked_fraction = 1.0F;
-        for (int iteration = 0; iteration < 8; ++iteration)
-        {
-            const float middle = (clear_fraction + blocked_fraction) * 0.5F;
-            candidate = position;
-            pickup_axis(candidate, axis) += amount * middle;
-            if (pickup_collides(candidate))
-                blocked_fraction = middle;
-            else
-                clear_fraction = middle;
-        }
-        pickup_axis(position, axis) += amount * clear_fraction;
-        return true;
-    };
     for (auto &pickup : block_pickups_)
     {
         pickup.age += delta;
@@ -2448,29 +3228,33 @@ std::vector<CollectedBlockStack> WorldPreviewRenderer::update_effects(float delt
         }
         pickup.time_left -= delta;
         pickup.bounce_phase += delta * 1.5F;
-        pickup.velocity.y += world::PlayerSimulation::gravity * 0.25F * delta;
-        world::Vec3 next = pickup.position;
-        const bool hit_x = move_pickup_axis(next, pickup.velocity.x * delta, 0);
-        const bool hit_y = move_pickup_axis(next, pickup.velocity.y * delta, 1);
-        const bool hit_z = move_pickup_axis(next, pickup.velocity.z * delta, 2);
-        const bool on_ground = hit_y && pickup.velocity.y < 0.0F;
-        if (hit_x)
-            pickup.velocity.x = 0.0F;
-        if (hit_y)
-            pickup.velocity.y = 0.0F;
-        if (hit_z)
-            pickup.velocity.z = 0.0F;
-        pickup.velocity.x *= on_ground ? 0.9F : 0.99F;
-        pickup.velocity.z *= on_ground ? 0.9F : 0.99F;
-        if (std::abs(pickup.velocity.x) < 0.1F)
-            pickup.velocity.x = 0.0F;
-        if (std::abs(pickup.velocity.z) < 0.1F)
-            pickup.velocity.z = 0.0F;
-        pickup.position = next;
+        // PickupEntity for one frame: a quarter of gravity, the swept slide of
+        // its 0.6 box and the per-frame damping, exactly as the shipped client
+        // runs them (world::advance_pickup, compared by SimulationParityProbe).
+        const world::BoxSlide moved =
+            world::advance_pickup(region_, pickup.position, pickup.velocity, delta);
+        pickup.velocity = moved.velocity;
+        pickup.position = moved.position;
+        // PickupEntity.OnUpdate, after the frame's move:
+        //     if (!BlockTerrain.Instance.RegionIsLoaded(LocalPosition))
+        //         { LocalVelocity = WorldVelocity = Zero; Visible = false; }
+        // A pickup outside the terrain this peer holds is parked where it is
+        // (it keeps only one frame of quarter gravity) until its timer ends or
+        // the player comes back, instead of falling out of the world.
+        if (!region_loaded(pickup.position.x, pickup.position.z))
+            pickup.velocity = {};
         const float dx = pickup.position.x - player_position.x;
         const float dy = pickup.position.y - (player_position.y + 1.0F);
         const float dz = pickup.position.z - player_position.z;
         const float distance_squared = dx * dx + dy * dy + dz * dz;
+        // PickupEntity.OnUpdate: while the local player is not a living gamer
+        // every pickup becomes ready and none is collected; a corpse does not
+        // hoover up what it dropped.
+        if (!player_alive)
+        {
+            pickup.ready_for_pickup = true;
+            continue;
+        }
         if (!pickup.ready_for_pickup && distance_squared > 4.0F)
             pickup.ready_for_pickup = true;
         if (pickup.ready_for_pickup && !pickup.request_pending && distance_squared < 4.0F)
@@ -2481,6 +3265,7 @@ std::vector<CollectedBlockStack> WorldPreviewRenderer::update_effects(float delt
             stack.waypoint = pickup.waypoint;
             stack.waypoint_name = pickup.waypoint_name;
             stack.waypoint_valid = pickup.waypoint_valid;
+            stack.mod_item = pickup.mod_item; // Modding, visuals area
             collected.push_back({stack, pickup.position, pickup.pickup_id, pickup.spawner_id,
                                  pickup.display_on_pickup});
             if (pickup.pickup_id.has_value())
@@ -2492,10 +3277,13 @@ std::vector<CollectedBlockStack> WorldPreviewRenderer::update_effects(float delt
             pickup.velocity = {};
             pickup.flying_to_player = true;
             pickup.fly_speed = 0.0F;
+            // Enhanced presentation: it winks as it is taken.
+            combat_vfx_pickup_collected(pickup.position);
         }
     }
     std::erase_if(block_pickups_,
                   [](const BlockPickup &pickup) { return pickup.time_left <= 0.0F; });
+    release_deferred_pickups();
     stats_.mining_particle_count = mining_particles_.size();
     stats_.block_pickup_count = block_pickups_.size();
     return collected;
@@ -2520,25 +3308,24 @@ void WorldPreviewRenderer::set_biome(int index)
 {
     const world::BiomeKind selected = preview_biome(index);
     discard_pending_stream();
+    focus_chunk_x_ = preview_biome_center_chunk(selected);
+    focus_chunk_z_ = 0;
+    simulation_window_.center_on(static_cast<float>(focus_chunk_x_ * world::chunk_width), 0.0F);
     auto immediate = generator_.generate_region(preview_biome_origin(selected, 4), -2, 4, 4);
     install_region(std::move(immediate), selected);
-
-    world::WorldRegion current = region_;
-    const world::WorldGenerator generator = generator_;
-    const int target_span = active_span_;
-    const int target_origin_x = preview_biome_origin(selected, target_span);
-    stream_job_ = std::async(std::launch::async, [generator, current = std::move(current),
-                                                  target_origin_x, target_span]() mutable {
-        return generator.stream_region(current, target_origin_x, -target_span / 2, target_span,
-                                       target_span);
-    });
-    stream_job_active_ = true;
-    pending_biome_ = selected;
-    stats_.stream_pending = true;
+    begin_stream_to_simulation_window(selected);
 }
 
 std::string_view WorldPreviewRenderer::biome_name() const noexcept
 {
+    // mod-world: a mod biome's own name.
+    if (const auto &terrain = generator_.custom_terrain(); terrain != nullptr)
+    {
+        const world::TerrainBiome &biome = terrain->definition().biomes[terrain->biome_at(
+            generator_, focus_chunk_x_ * world::chunk_width + 8, focus_chunk_z_ * world::chunk_depth + 8)];
+        if (biome.retail == world::RetailReuse::none)
+            return biome.name;
+    }
     switch (biome_)
     {
     case world::BiomeKind::classic:
@@ -2562,20 +3349,26 @@ world::BiomeKind WorldPreviewRenderer::biome() const noexcept
     return biome_;
 }
 
+// The middle of what is drawn: the corner of the focus chunk, which is where
+// the middle of the streamed window always was. (The resident window is the
+// original's and is deliberately not centred on a chunk corner.)
 int WorldPreviewRenderer::center_x() const noexcept
 {
-    return (region_.minimum_x() + region_.maximum_x() + 1) / 2;
+    return focus_chunk_x_ * world::chunk_width;
 }
 
 int WorldPreviewRenderer::center_z() const noexcept
 {
-    return (region_.minimum_z() + region_.maximum_z() + 1) / 2;
+    return focus_chunk_z_ * world::chunk_depth;
 }
 
 void WorldPreviewRenderer::load_original_atlas()
 {
     stats_.atlas_path = derived_atlas_path();
-    SDL_Surface *surface = SDL_LoadBMP(stats_.atlas_path.string().c_str());
+    // (Graphics area) a texture pack's tiles are written over the pack's own;
+    // without one this is SDL_LoadBMP alone.
+    SDL_Surface *surface =
+        apply_atlas_overrides(SDL_LoadBMP(stats_.atlas_path.string().c_str()), AtlasLayer::diffuse);
     if (surface == nullptr)
     {
         return;
@@ -2590,7 +3383,13 @@ void WorldPreviewRenderer::load_original_atlas()
 
     const auto load_material_atlas = [this](std::string_view name) {
         const auto path = stats_.atlas_path.parent_path() / std::string{name};
-        SDL_Surface *material_surface = SDL_LoadBMP(path.string().c_str());
+        // (Graphics area) a texture pack may replace a particle sprite, and
+        // tiles of the two material atlases.
+        SDL_Surface *material_surface = load_content_surface(path, ContentKind::particles);
+        if (name == "terrain_normal_spec.bmp")
+            material_surface = apply_atlas_overrides(material_surface, AtlasLayer::normal_spec);
+        else if (name == "terrain_metal_light.bmp")
+            material_surface = apply_atlas_overrides(material_surface, AtlasLayer::metal_light);
         if (material_surface == nullptr)
         {
             return static_cast<SDL_Texture *>(nullptr);
@@ -2670,7 +3469,7 @@ void WorldPreviewRenderer::load_original_atlas()
 
     const auto load_sky = [this](std::string_view name) {
         const auto path = stats_.atlas_path.parent_path() / std::string{name};
-        SDL_Surface *sky_surface = SDL_LoadBMP(path.string().c_str());
+        SDL_Surface *sky_surface = load_content_surface(path, ContentKind::sky);
         if (sky_surface == nullptr)
         {
             return static_cast<SDL_Texture *>(nullptr);
@@ -2704,21 +3503,166 @@ void WorldPreviewRenderer::load_original_atlas()
                                    complete(sunset_sky_) && complete(night_sky_);
 }
 
-void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkyState &sky,
+void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkyState &scene_sky,
                                 const world::PlayerState &player, float vertical_fov_degrees,
                                 float elapsed_seconds, float render_scale, float camera_bob,
                                 float screen_shake, float viewmodel_fov_degrees,
                                 bool rebirth_presentation, bool reduced_motion, bool inspector_view,
                                 bool ambient_occlusion, bool ore_glow, float shadow_strength)
 {
+    // Enhanced only: once the sun is down the moon is the frame's light. Its
+    // direction and a dim, cool colour stand in for the sun's in everything
+    // drawn below (terrain, shadows, creatures, the first-person body, the air),
+    // so a night has shape and moon shadows instead of one flat darkness. The
+    // swap happens while both lights are at zero, so nothing pops. Presentation
+    // only: the world clock and every rule that reads it are untouched, and the
+    // Original presentation keeps its night exactly.
+    world::SkyState sky = scene_sky;
+    float moonlight{};
+    if (rebirth_presentation && post_effects_.enabled && !inspector_view)
+    {
+        const std::array<float, 3> moon = post::moon_direction(sky.sun_x, sky.sun_y, sky.sun_z);
+        moonlight = post::moonlight(sky.sun_y, moon[1]) * (1.0F - std::clamp(sky.hell, 0.0F, 1.0F));
+        if (moonlight > 0.0F)
+        {
+            sky.sun_x = moon[0];
+            sky.sun_y = moon[1];
+            sky.sun_z = moon[2];
+            sky.direct = {0.085F * moonlight, 0.120F * moonlight, 0.200F * moonlight};
+            sky.specular = {0.045F * moonlight, 0.065F * moonlight, 0.110F * moonlight};
+        }
+    }
+    // Particles and pickups advance on the fixed simulation tick, while the
+    // camera is drawn part-way between two ticks. For the length of this draw,
+    // move them back along their own motion by the same amount so nothing
+    // steps against the smoothly moving view. The simulated values are put
+    // back exactly (saved, not recomputed) before update_effects() runs again.
+    struct MotionState final
+    {
+        world::Vec3 position{};
+        float rotation{};
+        float phase{};
+    };
+    struct SimulatedEffects final
+    {
+        std::vector<MiningParticle> &particles;
+        std::vector<BlockPickup> &pickups;
+        std::vector<MotionState> saved_particles;
+        std::vector<MotionState> saved_pickups;
+
+        ~SimulatedEffects()
+        {
+            const std::size_t particle_count = std::min(saved_particles.size(), particles.size());
+            for (std::size_t index = 0U; index < particle_count; ++index)
+            {
+                particles[index].position = saved_particles[index].position;
+                particles[index].rotation = saved_particles[index].rotation;
+                particles[index].age = saved_particles[index].phase;
+            }
+            const std::size_t pickup_count = std::min(saved_pickups.size(), pickups.size());
+            for (std::size_t index = 0U; index < pickup_count; ++index)
+            {
+                pickups[index].position = saved_pickups[index].position;
+                pickups[index].rotation = saved_pickups[index].rotation;
+                pickups[index].bounce_phase = saved_pickups[index].phase;
+            }
+        }
+    } simulated_effects{mining_particles_, block_pickups_, {}, {}};
+    if (presentation_lag_seconds_ > 0.0F)
+    {
+        simulated_effects.saved_particles.reserve(mining_particles_.size());
+        for (MiningParticle &particle : mining_particles_)
+        {
+            simulated_effects.saved_particles.push_back(
+                {particle.position, particle.rotation, particle.age});
+            // Never further back than the particle has existed.
+            const float lag = std::min(presentation_lag_seconds_, std::max(particle.age, 0.0F));
+            particle.position.x -= particle.velocity.x * lag;
+            particle.position.y -= particle.velocity.y * lag;
+            particle.position.z -= particle.velocity.z * lag;
+            particle.rotation -= particle.angular_velocity * lag;
+            particle.age -= lag;
+        }
+        simulated_effects.saved_pickups.reserve(block_pickups_.size());
+        for (BlockPickup &pickup : block_pickups_)
+        {
+            simulated_effects.saved_pickups.push_back(
+                {pickup.position, pickup.rotation, pickup.bounce_phase});
+            const float lag = std::min(presentation_lag_seconds_, std::max(pickup.age, 0.0F));
+            pickup.rotation -= lag;
+            if (pickup.flying_to_player)
+                continue;
+            pickup.position.x -= pickup.velocity.x * lag;
+            pickup.position.y -= pickup.velocity.y * lag;
+            pickup.position.z -= pickup.velocity.z * lag;
+            pickup.bounce_phase -= 1.5F * lag;
+        }
+    }
     world::PlayerState render_player = player;
     render_player.clock_time_of_day = sky.time_of_day;
     render_player.position.y += player.step_view_offset;
+    // Xbox-avatar skins: a slice of any pending texture upload, and the release
+    // of textures no draw can name any more, before this frame's batches.
+    if (avatar_viewmodel_ != nullptr)
+        avatar_viewmodel_->pump_skin_uploads();
+    EntityBatch local_body;
+    if (avatar_viewmodel_ != nullptr && avatar_viewmodel_->world_animation_ready())
+    {
+        if (player.dead)
+        {
+            const world::Vec3 light_position{player.position.x, player.position.y + 1.0F,
+                                             player.position.z};
+            world::Vec3 eye{player.position.x,
+                            player.position.y + world::PlayerSimulation::eye_height,
+                            player.position.z};
+            world::Vec3 head_forward{std::sin(player.yaw), 0, -std::cos(player.yaw)};
+            // Which clip plays when is world::PlayerAnimator's (the port of
+            // Player.UpdateAnimation); the rig poses from exactly this list.
+            if (player.animation_valid)
+                avatar_viewmodel_->set_world_player_animation(256U, player.animation);
+            avatar_viewmodel_->append_world_player(
+                local_body, 256U, static_cast<InventoryItemId>(player.selected_item_id),
+                player.position, player.yaw, 0.0F, player.death_animation_seconds, 0.0F, 0.0F,
+                item_player_animation_mode(static_cast<InventoryItemId>(player.selected_item_id)),
+                false, true, false, false, false, false,
+                local_actor_sky_light(region_, light_position),
+                local_emissive_light(region_, light_position), atlas_, sky, rebirth_presentation,
+                false, true, &eye, &head_forward, held_mod_item_.get()); // (Items)
+            // Follow the same animated head for both rigs. Keep the head hidden
+            // and sweep the camera displacement so falling beside a wall cannot
+            // put the eye through it.
+            const world::Vec3 standing{player.position.x,
+                player.position.y + world::PlayerSimulation::eye_height, player.position.z};
+            world::Vec3 direction{eye.x - standing.x, eye.y - standing.y, eye.z - standing.z};
+            const float travel = std::sqrt(direction.x*direction.x + direction.y*direction.y + direction.z*direction.z);
+            if (travel > 0.001F)
+            {
+                direction = {direction.x/travel, direction.y/travel, direction.z/travel};
+                if (const auto hit = world::PlayerSimulation::raycast_blocking(region_, standing, direction, travel))
+                {
+                    const float allowed = std::max(0.0F, hit->distance - 0.12F);
+                    eye = {standing.x + direction.x*allowed, standing.y + direction.y*allowed,
+                           standing.z + direction.z*allowed};
+                }
+            }
+            render_player.position = {eye.x, eye.y - world::PlayerSimulation::eye_height, eye.z};
+            const float head_length = std::sqrt(head_forward.x*head_forward.x + head_forward.y*head_forward.y + head_forward.z*head_forward.z);
+            if (head_length > 0.001F)
+            {
+                render_player.yaw = std::atan2(head_forward.x, -head_forward.z);
+                render_player.pitch = std::asin(std::clamp(head_forward.y/head_length, -0.995F, 0.995F));
+            }
+            if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_DEATH_CAMERA") != nullptr)
+                SDL_Log("death.camera seconds=%.3f eye=%.3f,%.3f,%.3f yaw=%.3f pitch=%.3f", player.death_animation_seconds, eye.x, eye.y, eye.z, render_player.yaw, render_player.pitch);
+        }
+        else
+            avatar_viewmodel_->forget_world_player(256U);
+    }
     const float horizontal_speed =
         std::sqrt(player.velocity.x * player.velocity.x + player.velocity.z * player.velocity.z);
     const float motion_amount =
-        !inspector_view && !reduced_motion && player.grounded
-            ? std::clamp(horizontal_speed / world::PlayerSimulation::movement_speed, 0.0F, 1.0F) *
+        !player.dead && !inspector_view && !reduced_motion && player.grounded
+            ? std::clamp(horizontal_speed / world::PlayerSimulation::ground_run_speed, 0.0F, 1.0F) *
                   std::clamp(camera_bob, 0.0F, 1.0F)
             : 0.0F;
     if (motion_amount > 0.0F)
@@ -2740,9 +3684,78 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
         render_player.yaw += std::sin(progress * std::numbers::pi_v<float> * 2.0F) * strength *
                              (pistol ? 0.0045F : 0.0015F);
     }
-    draw_sky(
-        metrics, sky, elapsed_seconds, reduced_motion, inspector_view ? 0.0F : render_player.yaw,
-        inspector_view ? -0.08F : render_player.pitch, vertical_fov_degrees, rebirth_presentation);
+    // Enhanced presentation only: effects go to the effects layer for as long
+    // as this frame's chain can draw it (world_preview_vfx.cpp), and a nearby
+    // explosion shakes the camera. Only the drawn camera moves: the player,
+    // the aim and every rule that reads them are untouched.
+    vfx_set_enhanced(rebirth_presentation && post_effects_.enabled && !inspector_view &&
+                     depth_renderer_ != nullptr && depth_renderer_->vfx_available() &&
+                     SDL_getenv("OPENMINERZ_DISABLE_VFX") == nullptr);
+    if (!reduced_motion && !inspector_view)
+        vfx_apply_camera_shake(render_player, elapsed_seconds);
+    // Known again only once this frame's viewmodel pass has drawn a gun.
+    first_person_muzzle_.reset();
+    // Same eye, angles, field of view and target size the depth pass uses.
+    overlay_camera_ = {{render_player.position.x,
+                        render_player.position.y + world::PlayerSimulation::eye_height,
+                        render_player.position.z},
+                       render_player.yaw,
+                       render_player.pitch,
+                       view::sanitized_fov_degrees(vertical_fov_degrees),
+                       static_cast<float>(metrics.output_width),
+                       static_cast<float>(metrics.output_height),
+                       !inspector_view};
+    const world::BiomeAtmosphere sky_atmosphere =
+        SDL_getenv("OPENMINERZ_DISABLE_BIOME_ATMOSPHERE") == nullptr
+            ? world::biome_atmosphere_at(player.position.x, player.position.z)
+            : world::BiomeAtmosphere{};
+    // The Enhanced presentation composes its own sky inside the depth renderer
+    // (in scene light, so the sun can bloom and the terrain can fade into it).
+    // Then nothing drawn here could be seen, and this pass is skipped. It still
+    // runs for the Original presentation, for the inspector, and for any frame
+    // after one the depth renderer could not draw that way.
+    const bool renderer_sky = rebirth_presentation && !inspector_view && post_effects_.enabled &&
+                              depth_renderer_ != nullptr && depth_renderer_->draws_sky();
+    if (!renderer_sky)
+        draw_sky(metrics, sky, elapsed_seconds, reduced_motion,
+                 inspector_view ? 0.0F : render_player.yaw,
+                 inspector_view ? -0.08F : render_player.pitch, vertical_fov_degrees,
+                 rebirth_presentation, sky_atmosphere);
+    if (rebirth_presentation && depth_renderer_ != nullptr)
+    {
+        // What the Enhanced sky, fog and lens need beyond the camera.
+        const world::Vec3 eye_position{
+            render_player.position.x,
+            render_player.position.y + world::PlayerSimulation::eye_height,
+            render_player.position.z};
+        const float eye_sky = local_actor_sky_light(region_, eye_position);
+        const float eye_delta = eye_sky_seconds_ < 0.0F
+                                    ? 1.0F
+                                    : std::clamp(elapsed_seconds - eye_sky_seconds_, 0.0F, 1.0F);
+        eye_sky_seconds_ = elapsed_seconds;
+        eye_sky_light_ += (eye_sky - eye_sky_light_) *
+                          (eye_delta >= 1.0F ? 1.0F : 1.0F - std::exp(-eye_delta * 2.5F));
+        depth_renderer_->set_post_view(
+            {aim_progress_, eye_sky_light_, sky_atmosphere.storminess, moonlight});
+        const auto blend = world::rebirth_sky_blend(sky.time_of_day);
+        const auto cube = [&](world::SkyTexture kind) -> const SkyCube & {
+            switch (kind)
+            {
+            case world::SkyTexture::day:
+                return clear_sky_;
+            case world::SkyTexture::dawn:
+                return dawn_sky_;
+            case world::SkyTexture::sunset:
+                return sunset_sky_;
+            default:
+                return night_sky_;
+            }
+        };
+        if (stats_.original_skies_loaded)
+            depth_renderer_->set_sky_plates(cube(blend.first), cube(blend.second), blend.amount);
+        else
+            depth_renderer_->set_sky_plates({}, {}, 0.0F);
+    }
     if (inspector_view)
     {
         draw_inspector(metrics, sky, ambient_occlusion, ore_glow, shadow_strength);
@@ -2750,34 +3763,69 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
     else
     {
         const bool expected_depth_renderer = stats_.depth_buffered;
-        const bool water_enabled = rebirth_presentation && biome_ == world::BiomeKind::lagoon;
+        // Retail draws no water anywhere (BlockTerrain.IsWaterWorld is never
+        // set); the Lagoon sea is the default-off enhancement.
+        const bool water_enabled = water_extra_enabled_ && rebirth_presentation &&
+                                   biome_ == world::BiomeKind::lagoon;
+        // (mod-liquid) The mod liquid the eyes are in, if any: the distance
+        // fogs into its colour and a veil of it lies over the view.
+        const world::LiquidTable::Kind *eye_liquid = this->eye_liquid(render_player);
+        if (depth_renderer_ != nullptr)
+            depth_renderer_->set_liquid_view(eye_liquid != nullptr,
+                                             eye_liquid != nullptr ? eye_liquid->color
+                                                                   : std::array<float, 3>{});
+        // (The deep underground's model draws its own embers, on the GPU and by
+        // its "Embers and ash" option; these few are the older fill's.)
+        const bool hell_embers = rebirth_presentation && sky.hell > 0.0F && !reduced_motion &&
+                                 mining_sparks_ != nullptr &&
+                                 !(depth_renderer_ != nullptr &&
+                                   depth_renderer_->deep_light_model());
         // A zero-delta pass only refreshes the torch cache when its timer has
         // lapsed — keeps props correct even when the simulation is paused.
         update_torch_props(0.0F, render_player.position);
+        // Enhanced presentation: what the effects layer shows this camera.
+        vfx_submit(render_player, elapsed_seconds);
+        // (Graphics area) mods' lighting props, both presentations.
+        mod_submit_lights(render_player, vertical_fov_degrees,
+                          static_cast<float>(metrics.output_width) /
+                              static_cast<float>(std::max(metrics.output_height, 1)));
         if (depth_renderer_ != nullptr && enemy_models_ != nullptr &&
             ((visible_enemies_ != nullptr && !visible_enemies_->empty()) ||
              (visible_remote_players_ != nullptr && !visible_remote_players_->empty()) ||
-             visible_dragon_ != nullptr || !projectile_visuals_.empty() ||
+             player.dead || visible_dragon_ != nullptr || !projectile_visuals_.empty() ||
              !rocket_visuals_.empty() || !explosive_fuse_visuals_.empty() ||
              !fireball_visuals_.empty() || !torch_cache_.empty() ||
              (visible_doors_ != nullptr && !visible_doors_->empty()) ||
-             !mining_particles_.empty() || !block_pickups_.empty()))
+             !mining_particles_.empty() || !block_pickups_.empty() || hell_embers ||
+             vfx_debris_pending() || mod_models_pending() ||
+             (avatar_viewmodel_ != nullptr && avatar_viewmodel_->gunfx_props_pending()) || // (GunFX)
+             SDL_getenv("OPENMINERZ_DIAGNOSTIC_VOLUMES") != nullptr))
         {
             // CPU-skin the live enemies into the depth pass. Light factors refresh a
             // few enemies per frame; the cache keeps the rest stable between samples.
-            EntityBatch batch;
+            EntityBatch batch = std::move(local_body);
             const std::array<float, 3> sun_color{
                 std::min(1.0F, (sky.ambient.red * 0.35F + sky.direct.red * 0.65F) * 1.2F),
                 std::min(1.0F, (sky.ambient.green * 0.35F + sky.direct.green * 0.65F) * 1.2F),
                 std::min(1.0F, (sky.ambient.blue * 0.35F + sky.direct.blue * 0.65F) * 1.2F)};
             if (visible_dragon_ != nullptr)
-                enemy_models_->append_dragon(batch, *visible_dragon_, sun_color);
+                enemy_models_->append_dragon(batch, *visible_dragon_, sun_color,
+                                             rebirth_presentation);
             std::size_t refresh_budget = 4U;
             const std::size_t enemy_count =
                 visible_enemies_ != nullptr ? visible_enemies_->size() : 0U;
             for (std::size_t index = 0; index < enemy_count; ++index)
             {
                 const world::Enemy &enemy = (*visible_enemies_)[index];
+                // Enemies are simulated across the whole resident window, as
+                // in the original, but only skinned where terrain is drawn:
+                // past the view distance there is nothing to stand them on.
+                if (!render_window_.contains(
+                        floor_divide(static_cast<int>(std::floor(enemy.position.x)),
+                                     world::chunk_width),
+                        floor_divide(static_cast<int>(std::floor(enemy.position.z)),
+                                     world::chunk_depth)))
+                    continue;
                 auto &sample = enemy_light_cache_[enemy.id];
                 const bool wants_refresh =
                     (index + enemy_light_cursor_) %
@@ -2790,22 +3838,44 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                     const int cell_x = static_cast<int>(std::floor(enemy.position.x));
                     const int cell_z = static_cast<int>(std::floor(enemy.position.z));
                     const int head_y = static_cast<int>(std::floor(enemy.position.y + 1.5F));
-                    bool sky_clear = true;
-                    for (int y = head_y + 1; y < world::world_min_y + world::chunk_height; ++y)
-                        if (region_.contains(cell_x, y, cell_z) &&
-                            world::occludes(region_.block(cell_x, y, cell_z)))
-                        {
-                            sky_clear = false;
-                            break;
-                        }
-                    sample.sun = sky_clear ? 1.0F : 0.2F;
+                    if (rebirth_presentation)
+                        // Enhanced lights the enemy from this in its shader, as
+                        // it does players and mod creatures: the sky light
+                        // reaching it, which a deep cave takes to zero.
+                        sample.sun = local_actor_sky_light(
+                            region_, {enemy.position.x, enemy.position.y + 1.0F, enemy.position.z});
+                    else
+                    {
+                        bool sky_clear = true;
+                        for (int y = head_y + 1; y < world::world_min_y + world::chunk_height; ++y)
+                            if (region_.contains(cell_x, y, cell_z) &&
+                                world::occludes(region_.block(cell_x, y, cell_z)))
+                            {
+                                sky_clear = false;
+                                break;
+                            }
+                        sample.sun = sky_clear ? 1.0F : 0.2F;
+                    }
                     sample.torch = local_emissive_light(
                         region_, {enemy.position.x, enemy.position.y + 1.0F, enemy.position.z});
                 }
                 enemy_models_->append_enemy(batch, enemy, sample.sun, sample.torch, sun_color,
-                                            sky.daylight);
+                                            sky.daylight, rebirth_presentation);
             }
             ++enemy_light_cursor_;
+            // (GunFX) weapon parts any character dropped (magazines, shells),
+            // falling onto the blocks around them.
+            if (avatar_viewmodel_ != nullptr)
+                avatar_viewmodel_->append_gunfx_props(
+                    batch, elapsed_seconds,
+                    [this](int x, int y, int z) {
+                        return region_.contains(x, y, z) && world::blocks_player(region_.block(x, y, z));
+                    },
+                    [this](world::Vec3 at) {
+                        return std::pair<float, float>{local_actor_sky_light(region_, at),
+                                                       local_emissive_light(region_, at)};
+                    },
+                    sky, rebirth_presentation);
             if (visible_remote_players_ != nullptr && !visible_remote_players_->empty())
             {
                 if (avatar_viewmodel_ != nullptr && avatar_viewmodel_->world_animation_ready())
@@ -2820,16 +3890,27 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                             region_, {player_visual.position.x,
                                       player_visual.position.y + 1.0F,
                                       player_visual.position.z});
+                        // PlayerUpdateMessage.Apply -> Player.UpdateAnimation for
+                        // this peer, stepped by the app's per-player animator.
+                        if (player_visual.animation_valid)
+                            avatar_viewmodel_->set_world_player_animation(player_visual.gid,
+                                                                          player_visual.animation);
                         avatar_viewmodel_->append_world_player(
                             batch, player_visual.gid, player_visual.carried_item,
-                            player_visual.position, player_visual.yaw,
-                            player_visual.torso_pitch, player_visual.animation_seconds,
-                            player_visual.movement_x, player_visual.movement_y,
-                            player_visual.animation_mode, player_visual.using_tool,
-                            player_visual.dead, player_visual.shouldering,
+                            player_visual.position, player_visual.yaw, player_visual.torso_pitch,
+                            player_visual.animation_seconds, player_visual.movement_x,
+                            player_visual.movement_y, player_visual.animation_mode,
+                            player_visual.using_tool, player_visual.dead, player_visual.shouldering,
                             player_visual.reloading, player_visual.throwing_grenade,
-                            player_visual.ready_to_throw_grenade,
-                            sun, torch, atlas_);
+                            player_visual.ready_to_throw_grenade, sun, torch, atlas_, sky,
+                            rebirth_presentation,
+                            (water_enabled &&
+                             world::is_underwater(true, player_visual.position.y)) ||
+                                // (mod-liquid) swimming in a mod liquid
+                                world::liquid_depth(region_, player_visual.position.x,
+                                                    player_visual.position.y,
+                                                    player_visual.position.z) > 0.6F,
+                            false, nullptr, nullptr, player_visual.mod_item.get()); // (Items)
                     }
                 }
                 else if (white_texture_ != nullptr)
@@ -3002,10 +4083,15 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                     // Original TracerManager index pattern.
                     static constexpr std::array<int, 18> spear_indices{1, 0, 2, 3, 0, 1, 2, 0, 3,
                                                                        1, 4, 3, 2, 4, 1, 3, 4, 2};
+                    // Enhanced only: a tracer or laser bolt is a light source, so
+                    // it is drawn several times brighter than a lit surface and
+                    // the bloom pass makes it glow. Its shape, size and colour
+                    // are the original's; the Original presentation is 1.
+                    const float glow = rebirth_presentation && post_effects_.enabled ? 5.0F : 1.0F;
                     for (const int point : spear_indices)
                     {
                         const auto &position = points[static_cast<std::size_t>(point)];
-                        const float shade = point == 4 ? 0.25F : 1.0F;
+                        const float shade = (point == 4 ? 0.25F : 1.0F) * glow;
                         batch.vertices.push_back({position[0], position[1], position[2], 0.5F, 0.5F,
                                                   projectile.color[0] * shade,
                                                   projectile.color[1] * shade,
@@ -3125,56 +4211,6 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                     batch.spans.push_back(span);
                 }
             }
-            // The dragon's fireballs: the original FireBall model tumbling
-            // about its local X at 3 rad/s, fullbright (FireballModelEntity
-            // disables all lighting), scaled up so the blaze reads at range.
-            if (!fireball_visuals_.empty() && fireball_model_ != nullptr &&
-                fireball_model_->loaded())
-            {
-                for (const FireballVisual &visual : fireball_visuals_)
-                {
-                    const float spin_cos = std::cos(visual.spin);
-                    const float spin_sin = std::sin(visual.spin);
-                    constexpr float fireball_scale = 1.6F;
-                    for (const StaticModelPart &part : fireball_model_->parts())
-                    {
-                        EntitySpan span;
-                        span.texture = part.texture;
-                        span.first = static_cast<std::uint32_t>(batch.vertices.size());
-                        for (const std::uint32_t index : part.indices)
-                        {
-                            const StaticModelVertex &source = part.vertices[index];
-                            const auto &m = part.transform;
-                            const std::array<float, 3> baked{
-                                source.position[0] * m[0] + source.position[1] * m[4] +
-                                    source.position[2] * m[8] + m[12],
-                                source.position[0] * m[1] + source.position[1] * m[5] +
-                                    source.position[2] * m[9] + m[13],
-                                source.position[0] * m[2] + source.position[1] * m[6] +
-                                    source.position[2] * m[10] + m[14]};
-                            // Tumble about local X, then scale and translate.
-                            const float local_y = baked[1] * spin_cos - baked[2] * spin_sin;
-                            const float local_z = baked[1] * spin_sin + baked[2] * spin_cos;
-                            EntityVertex vertex;
-                            vertex.x = visual.position.x + baked[0] * fireball_scale;
-                            vertex.y = visual.position.y + local_y * fireball_scale;
-                            vertex.z = visual.position.z + local_z * fireball_scale;
-                            vertex.u = source.uv[0];
-                            vertex.v = source.uv[1];
-                            if (visual.ice)
-                            {
-                                vertex.red = 0.65F;
-                                vertex.green = 0.85F;
-                                vertex.blue = 1.0F;
-                            }
-                            batch.vertices.push_back(vertex);
-                        }
-                        span.count = static_cast<std::uint32_t>(batch.vertices.size()) - span.first;
-                        if (span.count > 0U)
-                            batch.spans.push_back(span);
-                    }
-                }
-            }
             // Placed torch props: the real torch model at every cached torch
             // block, tilted per TorchCloud's per-face table, with the
             // original's flat 0.75 ambient.
@@ -3228,6 +4264,21 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                 }
             }
             append_door_models(batch, render_player, sky);
+            // (Graphics area) mods' glTF props and creatures, lit and shadowed
+            // like the creatures above.
+            mod_append_models(batch, render_player, sky, vertical_fov_degrees,
+                              static_cast<float>(metrics.output_width) /
+                                  static_cast<float>(std::max(metrics.output_height, 1)),
+                              rebirth_presentation,
+                              [this](world::Vec3 position) {
+                                  const world::Vec3 head{position.x, position.y + 1.0F,
+                                                         position.z};
+                                  return std::array<float, 2>{
+                                      local_actor_sky_light(region_, head),
+                                      local_emissive_light(region_, head)};
+                              });
+            // Enhanced presentation: debris of an explosion, as small lit cubes.
+            vfx_append_debris(batch);
             // Particles and pickups join the depth-tested batch. Soft spans
             // (alpha/additive) draw after all opaque geometry with read-only
             // depth, so nothing shows through zombies, terrain, or props.
@@ -3310,7 +4361,7 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                             size = particle.size;
                             break;
                         case ParticleKind::spark:
-                            color = {1.0F, 0.82F, 0.42F, remaining};
+                            color = {particle.tint[0], particle.tint[1], particle.tint[2], remaining};
                             size = particle.size;
                             break;
                         case ParticleKind::torch_smoke:
@@ -3380,8 +4431,12 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                     {
                         if (pickup.block == world::BlockType::empty)
                             continue;
-                        if (!pickup.flying_to_player && pickup.time_left <= 5.0F &&
-                            std::fmod(pickup.age * 8.0F, 1.0F) >= 0.5F)
+                        // Modding, visuals area: drawn by append_pickup_models.
+                        if (pickup.mod_item != 0U && pickup_mod_model(pickup) != nullptr)
+                            continue;
+                        if (!pickup.flying_to_player &&
+                            (pickup_blinked_out(pickup.time_left) ||
+                             !region_loaded(pickup.position.x, pickup.position.z)))
                             continue;
                         world::Vec3 center = pickup.position;
                         if (!pickup.flying_to_player)
@@ -3468,19 +4523,195 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                 append_pickup_models(batch);
                 particle_span(mining_rocks_, ParticleKind::rock, EntityBlend::alpha);
                 particle_span(mining_rocks_, ParticleKind::blast_rock, EntityBlend::alpha);
-                particle_span(mining_smoke_, ParticleKind::mining_dust, EntityBlend::alpha);
-                particle_span(mining_smoke_, ParticleKind::impact_smoke, EntityBlend::alpha);
-                particle_span(mining_smoke_, ParticleKind::smoke, EntityBlend::alpha);
-                particle_span(torch_smoke_texture_, ParticleKind::torch_smoke, EntityBlend::alpha);
-                particle_span(torch_fire_texture_, ParticleKind::fire_soft, EntityBlend::additive);
-                particle_span(ice_puff_texture_ != nullptr ? ice_puff_texture_
-                                                           : torch_fire_texture_,
-                              ParticleKind::ice_soft, EntityBlend::alpha);
                 particle_span(mining_sparks_, ParticleKind::spark, EntityBlend::additive);
-                particle_span(torch_fire_texture_, ParticleKind::torch_fire, EntityBlend::additive);
-                particle_span(flash_texture_, ParticleKind::flash, EntityBlend::additive);
-                particle_span(ice_flash_texture_ != nullptr ? ice_flash_texture_ : flash_texture_,
-                              ParticleKind::ice_flash, EntityBlend::additive);
+                struct Volume final
+                {
+                    world::Vec3 center;
+                    float radius;
+                    float kind;
+                    std::array<float, 4> color;
+                };
+                std::vector<Volume> volumes;
+                volumes.reserve(mining_particles_.size() + fireball_visuals_.size());
+                for (const MiningParticle &particle : mining_particles_)
+                {
+                    // Enhanced presentation: the effects layer draws these as
+                    // lit, soft, sorted particles after the resolve (see
+                    // vfx_submit). No ray-marched volume is built at all: laid
+                    // into the scene before occlusion and contact shadows, a
+                    // volume round the eye turned the whole world into
+                    // untextured grey shapes.
+                    if (enhanced_effects_)
+                        break;
+                    const auto kind = particle.kind;
+                    if (kind == ParticleKind::rock || kind == ParticleKind::blast_rock ||
+                        kind == ParticleKind::spark)
+                        continue;
+                    const float progress = std::clamp(particle.age / particle.lifetime, 0.0F, 1.0F);
+                    const float radius = std::max(0.015F, std::lerp(particle.size, particle.end_size, progress) * 0.5F);
+                    const bool smoke = kind == ParticleKind::smoke || kind == ParticleKind::torch_smoke ||
+                                       kind == ParticleKind::impact_smoke || kind == ParticleKind::mining_dust;
+                    const bool ice = kind == ParticleKind::ice_soft || kind == ParticleKind::ice_flash;
+                    const float fade = (1.0F - progress) * (smoke ? 0.65F : 1.0F);
+                    volumes.push_back({particle.position, radius, smoke ? -2.0F : ice ? -4.0F : -3.0F,
+                                       {particle.tint[0], particle.tint[1], particle.tint[2],
+                                        fade * particle.opacity}});
+                }
+                for (const FireballVisual &fireball : fireball_visuals_)
+                {
+                    if (enhanced_effects_)
+                        break;
+                    const float speed = std::sqrt(fireball.velocity.x*fireball.velocity.x +
+                        fireball.velocity.y*fireball.velocity.y + fireball.velocity.z*fireball.velocity.z);
+                    const world::Vec3 axis = speed > 0.001F ? world::Vec3{fireball.velocity.x/speed,
+                        fireball.velocity.y/speed, fireball.velocity.z/speed} : world::Vec3{0,0,-1};
+                    volumes.push_back({{fireball.position.x-axis.x*0.45F, fireball.position.y-axis.y*0.45F,
+                                         fireball.position.z-axis.z*0.45F},
+                                       0.65F, fireball.ice ? -6.0F : -5.0F, {axis.x,axis.y,axis.z,1.0F}});
+                }
+                const world::Vec3 eye{render_player.position.x,
+                    render_player.position.y + world::PlayerSimulation::eye_height, render_player.position.z};
+                const world::Vec3 forward{sine_yaw * cosine_pitch, sine_pitch, -cosine_yaw * cosine_pitch};
+                const auto distance_squared = [&](world::Vec3 point) {
+                    const float x = point.x - eye.x, y = point.y - eye.y, z = point.z - eye.z;
+                    return x*x + y*y + z*z;
+                };
+                if (const char *diagnostic = SDL_getenv("OPENMINERZ_DIAGNOSTIC_VOLUMES");
+                    diagnostic != nullptr && !enhanced_effects_)
+                {
+                    if (std::string_view{diagnostic} == "inside")
+                        volumes.push_back({{eye.x + forward.x*0.2F, eye.y, eye.z + forward.z*0.2F},
+                                           2.0F, -2.0F, {0.40F, 0.42F, 0.44F, 1.0F}});
+                    else
+                    for (int i = 0; i < 3; ++i)
+                        volumes.push_back({{eye.x + forward.x * 2.5F + camera_right.x * (i-1) * 1.2F,
+                                            eye.y + forward.y * 2.5F, eye.z + forward.z * 2.5F + camera_right.z * (i-1) * 1.2F},
+                                           0.45F, -2.0F - static_cast<float>(i), {0.45F, 0.48F, 0.52F, 1.0F}});
+                }
+                // Sort smoke, flames and cores together. Sorting by effect kind
+                // made smoke cut across fire and left rectangular layer seams.
+                std::stable_sort(volumes.begin(), volumes.end(), [&](const Volume &a, const Volume &b) {
+                    return distance_squared(a.center) > distance_squared(b.center);
+                });
+                EntitySpan volume_span;
+                volume_span.texture = white_texture_;
+                volume_span.blend = EntityBlend::alpha;
+                volume_span.first = static_cast<std::uint32_t>(batch.vertices.size());
+                for (const Volume &volume : volumes)
+                {
+                    if (volume.color[3] <= 0.001F)
+                        continue;
+                    const world::Vec3 delta{volume.center.x-eye.x, volume.center.y-eye.y, volume.center.z-eye.z};
+                    const float aspect = static_cast<float>(metrics.output_width) / std::max(1, metrics.output_height);
+                    const auto bounds = view::volume_bounds(
+                        delta.x*camera_right.x + delta.y*camera_right.y + delta.z*camera_right.z,
+                        delta.x*camera_up.x + delta.y*camera_up.y + delta.z*camera_up.z,
+                        delta.x*forward.x + delta.y*forward.y + delta.z*forward.z,
+                        volume.radius * (volume.kind < -4.5F ? 2.4F : 1.0F), vertical_fov_degrees, aspect);
+                    if (!bounds.visible)
+                        continue;
+                    // A bounded screen rectangle just beyond the scene's 8 cm
+                    // near plane. Its vertices only define rays, never the
+                    // smoke surface; all intersections are integrated in 3D.
+                    constexpr float proxy_depth = 0.10F;
+                    const float ty = view::half_tangent(vertical_fov_degrees) * proxy_depth;
+                    const float tx = ty * aspect;
+                    const auto vertex_at = [&](float x, float y) {
+                        EntityVertex vertex;
+                        vertex.x = eye.x + forward.x*proxy_depth + camera_right.x*x*tx + camera_up.x*y*ty;
+                        vertex.y = eye.y + forward.y*proxy_depth + camera_right.y*x*tx + camera_up.y*y*ty;
+                        vertex.z = eye.z + forward.z*proxy_depth + camera_right.z*x*tx + camera_up.z*y*ty;
+                        vertex.red = volume.color[0]; vertex.green = volume.color[1]; vertex.blue = volume.color[2];
+                        vertex.alpha = volume.color[3];
+                        vertex.normal_x = volume.center.x; vertex.normal_y = volume.center.y; vertex.normal_z = volume.center.z;
+                        vertex.sky_light = volume.radius; vertex.torch_light = volume.kind;
+                        return vertex;
+                    };
+                    const auto bl = vertex_at(bounds.left, bounds.bottom), br = vertex_at(bounds.right, bounds.bottom);
+                    const auto tl = vertex_at(bounds.left, bounds.top), tr = vertex_at(bounds.right, bounds.top);
+                    for (const auto &vertex : {bl, br, tr, bl, tr, tl})
+                    {
+                        batch.vertices.push_back(vertex);
+                    }
+                }
+                volume_span.count = static_cast<std::uint32_t>(batch.vertices.size()) - volume_span.first;
+                if (volume_span.count > 0U)
+                    batch.spans.push_back(volume_span);
+                if (hell_embers)
+                {
+                    // Sparse updrafts above real lava, anchored to world cells.
+                    // The ordinary soft-particle pass handles depth and bloom.
+                    EntitySpan embers;
+                    embers.texture = mining_sparks_;
+                    embers.blend = EntityBlend::additive;
+                    embers.first = static_cast<std::uint32_t>(batch.vertices.size());
+                    const int grid_x =
+                        static_cast<int>(std::floor(render_player.position.x / 4.0F));
+                    const int grid_z =
+                        static_cast<int>(std::floor(render_player.position.z / 4.0F));
+                    const int eye_y = static_cast<int>(std::floor(render_player.position.y + 1.6F));
+                    const auto random = [](int x, int z, std::uint32_t salt) {
+                        std::uint32_t value = static_cast<std::uint32_t>(x) * 73856093U ^
+                                              static_cast<std::uint32_t>(z) * 19349663U ^ salt;
+                        value ^= value >> 16U;
+                        value *= 0x7feb352dU;
+                        value ^= value >> 15U;
+                        return static_cast<float>(value & 65535U) / 65536.0F;
+                    };
+                    for (int z = grid_z - 6; z <= grid_z + 6; ++z)
+                        for (int x = grid_x - 6; x <= grid_x + 6; ++x)
+                        {
+                            const float seed = random(x, z, 17U);
+                            if (seed > std::min(1.0F, particle_density_))
+                                continue;
+                            const float px = static_cast<float>(x * 4) + random(x, z, 31U) * 4.0F;
+                            const float pz = static_cast<float>(z * 4) + random(x, z, 73U) * 4.0F;
+                            const int cell_x = static_cast<int>(std::floor(px));
+                            const int cell_z = static_cast<int>(std::floor(pz));
+                            for (int y = eye_y + 2; y >= eye_y - 14; --y)
+                            {
+                                if (!region_.contains(cell_x, y, cell_z))
+                                    continue;
+                                const auto block = region_.block(cell_x, y, cell_z);
+                                if (block != world::BlockType::surface_lava &&
+                                    block != world::BlockType::deep_lava)
+                                    continue;
+                                const float phase = std::fmod(
+                                    elapsed_seconds * (0.13F + seed * 0.04F) + seed, 1.0F);
+                                const world::Vec3 position{
+                                    px + std::sin(phase * 5.0F + seed * 12.0F) * 0.45F,
+                                    static_cast<float>(y) + 1.15F + phase * 8.5F,
+                                    pz + std::cos(phase * 4.0F + seed * 9.0F) * 0.45F};
+                                const float distance =
+                                    std::hypot(position.x - render_player.position.x,
+                                               position.z - render_player.position.z);
+                                const float fade =
+                                    std::sin(phase * 3.14159265F) *
+                                    std::clamp((24.0F - distance) / 6.0F, 0.0F, 1.0F);
+                                bool clear_updraft = true;
+                                for (int rise_y = y + 1;
+                                     rise_y <= static_cast<int>(std::floor(position.y)); ++rise_y)
+                                    if (region_.block(cell_x, rise_y, cell_z) !=
+                                        world::BlockType::empty)
+                                    {
+                                        clear_updraft = false;
+                                        break;
+                                    }
+                                if (clear_updraft && fade > 0.0F &&
+                                    region_.block(static_cast<int>(std::floor(position.x)),
+                                                  static_cast<int>(std::floor(position.y)),
+                                                  static_cast<int>(std::floor(position.z))) ==
+                                        world::BlockType::empty)
+                                    append_billboard(
+                                        position, 0.04F + seed * 0.02F, seed * 360.0F,
+                                        {3.4F, 0.65F, 0.025F, fade * sky.hell * 0.72F});
+                                break;
+                            }
+                        }
+                    embers.count = static_cast<std::uint32_t>(batch.vertices.size()) - embers.first;
+                    if (embers.count > 0U)
+                        batch.spans.push_back(embers);
+                }
             }
             if (SDL_getenv("OPENMINERZ_ENEMY_DEBUG") != nullptr)
             {
@@ -3582,14 +4813,13 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                     }
                 }
 
-                // FlashEffect emits five coincident particles. Treat the large
-                // explosion recipe as one source and merge its drifting copies;
-                // tiny blaster flashes and fireball glow remain visual-only.
+                // Large fire puffs illuminate the scene for the duration of the
+                // blast. Trail sparks and laser excavation stay visual-only.
                 for (const MiningParticle &particle : mining_particles_)
                 {
-                    if ((particle.kind != ParticleKind::flash &&
-                         particle.kind != ParticleKind::ice_flash) ||
-                        particle.end_size < 8.0F)
+                    if ((particle.kind != ParticleKind::fire_soft &&
+                         particle.kind != ParticleKind::ice_soft) ||
+                        particle.end_size < 2.0F)
                         continue;
                     const float fade =
                         world::dynamic_radiance_lifetime_fade(particle.age, particle.lifetime);
@@ -3597,7 +4827,7 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                         continue;
                     constexpr std::array<float, 3> fire_blast_linear{1.0F, 0.48F, 0.12F};
                     constexpr std::array<float, 3> ice_blast_linear{0.25F, 0.70F, 1.0F};
-                    const bool ice = particle.tint[2] > particle.tint[0] + 0.12F;
+                    const bool ice = particle.kind == ParticleKind::ice_soft;
                     constexpr float radius = 9.0F;
                     const float distance_squared = distance_to_player_squared(particle.position);
                     const float reach = static_cast<float>(world::dynamic_radiance_radius) + radius;
@@ -3610,7 +4840,7 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                             const float x = candidate.source.position.x - particle.position.x;
                             const float y = candidate.source.position.y - particle.position.y;
                             const float z = candidate.source.position.z - particle.position.z;
-                            return candidate.source.radius >= 8.5F && x * x + y * y + z * z < 4.0F;
+                            return candidate.source.radius >= 8.5F && x * x + y * y + z * z < 16.0F;
                         });
                     const float intensity = 1.8F * fade;
                     if (duplicate != transient_sources.end())
@@ -3692,6 +4922,10 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
             }
             depth_renderer_->submit_dynamic_radiance(std::move(dynamic_radiance));
         }
+        // Far terrain (Enhanced only): choose what of the far landscape this
+        // camera sees and hand it to the renderer with the frame.
+        update_far_terrain(metrics, sky, render_player, vertical_fov_degrees, elapsed_seconds,
+                           rebirth_presentation);
         const bool depth_rendered =
             depth_renderer_ != nullptr &&
             depth_renderer_->draw(metrics, sky, render_player, vertical_fov_degrees, render_scale,
@@ -3727,28 +4961,62 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
         const bool scoped_view =
             scoped_weapon && (render_player.viewmodel_cue == world::ViewmodelCue::shoulder_idle ||
                               render_player.viewmodel_cue == world::ViewmodelCue::shoulder_use);
-        if (avatar_viewmodel_ != nullptr && !scoped_view &&
+        if (avatar_viewmodel_ != nullptr && !player.dead && !scoped_view &&
             SDL_getenv("OPENMINERZ_DIAGNOSTIC_HIDE_VIEWMODEL") == nullptr)
         {
-            // GetAvatarColor: sample sun/torch light at the player and light
-            // the arms with ambient + directional sun (pow(sun, 30) means only
-            // open sky gets the direct term), sun direction in camera space.
-            const int eye_x = static_cast<int>(std::floor(render_player.position.x));
-            const int eye_z = static_cast<int>(std::floor(render_player.position.z));
-            const int head_y = static_cast<int>(
-                std::floor(render_player.position.y + world::PlayerSimulation::eye_height));
-            bool sky_clear = true;
-            for (int y = head_y + 1; y < world::world_min_y + world::chunk_height; ++y)
-                if (region_.contains(eye_x, y, eye_z) &&
-                    world::occludes(region_.block(eye_x, y, eye_z)))
+            // Continuous skylight across ledges, plus a small area sample
+            // toward the actual sun for direct shadows. Ambient bounce remains
+            // in shade instead of switching the whole hand to a dark preset.
+            const world::Vec3 hand_light_position{render_player.position.x,
+                render_player.position.y + 1.35F, render_player.position.z};
+            const float grid_x = std::floor(hand_light_position.x), grid_z = std::floor(hand_light_position.z);
+            const float fx = hand_light_position.x - grid_x, fz = hand_light_position.z - grid_z;
+            const auto sample_sky = [&](float x, float z) {
+                return local_actor_sky_light(region_, {x, hand_light_position.y, z});
+            };
+            const float column_sky = std::lerp(
+                std::lerp(sample_sky(grid_x, grid_z), sample_sky(grid_x+1, grid_z), fx),
+                std::lerp(sample_sky(grid_x, grid_z+1), sample_sky(grid_x+1, grid_z+1), fx), fz);
+            // A wide roof blocks vertical columns but can leave most of the
+            // horizon visible. Integrate that side light without leaking it
+            // through cave walls; the previous column-only probe blackened
+            // hands beneath an otherwise sunlit, open-sided shelter.
+            float hemisphere_sky{};
+            for (int ring = 0; ring < 2; ++ring)
+            {
+                const float y = ring == 0 ? 0.28F : 0.78F;
+                const float horizontal = std::sqrt(1.0F-y*y);
+                for (int sample = 0; sample < 8; ++sample)
                 {
-                    sky_clear = false;
-                    break;
+                    const float angle = (static_cast<float>(sample) + ring*0.5F) *
+                                        std::numbers::pi_v<float> / 4.0F;
+                    const world::Vec3 direction{std::cos(angle)*horizontal, y, std::sin(angle)*horizontal};
+                    if (!world::PlayerSimulation::raycast_blocking(region_, hand_light_position, direction, 96.0F))
+                        hemisphere_sky += 1.0F/16.0F;
                 }
-            const float sun_amount = sky_clear ? 1.0F : 0.2F;
-            float torch_amount = local_emissive_light(region_, {render_player.position.x,
-                                                                render_player.position.y + 1.0F,
-                                                                render_player.position.z});
+            }
+            const float sky_open = std::max(column_sky, hemisphere_sky);
+            const float sun_amount = 0.08F + 0.92F * std::sqrt(sky_open);
+            float sun_visibility{};
+            if (sky.sun_y > 0.02F)
+            {
+                const world::Vec3 sun_direction{sky.sun_x, sky.sun_y, sky.sun_z};
+                for (const auto offset : std::array<world::Vec3, 5>{{{0,0,0}, {0.45F,0,0}, {-0.45F,0,0}, {0,0,0.45F}, {0,0,-0.45F}}})
+                {
+                    const world::Vec3 origin{hand_light_position.x+offset.x, hand_light_position.y,
+                                              hand_light_position.z+offset.z};
+                    if (!world::PlayerSimulation::raycast_blocking(region_, origin, sun_direction, 64.0F))
+                        sun_visibility += 0.2F;
+                }
+            }
+            std::array<float, 2> local_sources{};
+            float torch_amount =
+                local_emissive_light(region_,
+                                     {render_player.position.x, render_player.position.y + 1.0F,
+                                      render_player.position.z},
+                                     &local_sources);
+            if (rebirth_presentation)
+                torch_amount = local_sources[0];
             // The terrain shader already treats an equipped torch as a local
             // light. Feed the same source to the separate first-person pass so
             // the torch and hands do not remain black inside the cave they light.
@@ -3762,33 +5030,84 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
             // without bleaching the sleeve and hand to paper white.
             if (render_player.selected_item_id == 14U)
                 torch_mix *= 0.72F;
-            const float hell_viewmodel =
+            float hell_viewmodel =
                 rebirth_presentation && SDL_getenv("OPENMINERZ_LEGACY_HELL_ATMOSPHERE") == nullptr
-                    ? std::clamp((-32.0F - (render_player.position.y +
-                                            world::PlayerSimulation::eye_height)) /
-                                     8.0F,
-                                 0.0F, 1.0F)
+                    ? world::hell_presence(render_player.position.y +
+                                           world::PlayerSimulation::eye_height)
                     : 0.0F;
-            // The first-person rig is a separate pass and cannot sample the
-            // terrain's directional probe. Give it the same restrained furnace
-            // floor so hands and the held tool remain identifiable in Hell.
-            constexpr std::array<float, 3> hell_rig_ambient{0.080F, 0.014F, 0.004F};
+            // Split the red fill between ambient and light from below so the
+            // hands have shape. Lava contributes orange light, not a white torch.
+            const float lava_mix =
+                rebirth_presentation ? std::pow(local_sources[1], 1.6F) * 0.45F : 0.0F;
+            std::array<float, 3> hell_fill{world::hell_ambient.red * 0.42F,
+                                           world::hell_ambient.green * 0.42F,
+                                           world::hell_ambient.blue * 0.42F};
+            std::array<float, 3> hell_below{world::hell_ambient.red * 0.58F,
+                                            world::hell_ambient.green * 0.58F,
+                                            world::hell_ambient.blue * 0.58F};
+            std::array<float, 3> lava_color{2.8F, 0.60F, 0.075F};
+            // Where the light from below comes from (toward the light, world).
+            std::array<float, 3> hell_light_world{-0.24F, -0.94F, 0.24F};
+            if (depth_renderer_ != nullptr && depth_renderer_->deep_light_model())
+            {
+                // From below and a little from behind the eye, so it rakes the
+                // undersides and lower edges the player can actually see
+                // instead of only faces turned straight down.
+                hell_light_world = {
+                    -std::sin(render_player.yaw) * 0.55F - std::cos(render_player.yaw) * 0.16F,
+                    -0.80F,
+                    std::cos(render_player.yaw) * 0.55F - std::sin(render_player.yaw) * 0.16F};
+                // The deep underground's model (hell_atmosphere.hpp) lit the
+                // world of this frame: the hands and the held item stand in the
+                // same glow as the rock, by how deep they are, and take the
+                // lava lake's light from below as a roof over it would.
+                const world::Vec3 chest{render_player.position.x, render_player.position.y + 1.2F,
+                                        render_player.position.z};
+                hell_viewmodel = world::hell_surface_presence(chest.y);
+                const world::HellBodyLight body = world::hell_body_light(
+                    1.0F, depth_renderer_->lava_light_at(chest.x, chest.y, chest.z, -1.0F),
+                    post_effects_.deep_light, 1.0F);
+                // A held tool is information (which one, is it raised): its
+                // fill is a third above the rock's so dark steel still has form.
+                constexpr float readable = 1.32F;
+                hell_fill = {body.ambient.red * readable, body.ambient.green * readable,
+                             body.ambient.blue * readable};
+                // ... and the light from below is what picks its edges out.
+                constexpr float raking = 1.60F;
+                hell_below = {body.below.red * raking, body.below.green * raking,
+                              body.below.blue * raking};
+                // (Turned down deep in Hell by as much as the eye is opened
+                // there, like the lava light on the rock.)
+                const float opened = std::lerp(1.0F, 0.55F, hell_viewmodel);
+                lava_color = {2.6F * opened, 0.66F * opened, 0.080F * opened};
+            }
+            // Daylit surroundings bounce light beneath a roof even when its
+            // direct sun ray is blocked. Keep that fill tied to visible sky;
+            // a sealed cave receives none of this outdoor contribution.
+            const float side_fill = (1.0F-sun_visibility) * std::sqrt(hemisphere_sky) * 0.65F;
             const std::array<float, 3> ambient{
-                std::min(1.0F, sky.ambient.red * sun_amount + torch_color[0] * torch_mix +
-                                   hell_rig_ambient[0] * hell_viewmodel),
-                std::min(1.0F, sky.ambient.green * sun_amount + torch_color[1] * torch_mix +
-                                   hell_rig_ambient[1] * hell_viewmodel),
-                std::min(1.0F, sky.ambient.blue * sun_amount + torch_color[2] * torch_mix +
-                                   hell_rig_ambient[2] * hell_viewmodel)};
-            const float direct_gain = std::pow(sun_amount, 30.0F);
-            const std::array<float, 3> directional{sky.direct.red * direct_gain,
-                                                   sky.direct.green * direct_gain,
-                                                   sky.direct.blue * direct_gain};
+                std::min(1.0F, std::lerp(sky.ambient.red * sun_amount + sky.direct.red * side_fill, hell_fill[0],
+                                         hell_viewmodel) +
+                                   torch_color[0] * torch_mix + lava_color[0] * lava_mix),
+                std::min(1.0F, std::lerp(sky.ambient.green * sun_amount + sky.direct.green * side_fill, hell_fill[1],
+                                         hell_viewmodel) +
+                                   torch_color[1] * torch_mix + lava_color[1] * lava_mix),
+                std::min(1.0F, std::lerp(sky.ambient.blue * sun_amount + sky.direct.blue * side_fill, hell_fill[2],
+                                         hell_viewmodel) +
+                                   torch_color[2] * torch_mix + lava_color[2] * lava_mix)};
+            const float direct_gain = sun_visibility;
+            const std::array<float, 3> directional{
+                std::lerp(sky.direct.red * direct_gain, hell_below[0], hell_viewmodel),
+                std::lerp(sky.direct.green * direct_gain, hell_below[1], hell_viewmodel),
+                std::lerp(sky.direct.blue * direct_gain, hell_below[2], hell_viewmodel)};
             const float sine_yaw = std::sin(render_player.yaw);
             const float cosine_yaw = std::cos(render_player.yaw);
             const float sine_pitch = std::sin(render_player.pitch);
             const float cosine_pitch = std::cos(render_player.pitch);
-            const std::array<float, 3> sun_world{sky.sun_x, sky.sun_y, sky.sun_z};
+            const std::array<float, 3> sun_world{
+                std::lerp(sky.sun_x, hell_light_world[0], hell_viewmodel),
+                std::lerp(sky.sun_y, hell_light_world[1], hell_viewmodel),
+                std::lerp(sky.sun_z, hell_light_world[2], hell_viewmodel)};
             const std::array<float, 3> sun_camera{
                 sun_world[0] * cosine_yaw + sun_world[2] * sine_yaw,
                 sun_world[0] * (-sine_yaw * sine_pitch) + sun_world[1] * cosine_pitch +
@@ -3805,16 +5124,84 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                 viewmodel_fog = {viewmodel_fog.red * viewmodel_fog.red,
                                  viewmodel_fog.green * viewmodel_fog.green,
                                  viewmodel_fog.blue * viewmodel_fog.blue};
+                // The same far haze the world's white balance sees this frame.
+                if (depth_renderer_ != nullptr && depth_renderer_->deep_light_model())
+                {
+                    const float deep = std::clamp(sky.hell, 0.0F, 1.0F);
+                    viewmodel_fog = {
+                        std::lerp(viewmodel_fog.red, world::hell_far_haze.red, deep),
+                        std::lerp(viewmodel_fog.green, world::hell_far_haze.green, deep),
+                        std::lerp(viewmodel_fog.blue, world::hell_far_haze.blue, deep)};
+                }
             }
             const DisplayGrading grading =
                 depth_renderer_ != nullptr ? depth_renderer_->display_grading() : DisplayGrading{};
+            const float light_dt = elapsed_seconds - viewmodel_light_seconds_;
+            const float moved = std::hypot(hand_light_position.x - viewmodel_light_position_.x,
+                                           hand_light_position.z - viewmodel_light_position_.z);
+            const float light_blend = viewmodel_light_seconds_ < 0.0F || light_dt < 0.0F || moved > 8.0F
+                ? 1.0F : 1.0F - std::exp(-std::clamp(light_dt, 0.0F, 0.25F) * 12.0F);
+            for (std::size_t channel = 0; channel < 3; ++channel)
+            {
+                viewmodel_ambient_[channel] = std::lerp(viewmodel_ambient_[channel], ambient[channel], light_blend);
+                viewmodel_directional_[channel] = std::lerp(viewmodel_directional_[channel], directional[channel], light_blend);
+            }
+            viewmodel_light_seconds_ = elapsed_seconds;
+            viewmodel_light_position_ = hand_light_position;
+            if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_HAND_SHADOW") != nullptr)
+                SDL_Log("hand.light x=%.2f sky=%.3f direct=%.3f ambient=%.3f", hand_light_position.x,
+                        sky_open, sun_visibility, viewmodel_ambient_[0]);
+            // Enhanced presentation: an explosion or a flame nearby lights the
+            // hands and the held item too, this frame, without the smoothing
+            // above (a flash is over in a few frames). Zero in the Original.
+            std::array<float, 3> viewmodel_lit_ambient = viewmodel_ambient_;
+            {
+                std::array<float, 3> effect_light = vfx_light_at(hand_light_position);
+                // (Graphics area) and mods' lighting props, in both presentations.
+                const std::array<float, 3> prop_light = mod_light_at(hand_light_position);
+                for (std::size_t channel = 0; channel < 3; ++channel)
+                    effect_light[channel] += prop_light[channel];
+                for (std::size_t channel = 0; channel < 3; ++channel)
+                    viewmodel_lit_ambient[channel] +=
+                        std::min(effect_light[channel] * 0.35F, 1.25F);
+            }
             avatar_viewmodel_->set_environment_light(
-                ambient, directional, sun_camera, rebirth_presentation, torch_mix, grading.exposure,
+                viewmodel_lit_ambient, viewmodel_directional_, sun_camera, rebirth_presentation, torch_mix, grading.exposure,
                 grading.tone_curve, grading.color_grading,
                 {viewmodel_fog.red, viewmodel_fog.green, viewmodel_fog.blue});
+            if (render_player.animation_valid)
+                avatar_viewmodel_->set_first_person_animation(render_player.animation);
+            // THE VIEWMODEL PASS. Its own projection (viewmodel_fov_degrees is
+            // scaled from retail's 90/45 with the FOV setting), its own depth
+            // buffer, composited over the finished world image - which is how
+            // every renderer tells the hands from the world; see the
+            // convention on AvatarViewmodel::draw before adding a pass on
+            // either side of this line.
+            if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_VIEWMODEL_BACKDROP") != nullptr)
+                // Capture aid: cover the finished world with a flat colour so a
+                // still holds the viewmodel layer alone for FOV comparisons.
+                fill(renderer_,
+                     {0.0F, 0.0F, static_cast<float>(metrics.output_width),
+                      static_cast<float>(metrics.output_height)},
+                     {255U, 0U, 255U, 255U});
+            avatar_viewmodel_->set_held_mod_item(held_mod_item_); // Modding, visuals area
+            avatar_viewmodel_->set_gunfx_frame(gunfx_reload_empty_, vertical_fov_degrees); // (GunFX)
             avatar_viewmodel_->draw(metrics, render_player, elapsed_seconds, reduced_motion,
                                     viewmodel_fov_degrees, atlas_);
+            first_person_muzzle_ = avatar_viewmodel_->muzzle();
         }
+        // (Visuals) a mod's colour grade over the world and the viewmodel
+        // together; nothing without a mod LUT.
+        if (depth_rendered && mod_graphics_ != nullptr && depth_renderer_ != nullptr)
+            depth_renderer_->draw_mod_grade();
+        // THE LENS PASS (Enhanced only): vignette, film grain and the player's
+        // contrast, colour strength and colour temperature, over the finished
+        // world AND the viewmodel just composited, before any HUD is drawn.
+        if (rebirth_presentation && depth_rendered && post_effects_.enabled)
+            depth_renderer_->draw_lens(elapsed_seconds);
+        // (Graphics area) mods' colour grade and fade over the same image,
+        // both presentations; nothing without a mod asking for one.
+        mod_screen_effects(metrics);
         const float eye_y = render_player.position.y + world::PlayerSimulation::eye_height;
         if (water_enabled && eye_y < world::water_level)
         {
@@ -3837,13 +5224,28 @@ void WorldPreviewRenderer::draw(const ui::UiMetrics &metrics, const world::SkySt
                 }
             }
         }
+        else if (eye_liquid != nullptr)
+        {
+            // (mod-liquid) The Lagoon's veil, in the liquid's own colour.
+            // (fix, wave 5) Without the Lagoon's five drifting bands: over a
+            // lit lake bed they read as thin lines ruled across the screen.
+            const auto channel = [&](std::size_t index, float scale) {
+                return static_cast<std::uint8_t>(
+                    std::lround(std::clamp(eye_liquid->color[index] * scale, 0.0F, 1.0F) * 255.0F));
+            };
+            fill(renderer_,
+                 {0.0F, 0.0F, static_cast<float>(metrics.output_width),
+                  static_cast<float>(metrics.output_height)},
+                 {channel(0U, 0.45F), channel(1U, 0.45F), channel(2U, 0.45F), 84U});
+        }
     }
 }
 
 void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::SkyState &sky,
                                     float elapsed_seconds, bool reduced_motion, float yaw,
                                     float pitch, float vertical_fov_degrees,
-                                    bool rebirth_presentation)
+                                    bool rebirth_presentation,
+                                    const world::BiomeAtmosphere &atmosphere)
 {
     constexpr int bands = 36;
     const float width = static_cast<float>(metrics.output_width);
@@ -3866,8 +5268,7 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
     // eye-adaptation multiplier into them crushed the already-dark cloud plate
     // into near-black at noon. Rebirth grades the sky independently, like a
     // modern HDR pipeline, while Classic retains the recovered behavior.
-    const float storminess =
-        rebirth_presentation ? world::biome_atmosphere(biome_).storminess : 0.0F;
+    const float storminess = rebirth_presentation ? atmosphere.storminess : 0.0F;
     const float sky_exposure = rebirth_presentation ? std::lerp(0.92F, 1.18F, sky.daylight) *
                                                           std::lerp(1.0F, 0.86F, storminess)
                                                     : grading.exposure;
@@ -3880,7 +5281,7 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
     constexpr float sky_reference = 0.72F;
     const float sky_scale =
         tone_curve_channel(sky_reference * sky_exposure, grading.tone_curve) / sky_reference;
-    for (int band = 0; band < bands; ++band)
+    for (int band = 0; band < bands && !rebirth_presentation; ++band)
     {
         const float amount = static_cast<float>(band) / static_cast<float>(bands - 1);
         const float eased = amount * amount * (3.0F - 2.0F * amount);
@@ -3888,7 +5289,41 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
              mix(zenith, horizon, eased));
     }
 
-    if (stats_.original_skies_loaded)
+    if (rebirth_presentation)
+    {
+        // Sample the dome in world directions. Screen-aligned colour bands
+        // moved the horizon with the camera and darkened it when looking down.
+        const float tangent_y = std::tan(view::sanitized_fov_degrees(vertical_fov_degrees) *
+                                         std::numbers::pi_v<float> / 360.0F);
+        const float tangent_x = tangent_y * width / height;
+        constexpr int columns = 24;
+        constexpr int rows = 24;
+        std::vector<SDL_Vertex> vertices;
+        vertices.reserve(columns * rows * 6);
+        const auto vertex = [&](int x, int y) {
+            const float u = static_cast<float>(x) / columns;
+            const float v = static_cast<float>(y) / rows;
+            const float dx = (u * 2.0F - 1.0F) * tangent_x;
+            const float dy = (1.0F - v * 2.0F) * tangent_y;
+            const float elevation =
+                (std::sin(pitch) + std::cos(pitch) * dy) / std::sqrt(1.0F + dx * dx + dy * dy);
+            const float amount = std::pow(std::clamp(elevation, 0.0F, 1.0F), 0.55F);
+            return SDL_Vertex{{u * width, v * height},
+                              to_float_color(mix(horizon, zenith, amount)),
+                              {0.0F, 0.0F}};
+        };
+        for (int y = 0; y < rows; ++y)
+            for (int x = 0; x < columns; ++x)
+            {
+                const auto a = vertex(x, y), b = vertex(x + 1, y);
+                const auto c = vertex(x + 1, y + 1), d = vertex(x, y + 1);
+                vertices.insert(vertices.end(), {a, b, c, a, c, d});
+            }
+        SDL_RenderGeometry(renderer_, nullptr, vertices.data(), static_cast<int>(vertices.size()),
+                           nullptr, 0);
+    }
+
+    if (stats_.original_skies_loaded && sky.hell < 0.999F)
     {
         const SkyCube *first = &night_sky_;
         const SkyCube *second = &night_sky_;
@@ -3934,8 +5369,28 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
             second = &night_sky_;
             amount = fraction;
         }
+        if (rebirth_presentation)
+        {
+            const auto blend = world::rebirth_sky_blend(sky.time_of_day);
+            const auto texture = [&](world::SkyTexture kind) -> const SkyCube * {
+                switch (kind)
+                {
+                case world::SkyTexture::day:
+                    return &clear_sky_;
+                case world::SkyTexture::dawn:
+                    return &dawn_sky_;
+                case world::SkyTexture::sunset:
+                    return &sunset_sky_;
+                default:
+                    return &night_sky_;
+                }
+            };
+            first = texture(blend.first);
+            second = texture(blend.second);
+            amount = blend.amount;
+        }
         constexpr float pi = 3.14159265358979323846F;
-        const float vertical_fov = std::clamp(vertical_fov_degrees, 50.0F, 105.0F) * pi / 180.0F;
+        const float vertical_fov = view::sanitized_fov_degrees(vertical_fov_degrees) * pi / 180.0F;
         const float tangent_vertical = std::tan(vertical_fov * 0.5F);
         const float tangent_horizontal = tangent_vertical * width / std::max(height, 1.0F);
         const float sine_yaw = std::sin(yaw);
@@ -4084,11 +5539,14 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
     // the horizon while pitching instead of pinning a dark gradient to the screen.
     {
         constexpr float pi = 3.14159265358979323846F;
-        const float vertical_fov = std::clamp(vertical_fov_degrees, 50.0F, 105.0F) * pi / 180.0F;
+        const float vertical_fov = view::sanitized_fov_degrees(vertical_fov_degrees) * pi / 180.0F;
         const float focal_length = height * 0.5F / std::tan(vertical_fov * 0.5F);
         const float sine_pitch = std::sin(pitch);
         const float cosine_pitch = std::cos(pitch);
-        const SDL_Color fog_color = to_color(presentation_fog);
+        const SDL_Color fog_color =
+            to_color(rebirth_presentation ? display_fog_color(presentation_fog, grading, atmosphere,
+                                                              sky.daylight, sky.hell)
+                                          : presentation_fog);
         const auto fog_amount_at = [&](float y) {
             const float camera_y = (height * 0.5F - y) / focal_length;
             const float world_y = cosine_pitch * camera_y + sine_pitch;
@@ -4149,7 +5607,7 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
     }
 
     constexpr float pi = 3.14159265358979323846F;
-    const float vertical_fov = std::clamp(vertical_fov_degrees, 50.0F, 105.0F) * pi / 180.0F;
+    const float vertical_fov = view::sanitized_fov_degrees(vertical_fov_degrees) * pi / 180.0F;
     const float sine_yaw = std::sin(yaw);
     const float cosine_yaw = std::cos(yaw);
     const float sine_pitch = std::sin(pitch);
@@ -4171,7 +5629,11 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
                                            tangent_horizontal;
     const float sun_y = height * 0.5F - sun_camera_y / std::max(sun_depth, 0.0001F) * height *
                                             0.5F / tangent_vertical;
-    const float sun_radius = metrics.px(30.0F);
+    // An angular size: it scales with the picture like everything else in the
+    // world, so the disc is the same share of the sky at every field of view.
+    const float sun_radius = metrics.px(30.0F) *
+                             view::half_tangent(view::default_vertical_fov_degrees) /
+                             tangent_vertical;
     const SDL_Color sun_color = sky.daylight > 0.42F ? SDL_Color{255U, 224U, 154U, 225U}
                                                      : SDL_Color{196U, 210U, 232U, 190U};
     for (int slice = -10; slice <= 10 && !stats_.original_skies_loaded && sun_depth > 0.0F; ++slice)
@@ -4199,12 +5661,14 @@ void WorldPreviewRenderer::draw_sky(const ui::UiMetrics &metrics, const world::S
             {x + cloud_width * 0.2F, y - metrics.px(11.0F), cloud_width * 0.48F, metrics.px(14.0F)},
             {220U, 225U, 226U, static_cast<Uint8>(14.0F + sky.daylight * 20.0F)});
     }
-    if (sky.lightning)
+    if (sky.lightning || sky.lightning_strength > 0.001F)
     {
-        // CastleMinerSky replaces its cube-map blend with pure white. This
-        // executes before terrain, so the flash illuminates only visible sky
-        // rather than washing the whole screen or brightening cave geometry.
-        fill(renderer_, {0.0F, 0.0F, width, height}, {255U, 255U, 255U, 255U});
+        // Enhanced storms brighten the cloud deck and exposed terrain together.
+        // Classic retains CastleMinerSky's original white replacement frame.
+        fill(renderer_, {0.0F, 0.0F, width, height},
+             rebirth_presentation
+                 ? SDL_Color{193U, 211U, 240U, static_cast<Uint8>(85.0F * sky.lightning_strength)}
+                 : SDL_Color{255U, 255U, 255U, 255U});
     }
 }
 
@@ -4221,8 +5685,7 @@ void WorldPreviewRenderer::draw_inspector(const ui::UiMetrics &metrics, const wo
                                 tile_width,
                                 tile_width * 0.5F,
                                 tile_width * 0.36F,
-                                (region_.minimum_x() + region_.maximum_x() + 1) * 0.5F,
-                                (region_.minimum_z() + region_.maximum_z() + 1) * 0.5F};
+                                static_cast<float>(center_x()), static_cast<float>(center_z())};
     std::vector<SDL_Vertex> vertices;
     vertices.reserve(faces_.size() * 6U);
     for (const RenderFace &render_face : faces_)
@@ -4257,8 +5720,11 @@ void WorldPreviewRenderer::draw_inspector(const ui::UiMetrics &metrics, const wo
                       projection.point(x + 1.0F, y + 1.0F, z + 1.0F),
                       projection.point(x, y + 1.0F, z + 1.0F)};
         }
-        const int tile_x = face.tile & 7;
-        const int tile_y = face.tile >> 3;
+        // (Visuals) a mod tile (64..) is not in this 8x8 atlas: its fallback is.
+        const std::uint8_t atlas_tile =
+            face.tile < 64U ? face.tile : world::atlas_tile(face.block, face.direction);
+        const int tile_x = atlas_tile & 7;
+        const int tile_y = atlas_tile >> 3;
         constexpr float inset = 0.0012F;
         const float u0 = static_cast<float>(tile_x) / 8.0F + inset;
         const float v0 = static_cast<float>(tile_y) / 8.0F + inset;
@@ -4305,7 +5771,7 @@ void WorldPreviewRenderer::draw_first_person(const ui::UiMetrics &metrics,
     const float width = static_cast<float>(metrics.output_width);
     const float height = static_cast<float>(metrics.output_height);
     constexpr float pi = 3.14159265358979323846F;
-    const float vertical_fov = std::clamp(vertical_fov_degrees, 50.0F, 105.0F) * pi / 180.0F;
+    const float vertical_fov = view::sanitized_fov_degrees(vertical_fov_degrees) * pi / 180.0F;
     const float focal_length = height * 0.5F / std::tan(vertical_fov * 0.5F);
     const float sine_yaw = std::sin(player.yaw);
     const float cosine_yaw = std::cos(player.yaw);
@@ -4427,8 +5893,11 @@ void WorldPreviewRenderer::draw_first_person(const ui::UiMetrics &metrics,
         {
             continue;
         }
-        const int tile_x = face.tile & 7;
-        const int tile_y = face.tile >> 3;
+        // (Visuals) a mod tile (64..) is not in this 8x8 atlas: its fallback is.
+        const std::uint8_t atlas_tile =
+            face.tile < 64U ? face.tile : world::atlas_tile(face.block, face.direction);
+        const int tile_x = atlas_tile & 7;
+        const int tile_y = atlas_tile >> 3;
         constexpr float inset = 0.0012F;
         const float u0 = static_cast<float>(tile_x) / 8.0F + inset;
         const float v0 = static_cast<float>(tile_y) / 8.0F + inset;
@@ -4880,14 +6349,118 @@ void WorldPreviewRenderer::append_door_models(EntityBatch &batch, const world::P
     }
 }
 
+std::shared_ptr<const modding::graphics::ItemLook> WorldPreviewRenderer::pickup_mod_model(
+    const BlockPickup &pickup) const
+{
+    if (pickup.mod_item == 0U || !mod_item_models_)
+        return nullptr;
+    auto look = mod_item_models_(pickup.mod_item);
+    return look != nullptr && !look->empty() ? look : nullptr;
+}
+
 void WorldPreviewRenderer::append_pickup_models(EntityBatch &batch)
 {
     for (const BlockPickup &pickup : block_pickups_)
     {
+        // Modding, visuals area: a mod item's pickup is its icon as a solid
+        // sprite, standing upright and turning like the retail models, lit the
+        // way they are (baked shade, no normals). (Items) Or its glTF model,
+        // upright, no bigger than a pickup, in its materials.
+        if (pickup.mod_item != 0U)
+        {
+            if (!pickup.flying_to_player && (pickup_blinked_out(pickup.time_left) ||
+                                             !region_loaded(pickup.position.x, pickup.position.z)))
+                continue;
+            if (const auto look = pickup_mod_model(pickup))
+            {
+                world::Vec3 center = pickup.position;
+                if (!pickup.flying_to_player)
+                    center.y += std::sin(pickup.bounce_phase) * 0.1F + 0.1F;
+                const float spin_cosine = std::cos(-pickup.rotation);
+                const float spin_sine = std::sin(-pickup.rotation);
+                const auto baked = [&](float normal_x, float normal_y, float normal_z) {
+                    const float turned_x = normal_x * spin_cosine + normal_z * spin_sine;
+                    const float turned_z = -normal_x * spin_sine + normal_z * spin_cosine;
+                    return std::clamp(0.68F + normal_y * 0.18F - turned_z * 0.10F + turned_x * 0.04F, 0.40F,
+                                      1.0F);
+                };
+                if (look->model != nullptr)
+                {
+                    if (pickup_item_scratch_ == nullptr)
+                        pickup_item_scratch_ = std::make_unique<modding::graphics::ItemPoseScratch>();
+                    modding::graphics::pose_item_model(*look->model, {}, pickup_item_parts_,
+                                                       *pickup_item_scratch_);
+                    const modding::graphics::Matrix4 placed = modding::graphics::dropped_item_transform(
+                        *look, {center.x, center.y, center.z}, pickup.rotation);
+                    for (const modding::graphics::PosedItemPart &part : pickup_item_parts_)
+                    {
+                        if (part.vertices.empty())
+                            continue;
+                        EntitySpan span;
+                        span.texture = white_texture_;
+                        if (part.material >= 0 &&
+                            static_cast<std::size_t>(part.material) < look->model->materials.size())
+                            if (SDL_Texture *own = mod_material_texture(
+                                    look->model, look->model->materials[static_cast<std::size_t>(part.material)]))
+                                span.texture = own;
+                        span.repeat_texture = true;
+                        span.first = static_cast<std::uint32_t>(batch.vertices.size());
+                        const std::array<float, 4> color =
+                            modding::graphics::item_material_color(*look->model, part.material);
+                        for (const modding::graphics::PosedItemVertex &source : part.vertices)
+                        {
+                            const modding::graphics::Vec3 point =
+                                modding::graphics::transform_point(placed, source.position);
+                            // Shaded like the icons: the model's own normal, turned with the spin.
+                            const float light = baked(source.normal.x, source.normal.y, source.normal.z);
+                            EntityVertex vertex;
+                            vertex.x = point.x;
+                            vertex.y = point.y;
+                            vertex.z = point.z;
+                            vertex.u = source.uv[0];
+                            vertex.v = source.uv[1];
+                            vertex.red = color[0] * light;
+                            vertex.green = color[1] * light;
+                            vertex.blue = color[2] * light;
+                            batch.vertices.push_back(vertex);
+                        }
+                        span.count = static_cast<std::uint32_t>(batch.vertices.size()) - span.first;
+                        batch.spans.push_back(span);
+                    }
+                    continue;
+                }
+                constexpr float size = 0.3F;
+                const float scale = size * std::clamp(look->scale, 0.25F, 2.0F);
+                EntitySpan span;
+                span.texture = white_texture_;
+                span.first = static_cast<std::uint32_t>(batch.vertices.size());
+                for (const modding::graphics::IconModelVertex &source : look->icon->vertices)
+                {
+                    const float x = source.position[0] * scale;
+                    const float z = source.position[2] * scale;
+                    const float light = baked(source.normal[0], source.normal[1], source.normal[2]);
+                    EntityVertex vertex;
+                    vertex.x = center.x + x * spin_cosine + z * spin_sine;
+                    vertex.y = center.y + source.position[1] * scale;
+                    vertex.z = center.z - x * spin_sine + z * spin_cosine;
+                    vertex.u = 0.5F;
+                    vertex.v = 0.5F;
+                    vertex.red = source.color[0] * light;
+                    vertex.green = source.color[1] * light;
+                    vertex.blue = source.color[2] * light;
+                    batch.vertices.push_back(vertex);
+                }
+                span.count = static_cast<std::uint32_t>(batch.vertices.size()) - span.first;
+                if (span.count > 0U)
+                    batch.spans.push_back(span);
+                continue;
+            }
+        }
         if (pickup.block != world::BlockType::empty)
             continue;
-        if (!pickup.flying_to_player && pickup.time_left <= 5.0F &&
-            std::fmod(pickup.age * 8.0F, 1.0F) >= 0.5F)
+        if (!pickup.flying_to_player &&
+            (pickup_blinked_out(pickup.time_left) ||
+             !region_loaded(pickup.position.x, pickup.position.z)))
             continue;
         const PickupModelChoice choice = pickup_model_choice(pickup.item);
         if (choice.model == nullptr || !choice.model->loaded())
@@ -4909,7 +6482,7 @@ void WorldPreviewRenderer::append_pickup_models(EntityBatch &batch)
         for (const StaticModelPart &part : choice.model->parts())
         {
             EntitySpan span;
-            span.texture = part.texture;
+            span.texture = (part.material_flags & 4U) != 0U ? white_texture_ : part.texture;
             span.first = static_cast<std::uint32_t>(batch.vertices.size());
             for (const std::uint32_t index : part.indices)
             {
@@ -4930,7 +6503,8 @@ void WorldPreviewRenderer::append_pickup_models(EntityBatch &batch)
                 const float spun_x = point[0] * spin_cosine + point[2] * spin_sine;
                 const float spun_z = -point[0] * spin_sine + point[2] * spin_cosine;
                 const std::array<float, 3> part_tint =
-                    (part.material_flags & 2U) != 0U
+                    (part.material_flags & 8U) != 0U ? projectile_tint(pickup.item)
+                    : (part.material_flags & 2U) != 0U
                         ? choice.secondary
                         : ((part.material_flags & 1U) != 0U
                                ? choice.primary
@@ -4949,6 +6523,13 @@ void WorldPreviewRenderer::append_pickup_models(EntityBatch &batch)
                     part.diffuse[1] * source.color[1] * color_scale * part_tint[1] * light;
                 vertex.blue =
                     part.diffuse[2] * source.color[2] * color_scale * part_tint[2] * light;
+                if ((part.material_flags & 12U) != 0U)
+                {
+                    vertex.red = part_tint[0];
+                    vertex.green = part_tint[1];
+                    vertex.blue = part_tint[2];
+                    vertex.sky_light = (part.material_flags & 4U) != 0U ? -3.0F : -2.0F;
+                }
                 batch.vertices.push_back(vertex);
             }
             span.count = static_cast<std::uint32_t>(batch.vertices.size()) - span.first;
@@ -4965,7 +6546,7 @@ void WorldPreviewRenderer::draw_mining_effects(const ui::UiMetrics &metrics,
     constexpr float pi = 3.14159265358979323846F;
     const float width = static_cast<float>(metrics.output_width);
     const float height = static_cast<float>(metrics.output_height);
-    const float vertical_fov = std::clamp(vertical_fov_degrees, 50.0F, 105.0F) * pi / 180.0F;
+    const float vertical_fov = view::sanitized_fov_degrees(vertical_fov_degrees) * pi / 180.0F;
     const float focal_length = height * 0.5F / std::tan(vertical_fov * 0.5F);
     const float sine_yaw = std::sin(player.yaw);
     const float cosine_yaw = std::cos(player.yaw);
@@ -5353,8 +6934,9 @@ void WorldPreviewRenderer::draw_mining_effects(const ui::UiMetrics &metrics,
 
     for (const auto &pickup : block_pickups_)
     {
-        if (!pickup.flying_to_player && pickup.time_left <= 5.0F &&
-            std::fmod(pickup.age * 8.0F, 1.0F) >= 0.5F)
+        if (!pickup.flying_to_player &&
+            (pickup_blinked_out(pickup.time_left) ||
+             !region_loaded(pickup.position.x, pickup.position.z)))
             continue;
         world::Vec3 display = pickup.position;
         if (!pickup.flying_to_player)
@@ -5460,7 +7042,7 @@ void WorldPreviewRenderer::draw_target_outline(const ui::UiMetrics &metrics,
     constexpr float pi = 3.14159265358979323846F;
     const float width = static_cast<float>(metrics.output_width);
     const float height = static_cast<float>(metrics.output_height);
-    const float vertical_fov = std::clamp(vertical_fov_degrees, 50.0F, 105.0F) * pi / 180.0F;
+    const float vertical_fov = view::sanitized_fov_degrees(vertical_fov_degrees) * pi / 180.0F;
     const float focal_length = height * 0.5F / std::tan(vertical_fov * 0.5F);
     const float sine_yaw = std::sin(player.yaw);
     const float cosine_yaw = std::cos(player.yaw);

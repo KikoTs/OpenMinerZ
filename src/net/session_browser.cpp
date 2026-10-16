@@ -1,4 +1,5 @@
 #include "openminerz/net/session_browser.hpp"
+#include "openminerz/net/legacy_steam_host_session.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -214,7 +215,7 @@ bool validate_session_advertisement(const DiscoveredSession &session, ProtocolVe
 }
 
 JoinAssessment assess_join(const DiscoveredSession &session, const ModManifest &client_manifest,
-                           bool client_advertises_extension)
+                           bool client_advertises_extension, PeerId local_peer)
 {
     JoinAssessment result;
     std::string error;
@@ -227,6 +228,20 @@ JoinAssessment assess_join(const DiscoveredSession &session, const ModManifest &
         return result;
     }
     result.password_required = session.password_required;
+    // Compared by platform id only: another player may legitimately share the
+    // local display name, and the local account may host under any name.
+    if (local_peer != 0U && session.host_peer == local_peer)
+    {
+        result.status = JoinCompatibility::own_session;
+        result.detail = "This lobby is hosted by your own Steam account.";
+        return result;
+    }
+    if (session.properties[1] != 0)
+    {
+        result.status = JoinCompatibility::session_closed;
+        result.detail = "This game is no longer accepting players.";
+        return result;
+    }
     if (session.current_players >= session.maximum_players)
     {
         result.status = JoinCompatibility::full;
@@ -302,6 +317,8 @@ const char *join_compatibility_label(JoinCompatibility status) noexcept
         return "COMPATIBLE";
     case JoinCompatibility::full:
         return "FULL";
+    case JoinCompatibility::session_closed:
+        return "CLOSED";
     case JoinCompatibility::platform_restricted:
         return "INVITE REQUIRED";
     case JoinCompatibility::malformed_advertisement:
@@ -312,8 +329,92 @@ const char *join_compatibility_label(JoinCompatibility status) noexcept
         return "MOD EXTENSION";
     case JoinCompatibility::mod_mismatch:
         return "MOD MISMATCH";
+    case JoinCompatibility::own_session:
+        return "YOUR OWN LOBBY";
     }
     return "UNKNOWN";
+}
+
+JoinFailureNotice describe_join_failure(std::string_view reason)
+{
+    struct Known final
+    {
+        std::string_view code;
+        std::string_view title;
+        std::string_view detail;
+        bool retry_password;
+    };
+    // Host denial codes are DNA.Net.GamerServices.NetworkSession.ResultCode names;
+    // lobby-enter codes mirror the names the stock client reports for Steam's
+    // EChatRoomEnterResponse values.
+    static constexpr Known known[]{
+        {"GamerAlreadyConnected", "ALREADY IN THIS SESSION",
+         "The host reports your Steam account or player name as already connected. If you just "
+         "left, wait a few seconds and join again.",
+         false},
+        {"IncorrectPassword", "INCORRECT PASSWORD",
+         "The host rejected the password. Enter it again and retry.", true},
+        {"GameIsFull", "SERVER IS FULL", "Every player slot on this server is taken.", false},
+        {"GameNoLongerExists", "SERVER NO LONGER AVAILABLE",
+         "This server went offline or stopped accepting players.", false},
+        {"ServerHasNewerVersion", "VERSION MISMATCH",
+         "The host runs a newer network version than this profile.", false},
+        {"ServerHasOlderVersion", "VERSION MISMATCH",
+         "The host runs an older network version than this profile.", false},
+        {"VersionIsInvalid", "VERSION MISMATCH",
+         "The host could not read this profile's join request.", false},
+        {"GameNamesDontMatch", "VERSION MISMATCH", "The host is running a different game.", false},
+        {"SessionPropertiesDontMatch", "SERVER SETTINGS CHANGED",
+         "The host changed its game settings after it was listed. Join again to use the new "
+         "settings.",
+         false},
+        // Also what a server that only admits OpenMinerZ players says to the
+        // original game (legacy_modded_session_denial); an OpenMinerZ client
+        // never meets that case, it negotiates first.
+        {"ConnectionDenied", "HOST DENIED THE CONNECTION",
+         "The host only admits friends or invited players, or has blocked this account.", false},
+        {"HostDeniedConnection", "HOST UNREACHABLE",
+         "A connection to the host could not be established.", false},
+        {"HostDisconnected", "HOST DISCONNECTED", "The host left before the join completed.",
+         false},
+        {"YouLackTheNeededPermissions", "NOT ALLOWED TO JOIN",
+         "Steam did not admit this account. The lobby is friends-only or invite-only.", false},
+        {"BannedBySteam", "NOT ALLOWED TO JOIN", "Steam reports this account as banned here.",
+         false},
+        {"YouAreALimitedUserAndCannotJoin", "NOT ALLOWED TO JOIN",
+         "Limited Steam accounts cannot join lobbies.", false},
+        {"UnknownSteamErrorJoiningGame", "STEAM COULD NOT JOIN THE LOBBY",
+         "Steam reported an error while entering the lobby. Try again.", false},
+        {"HostDidNotAnswer", "HOST DID NOT ANSWER",
+         "The host did not answer the join request. It may have gone offline.", false},
+        {"HostStoppedResponding", "HOST STOPPED RESPONDING",
+         "The host stopped sending the world before loading finished.", false},
+        {"OwnSteamAccount", "YOUR OWN LOBBY",
+         "This lobby is hosted by your own Steam account, so it cannot be joined from it.",
+         false},
+        {"JoinCancelled", "JOIN CANCELLED", "The join was cancelled.", false},
+    };
+    for (const Known &entry : known)
+        if (reason == entry.code)
+            return {std::string{entry.title}, std::string{entry.detail}, entry.retry_password};
+    return {"COULD NOT JOIN",
+            reason.empty() ? std::string{"The join ended without a reported reason."}
+                           : std::string{reason},
+            false};
+}
+
+std::size_t remap_browser_selection(std::size_t selection,
+                                    std::span<const std::uint64_t> previous_rows,
+                                    std::span<const std::uint64_t> current_rows) noexcept
+{
+    if (selection >= previous_rows.size())
+        return current_rows.size() + (selection - previous_rows.size());
+    const auto found =
+        std::find(current_rows.begin(), current_rows.end(), previous_rows[selection]);
+    if (found != current_rows.end())
+        return static_cast<std::size_t>(found - current_rows.begin());
+    // The highlighted server expired. Stay near it, or fall to the first action.
+    return std::min(selection, current_rows.size());
 }
 
 void SessionBrowser::replace(std::vector<DiscoveredSession> sessions)
@@ -350,20 +451,59 @@ void SessionBrowser::set_client(ModManifest manifest, bool advertises_extension)
     rebuild();
 }
 
+void SessionBrowser::set_local_peer(PeerId local_peer)
+{
+    local_peer_ = local_peer;
+    rebuild();
+}
+
+void SessionBrowser::select(std::uint64_t session_id) noexcept
+{
+    selected_id_ = session_id;
+}
+
+std::optional<std::size_t> SessionBrowser::index_of(std::uint64_t session_id) const noexcept
+{
+    if (session_id == 0U)
+        return std::nullopt;
+    for (std::size_t index = 0U; index < sessions_.size(); ++index)
+        if (sessions_[index].session_id == session_id)
+            return index;
+    return std::nullopt;
+}
+
+std::optional<std::size_t> SessionBrowser::visible_row_of(
+    std::uint64_t session_id) const noexcept
+{
+    if (session_id == 0U)
+        return std::nullopt;
+    for (std::size_t row = 0U; row < visible_indices_.size(); ++row)
+        if (sessions_[visible_indices_[row]].session_id == session_id)
+            return row;
+    return std::nullopt;
+}
+
 JoinAssessment SessionBrowser::assessment(std::size_t session_index) const
 {
     if (session_index >= sessions_.size())
         return {JoinCompatibility::malformed_advertisement, ProtocolVersion::classic_v3, false,
                 "Session selection is out of range."};
-    return assess_join(sessions_[session_index], client_manifest_, client_advertises_extension_);
+    return assess_join(sessions_[session_index], client_manifest_, client_advertises_extension_,
+                       local_peer_);
 }
 
 void SessionBrowser::rebuild()
 {
     visible_indices_.clear();
+    own_session_count_ = 0U;
     for (std::size_t index = 0U; index < sessions_.size(); ++index)
     {
         const DiscoveredSession &session = sessions_[index];
+        if (local_peer_ != 0U && session.host_peer == local_peer_)
+        {
+            ++own_session_count_;
+            continue;
+        }
         if (!source_matches(session.source, options_.filter) ||
             !contains_query(session, options_.query))
             continue;
@@ -386,6 +526,190 @@ void SessionBrowser::rebuild()
                              return sortable_ping(a) < sortable_ping(b);
                          return lower(a.server_name) < lower(b.server_name);
                      });
+}
+
+void JoinBrowserFlow::set_assessor(Assessor assessor)
+{
+    assessor_ = std::move(assessor);
+}
+
+void JoinBrowserFlow::browser_opened() noexcept
+{
+    refresh_due_ = true;
+}
+
+void JoinBrowserFlow::request_refresh() noexcept
+{
+    refresh_due_ = true;
+    manual_refresh_ = true;
+}
+
+void JoinBrowserFlow::transport_lost() noexcept
+{
+    refresh_due_ = true;
+}
+
+JoinBrowserAction JoinBrowserFlow::start_discovery(bool quiet) noexcept
+{
+    refresh_due_ = false;
+    manual_refresh_ = false;
+    refresh_timer_ = refresh_interval_seconds;
+    JoinBrowserAction action;
+    action.kind = JoinBrowserAction::Kind::start_discovery;
+    action.quiet = quiet;
+    return action;
+}
+
+JoinBrowserAction JoinBrowserFlow::tick(float seconds, bool browser_visible,
+                                        const JoinTransportView &transport)
+{
+    if (transport.in_session)
+    {
+        pending_.reset();
+        return {};
+    }
+    // One helper operation at a time. Requests stay latched until it completes.
+    if (transport.busy)
+        return {};
+    // A queued join outlived the operation it waited behind (for example a join
+    // that was cancelled). Discover again; that result resolves it by lobby id.
+    if (pending_.has_value())
+        return start_discovery(true);
+    if (!browser_visible)
+        return {};
+    if (refresh_due_)
+        return start_discovery(!manual_refresh_);
+    refresh_timer_ -= std::max(0.0F, seconds);
+    if (refresh_timer_ <= 0.0F)
+        return start_discovery(true);
+    return {};
+}
+
+JoinBrowserAction JoinBrowserFlow::request_join(std::uint64_t session_id, std::string password,
+                                                const JoinTransportView &transport,
+                                                const SessionBrowser &browser)
+{
+    JoinBrowserAction action;
+    if (transport.in_session)
+    {
+        action.failure = JoinFailureNotice{"ALREADY IN A SESSION",
+                                           "Leave the current server before joining another.",
+                                           false};
+        return action;
+    }
+    if (session_id == 0U)
+    {
+        action.failure = describe_join_failure("GameNoLongerExists");
+        return action;
+    }
+    pending_ = PendingJoin{session_id, std::move(password)};
+    // Wait for the operation in flight. Its completion resolves this request.
+    if (transport.busy)
+        return action;
+    // The idle helper produced the rows on screen, so a listed lobby is current.
+    if (transport.ready && browser.index_of(session_id).has_value())
+        return resolve_pending(browser);
+    // No live helper, or the row is not in the helper's latest list: discover
+    // first, then re-resolve the lobby by id.
+    return start_discovery(true);
+}
+
+void JoinBrowserFlow::cancel_join() noexcept
+{
+    pending_.reset();
+    refresh_due_ = true;
+}
+
+JoinBrowserAction JoinBrowserFlow::resolve_pending(const SessionBrowser &browser)
+{
+    JoinBrowserAction action;
+    if (!pending_.has_value())
+        return action;
+    PendingJoin pending = std::move(*pending_);
+    pending_.reset();
+    const std::optional<std::size_t> index = browser.index_of(pending.session_id);
+    if (!index.has_value())
+    {
+        action.failure = describe_join_failure("GameNoLongerExists");
+        return action;
+    }
+    const DiscoveredSession &session = browser.sessions()[*index];
+    JoinAssessment assessment;
+    if (assessor_)
+        assessment = assessor_(session);
+    else
+    {
+        ModManifest manifest;
+        if (session.properties[0] == static_cast<std::int32_t>(ProtocolVersion::modern_v4))
+            manifest.protocol = ProtocolVersion::modern_v4;
+        assessment = assess_join(session, manifest, true, browser.local_peer());
+    }
+    if (!assessment.joinable())
+    {
+        action.failure =
+            assessment.status == JoinCompatibility::full ? describe_join_failure("GameIsFull")
+            : assessment.status == JoinCompatibility::session_closed
+                ? describe_join_failure("GameNoLongerExists")
+            : assessment.status == JoinCompatibility::own_session
+                ? describe_join_failure("OwnSteamAccount")
+                : JoinFailureNotice{join_compatibility_label(assessment.status),
+                                    assessment.detail, false};
+        return action;
+    }
+    action.kind = JoinBrowserAction::Kind::start_join;
+    action.session_id = pending.session_id;
+    action.protocol = assessment.protocol;
+    action.password = std::move(pending.password);
+    return action;
+}
+
+JoinBrowserAction JoinBrowserFlow::discovery_succeeded(SessionBrowser &browser,
+                                                       std::vector<DiscoveredSession> sessions,
+                                                       PeerId local_peer)
+{
+    browser.set_local_peer(local_peer);
+    browser.replace(std::move(sessions));
+    consecutive_failures_ = 0U;
+    refresh_due_ = false;
+    manual_refresh_ = false;
+    refresh_timer_ = refresh_interval_seconds;
+    return resolve_pending(browser);
+}
+
+JoinBrowserAction JoinBrowserFlow::discovery_failed(SessionBrowser &browser,
+                                                    std::string_view error)
+{
+    ++consecutive_failures_;
+    refresh_due_ = false;
+    manual_refresh_ = false;
+    float delay = first_retry_seconds;
+    for (std::size_t attempt = 1U;
+         attempt < consecutive_failures_ && delay < maximum_retry_seconds; ++attempt)
+        delay *= 2.0F;
+    refresh_timer_ = std::min(delay, maximum_retry_seconds);
+    // One failed refresh keeps the list (a join still re-resolves every row). A
+    // second in a row means the rows can no longer be confirmed, so they expire.
+    if (consecutive_failures_ >= 2U)
+        browser.replace({});
+    JoinBrowserAction action;
+    if (pending_.has_value())
+    {
+        pending_.reset();
+        action.failure = JoinFailureNotice{
+            "COULD NOT REACH STEAM",
+            error.empty() ? std::string{"The server list could not be refreshed."}
+                          : std::string{error},
+            false};
+    }
+    return action;
+}
+
+JoinFailureNotice JoinBrowserFlow::join_failed(std::string_view reason)
+{
+    // A failed join consumes the helper. Restore the list without being asked.
+    pending_.reset();
+    refresh_due_ = true;
+    return describe_join_failure(reason);
 }
 
 } // namespace openminerz::net

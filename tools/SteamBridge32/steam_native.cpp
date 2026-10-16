@@ -355,6 +355,13 @@ std::uint64_t SteamNative::friend_game_lobby(std::uint64_t friend_id) const
     if (vtable_method<GetFriendGamePlayed>(friends_, 8U)(friends_, friend_id, game_info.data()) ==
         0U)
         return 0U;
+    // FriendGameInfo_t starts with the CGameID whose low 24 bits are the app id.
+    // A friend's lobby in another game can never be read through this app, and
+    // waiting for its data stalls every discovery for the full deadline.
+    std::uint64_t game_id{};
+    std::memcpy(&game_id, game_info.data(), sizeof(game_id));
+    if (static_cast<std::uint32_t>(game_id & 0x00FF'FFFFU) != app_id())
+        return 0U;
     std::uint64_t lobby{};
     std::memcpy(&lobby, game_info.data() + 16U, sizeof(lobby));
     return lobby;

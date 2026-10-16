@@ -4,7 +4,10 @@
   "description": "Clean C++20 CastleMiner Z-inspired runtime",
   "builtin-baseline": "f14401ca0f2754347c3864da7488a9b955b4e47a",
   "dependencies": [
+    "cgltf",
     "freetype",
-    "sdl3"
+    "luau",
+    "sdl3",
+    "stb"
   ]
 }

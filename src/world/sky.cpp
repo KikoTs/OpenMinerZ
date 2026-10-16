@@ -130,7 +130,7 @@ LightPack lighting(float time) noexcept
     return blend_pack(dusk, night, blend, "DUSK");
 }
 
-SkyState rebirth_lighting(float time, const char *period) noexcept
+SkyState rebirth_lighting(float time) noexcept
 {
     // A fixed 68-degree maximum elevation gives the blocks useful directional
     // relief at noon while still crossing the horizon at 06:00 and 18:00.
@@ -149,8 +149,8 @@ SkyState rebirth_lighting(float time, const char *period) noexcept
     // illumination, unlike indirect sky light, reaches exactly zero at night.
     const float daylight = smooth_step(-0.18F, 0.16F, sun_y);
     const float direct_amount = smooth_step(-0.005F, 0.14F, sun_y);
-    const float twilight = smooth_step(-0.22F, -0.015F, sun_y) *
-                            (1.0F - smooth_step(0.02F, 0.42F, std::abs(sun_y)));
+    const float twilight =
+        smooth_step(-0.22F, -0.015F, sun_y) * (1.0F - smooth_step(0.02F, 0.42F, std::abs(sun_y)));
     const bool morning = time < 0.5F;
 
     constexpr SkyColor night_zenith{0.008F, 0.016F, 0.050F};
@@ -162,12 +162,12 @@ SkyState rebirth_lighting(float time, const char *period) noexcept
     constexpr SkyColor day_fog{0.290F, 0.340F, 0.360F};
     constexpr SkyColor day_ambient{0.380F, 0.400F, 0.420F};
     constexpr SkyColor dawn_zenith{0.110F, 0.160F, 0.300F};
-    constexpr SkyColor dawn_horizon{0.900F, 0.430F, 0.210F};
-    constexpr SkyColor dawn_fog{0.410F, 0.260F, 0.190F};
+    constexpr SkyColor dawn_horizon{0.740F, 0.500F, 0.360F};
+    constexpr SkyColor dawn_fog{0.340F, 0.300F, 0.270F};
     constexpr SkyColor dawn_ambient{0.260F, 0.210F, 0.190F};
     constexpr SkyColor dusk_zenith{0.100F, 0.090F, 0.180F};
-    constexpr SkyColor dusk_horizon{0.950F, 0.280F, 0.100F};
-    constexpr SkyColor dusk_fog{0.430F, 0.210F, 0.120F};
+    constexpr SkyColor dusk_horizon{0.660F, 0.360F, 0.260F};
+    constexpr SkyColor dusk_fog{0.320F, 0.250F, 0.240F};
     constexpr SkyColor dusk_ambient{0.270F, 0.190F, 0.150F};
 
     const SkyColor twilight_zenith = morning ? dawn_zenith : dusk_zenith;
@@ -187,21 +187,55 @@ SkyState rebirth_lighting(float time, const char *period) noexcept
     // light below stay at zero, so this cannot create night-time cast shadows.
     ambient = mix(ambient, twilight_ambient, twilight * 0.68F);
 
-    const SkyColor low_sun = morning ? SkyColor{1.0F, 0.62F, 0.34F}
-                                     : SkyColor{1.0F, 0.46F, 0.20F};
+    const SkyColor low_sun = morning ? SkyColor{1.0F, 0.62F, 0.34F} : SkyColor{1.0F, 0.46F, 0.20F};
     constexpr SkyColor high_sun{1.0F, 0.98F, 0.92F};
     const float neutral_sun = smooth_step(0.03F, 0.58F, sun_y);
     const SkyColor direct = scale(mix(low_sun, high_sun, neutral_sun), direct_amount);
     const SkyColor specular = scale(direct, 0.92F);
 
-    return {time,       sun_x,  sun_y,  sun_z, daylight, zenith, horizon,
-            fog,        ambient, direct, specular, period, false};
+    const char *period = sun_y < -0.18F  ? "NIGHT"
+                         : sun_y < 0.14F ? (morning ? "DAWN" : "DUSK")
+                         : sun_y < 0.42F ? (morning ? "MORNING" : "SUNSET")
+                                         : "DAY";
+    return {time, sun_x,   sun_y,  sun_z,    daylight, zenith, horizon,
+            fog,  ambient, direct, specular, period,   false};
 }
 
 } // namespace
 
+SkyBlend rebirth_sky_blend(float time_of_day) noexcept
+{
+    const float time = wrap01(time_of_day);
+    const float elevation = std::sin((time - 0.25F) * 2.0F * pi) * std::sin(68.0F * pi / 180.0F);
+    const auto twilight = time < 0.5F ? SkyTexture::dawn : SkyTexture::sunset;
+    if (elevation < 0.02F)
+        return {SkyTexture::night, twilight, smooth_step(-0.18F, 0.02F, elevation)};
+    return {twilight, SkyTexture::day, smooth_step(0.02F, 0.42F, elevation)};
+}
+
 DayNightCycle::DayNightCycle(float day) noexcept : day_(day)
 {
+}
+
+float lightning_envelope(float previous, bool flashing, float elapsed_seconds, float cloud_cover,
+                         bool exposed) noexcept
+{
+    if (!exposed)
+        return 0.0F;
+    const float target = flashing ? std::clamp(cloud_cover, 0.0F, 1.0F) : 0.0F;
+    const float response =
+        1.0F - std::exp(-std::max(0.0F, elapsed_seconds) / (flashing ? 0.035F : 0.18F));
+    return std::lerp(std::clamp(previous, 0.0F, 1.0F), target, response);
+}
+
+void apply_lightning_illumination(SkyState &sky) noexcept
+{
+    const float flash = std::clamp(sky.lightning_strength, 0.0F, 1.0F) * (1.0F - sky.hell);
+    sky.ambient.red += 0.42F * flash;
+    sky.ambient.green += 0.50F * flash;
+    sky.ambient.blue += 0.66F * flash;
+    sky.horizon = mix(sky.horizon, {0.70F, 0.76F, 0.88F}, flash * 0.35F);
+    sky.fog = mix(sky.fog, {0.52F, 0.59F, 0.72F}, flash * 0.22F);
 }
 
 void DayNightCycle::update(float elapsed_seconds, float speed) noexcept
@@ -229,7 +263,7 @@ SkyState DayNightCycle::state(SkyModel model) const
     const float time = time_of_day();
     const auto pack = lighting(time);
     if (model == SkyModel::rebirth)
-        return rebirth_lighting(time, pack.name);
+        return rebirth_lighting(time);
     float phase = wrap01(time + 1.625F) * 2.0F * pi;
     const float sun_y = 0.2F + 0.8F * std::abs(std::sin(phase));
     const float radial = std::sqrt(std::max(0.0F, 1.0F - sun_y * sun_y));
@@ -292,8 +326,8 @@ int LightningCycle::next_int(int minimum, int maximum_exclusive) noexcept
 {
     if (maximum_exclusive <= minimum)
         return minimum;
-    return minimum + static_cast<int>(
-        next() % static_cast<std::uint64_t>(maximum_exclusive - minimum));
+    return minimum +
+           static_cast<int>(next() % static_cast<std::uint64_t>(maximum_exclusive - minimum));
 }
 
 void LightningCycle::schedule_initial() noexcept
@@ -304,7 +338,7 @@ void LightningCycle::schedule_initial() noexcept
 }
 
 LightningUpdate LightningCycle::update(float elapsed_seconds, int depth_under_ground,
-                                        float player_y) noexcept
+                                       float player_y) noexcept
 {
     const float delta = std::max(0.0F, elapsed_seconds);
     if (flash_count_ <= 0 || depth_under_ground > 2 || player_y <= -32.0F)

@@ -125,6 +125,13 @@ struct KickPayload final
 // Below the wire ceiling on purpose: one syntactically valid packet must not
 // force more than a bounded amount of world/snapshot work at every recipient.
 inline constexpr std::size_t maximum_remove_blocks = 4096U;
+// What a RECEIVED RemoveBlocksMessage may hold. Explosive.FindBlocksToRemove
+// puts a whole chain reaction into ONE message with no limit of its own (the
+// original's message buffer simply grows), so a stock player's large TNT or C4
+// field legitimately exceeds the 4096 cells this client chooses to send per
+// message. Refusing it left thousands of blocks removed for the sender and
+// intact for everybody else. The bound is what fits the native packet budget.
+inline constexpr std::size_t maximum_received_remove_blocks = 21'000U;
 
 [[nodiscard]] bool stock_block_type(std::int32_t block_type, ProtocolVersion protocol) noexcept;
 [[nodiscard]] bool stock_item_id(std::int16_t item_id, ProtocolVersion protocol) noexcept;

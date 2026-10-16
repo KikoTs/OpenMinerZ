@@ -1,0 +1,5 @@
+# Lighting Pack: English strings.
+setting.torches = Torch and lantern light
+setting.torches_hint = Flickering light around placed torches and lanterns.
+setting.grade = Time-of-day grading
+setting.grade_hint = Golden light at dawn and dusk, cooler nights.

@@ -1,39 +1,87 @@
 #include "app.hpp"
 
+#include "xbox_avatar_addon.hpp"
 #include "font_renderer.hpp"
 #include "openminerz/asset_paths.hpp"
+#include "openminerz/atomic_file.hpp"
 #include "openminerz/design_canvas.hpp"
+#include "openminerz/frame_pacing.hpp"
 #include "openminerz/game_mode.hpp"
+#include "openminerz/hud_layout.hpp"
 #include "openminerz/input_contract.hpp"
-#include "openminerz/inventory.hpp"
 #include "openminerz/interop_state.hpp"
+#include "openminerz/inventory.hpp"
+#include "openminerz/menu_look.hpp"
 #include "openminerz/menu_model.hpp"
+#include "openminerz/player_progress.hpp"
 #include "openminerz/net/authoritative_bootstrap.hpp"
+#include "openminerz/net/bootstrap_gameplay_buffer.hpp"
 #include "openminerz/net/client_gameplay_authority.hpp"
 #include "openminerz/net/combat_codec.hpp"
+#include "openminerz/net/crate_focus.hpp"
 #include "openminerz/net/dragon_codec.hpp"
 #include "openminerz/net/enemy_codec.hpp"
+#include "openminerz/net/host_ban_list.hpp"
 #include "openminerz/net/host_session.hpp"
 #include "openminerz/net/legacy_steam_runtime_client.hpp"
 #include "openminerz/net/legacy_steam_runtime_host.hpp"
 #include "openminerz/net/misc_codec.hpp"
 #include "openminerz/net/mod_catalog.hpp"
+// Mod runtime area: script VMs and mod packages (app_mod_runtime.inc).
+#include "openminerz/modding/package.hpp"
+#include "openminerz/modding/addons.hpp" // (Add-Ons)
+#include "openminerz/modding/runtime.hpp"
+// Modding, gameplay area: the gameplay service and its hooks (app_mod_gameplay.inc).
+#include "openminerz/modding/gameplay.hpp"
+// Modding, network area: mod channel, replication and mod download (app_mod_net.inc).
+#include "openminerz/modding/gameplay_net.hpp"
+#include "openminerz/modding/net.hpp"
+#include "openminerz/net/mod_download.hpp"
+// Modding UI area: themes, widgets, screens, HUD and story UI (app_mod_ui.inc).
+#include "openminerz/modding/ui.hpp"
+// mod-world: world generators from server and core mods (app_mod_world.inc).
+#include "openminerz/modding/worldgen.hpp"
+#include "openminerz/world/custom_terrain.hpp"
+// Modding graphics area: packs, models, lights, atmosphere, sounds
+// (app_mod_graphics.inc).
+#include "openminerz/modding/graphics.hpp"
+#include "modding/graphics/mod_output.hpp"
+#include "modding/graphics/mod_surfaces.hpp"
+// Modding, visuals area: mod item icons (app_mod_graphics_items.inc).
+#include "openminerz/modding/icon_model.hpp"
+// (Items) held and dropped mod items, hold styles, mod weapons (app_mod_items.inc).
+#include "openminerz/modding/held_item.hpp"
 #include "openminerz/net/payload_codec.hpp"
 #include "openminerz/net/pickup_codec.hpp"
 #include "openminerz/net/player_replication.hpp"
+#include "openminerz/net/session_authority.hpp" // (Authority)
 #include "openminerz/net/session_browser.hpp"
+#include "openminerz/net/stock_parity.hpp"
+#include "openminerz/retail_items.hpp"
+#include "openminerz/retail_parity.hpp"
+#include "openminerz/remastered_layout.hpp"
+#include "openminerz/retail_text.hpp"
+#include "openminerz/screens.hpp"
 #include "openminerz/settings.hpp"
 #include "openminerz/settings_menu.hpp"
+#include "openminerz/view_projection.hpp"
 #include "openminerz/world/biome_atmosphere.hpp"
 #include "openminerz/world/block.hpp"
+#include "openminerz/world/dragon_brain.hpp"
 #include "openminerz/world/enemy.hpp"
 #include "openminerz/world/explosive.hpp"
+#include "openminerz/world/hell_atmosphere.hpp"
+#include "openminerz/world/liquid.hpp" // mod-liquid
 #include "openminerz/world/loot.hpp"
+#include "openminerz/world/player_animation.hpp"
 #include "openminerz/world/sky.hpp"
 #include "openminerz/world/spawner.hpp"
+#include "openminerz/world/stock_landing.hpp"
 #include "openminerz/world_save.hpp"
 #include "original_sound_bank.hpp"
+#include "present_control.hpp"
 #include "static_model_asset.hpp"
+#include "voice_chat_audio.hpp"
 #include "world_preview_renderer.hpp"
 
 #include <SDL3/SDL.h>
@@ -45,6 +93,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <format>
@@ -61,6 +110,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -95,7 +145,9 @@ PointerButton pointer_button(Uint8 button) noexcept
 
 SDL_Texture *load_bmp_texture(SDL_Renderer *renderer, const std::filesystem::path &path)
 {
-    SDL_Surface *surface = SDL_LoadBMP(path.string().c_str());
+    // (Graphics area) a mod's textures/ui/<name>.png replaces it; without a
+    // texture pack this is SDL_LoadBMP alone.
+    SDL_Surface *surface = load_content_surface(path, ContentKind::ui);
     if (surface == nullptr)
         return nullptr;
     SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
@@ -135,6 +187,13 @@ std::filesystem::path default_online_positions_path()
     }
 #endif
     return std::filesystem::current_path() / "online-positions.cfg";
+}
+
+// PlayerStats.BanList is the PLAYER's, not a world's (net::HostBanList), so it
+// is kept beside the settings rather than in a save.
+std::filesystem::path default_host_ban_list_path()
+{
+    return default_online_positions_path().parent_path() / "host-bans.cfg";
 }
 
 struct OnlineRememberedPosition final
@@ -258,9 +317,20 @@ std::string system_profile_name()
 enum class HitKind
 {
     menu_item,
+    world_item,
+    world_sort,
     setting_row,
     tab,
-    back
+    back,
+    // Settings screen: restore the open page's defaults, answer the
+    // "keep this display mode?" prompt, and a click-swallowing backdrop.
+    reset_page,
+    display_keep,
+    display_revert,
+    blocker,
+    // (Add-Ons) The buttons of the prompt for a world whose generator mod is
+    // off: index 0 accepts, 1 cancels.
+    addon_prompt
 };
 
 enum class HostTextField
@@ -278,42 +348,6 @@ struct HitRegion final
     HitKind kind{};
     std::size_t index{};
 };
-
-enum class CraftHitKind
-{
-    recipe,       // index = cookbook recipe index
-    ingredient,   // index = ingredient slot of the selected recipe
-    create,       // the CREATE ITEM button
-    mode_classic, // style toggle segments
-    mode_modern,
-    category_cycle, // classic CATEGORY button (LMB next, RMB previous)
-    tab,            // modern category tab, index into craft_categories
-};
-
-struct CraftHit final
-{
-    Rect rect;
-    CraftHitKind kind{};
-    std::size_t index{};
-};
-
-struct CraftCategoryEntry final
-{
-    int id{};
-    const char *label{};
-};
-
-// CraftingUIScreen's category cycle order: All, Tools, Special, Firearms,
-// Ammo, Components, Blocks (the ints are the original Category values).
-constexpr std::array<CraftCategoryEntry, 7> craft_categories{{
-    {-1, "ALL"},
-    {1, "TOOLS"},
-    {2, "SPECIAL"},
-    {3, "FIREARMS"},
-    {6, "AMMO"},
-    {4, "COMPONENTS"},
-    {5, "BLOCKS"},
-}};
 
 struct Palette final
 {
@@ -335,22 +369,6 @@ Palette palette(bool high_contrast)
     return {{8U, 11U, 12U, 218U}, {31U, 17U, 18U, 238U}, {87U, 99U, 102U, 125U}, white, muted, red};
 }
 
-float terrain_shadow_strength(QualityLevel quality) noexcept
-{
-    switch (quality)
-    {
-    case QualityLevel::low:
-        return 0.25F;
-    case QualityLevel::medium:
-        return 0.45F;
-    case QualityLevel::high:
-        return 0.68F;
-    case QualityLevel::ultra:
-        return 0.86F;
-    }
-    return 0.68F;
-}
-
 float particle_density(QualityLevel quality) noexcept
 {
     switch (quality)
@@ -367,6 +385,106 @@ float particle_density(QualityLevel quality) noexcept
     return 1.0F;
 }
 
+// What the Shadows setting buys: texels per side of each sun cascade (edge
+// sharpness). How far from the camera shadows are drawn is its own option,
+// Settings::graphics.shadow_distance. HIGH is what the renderer always used.
+int shadow_map_resolution(QualityLevel quality) noexcept
+{
+    switch (quality)
+    {
+    case QualityLevel::low:
+        return 1024;
+    case QualityLevel::medium:
+        return 1536;
+    case QualityLevel::high:
+        return 2048;
+    case QualityLevel::ultra:
+        return 4096;
+    }
+    return 2048;
+}
+
+// Diagnostic switches for frame pacing. They exist so one binary can measure a
+// behaviour with and without a change; none of them is ever written back to
+// the settings file.
+struct PacingOverrides final
+{
+    std::optional<bool> motion_smoothing; // OPENMINERZ_MOTION_SMOOTHING=0|1
+    std::optional<bool> low_latency;      // OPENMINERZ_LOW_LATENCY=0|1
+    bool legacy_limiter{};                // OPENMINERZ_LEGACY_LIMITER=1
+    bool bench_vsync{};                   // OPENMINERZ_BENCH_VSYNC=1
+    int bench_limit{};                    // OPENMINERZ_BENCH_LIMIT=<fps>
+    bool bench_glide{};                   // OPENMINERZ_BENCH_MODE=glide
+    // OPENMINERZ_BENCH_MODE=sweep: the far-terrain flight. A glide that
+    // meanders outward from the spawn at OPENMINERZ_FAR_SWEEP_SPEED blocks a
+    // second (default 48) and teleports a kilometre further at each quarter
+    // of the run, so tiles of every level stream in, morph and are given up
+    // under the measured frames. OPENMINERZ_FAR_SWEEP_SHOTS=<directory>[,<n>]
+    // also writes a still every n measured frames (default 240) for looking
+    // at seams and popping; those runs are for the pictures, not the timings.
+    bool bench_sweep{};
+    float sweep_speed{48.0F};
+    std::string sweep_shots;
+    int sweep_shot_interval{240};
+    std::string bench_trace;              // OPENMINERZ_BENCH_TRACE=<csv path>
+
+    [[nodiscard]] static PacingOverrides from_environment()
+    {
+        PacingOverrides overrides;
+        const auto flag = [](const char *name) -> std::optional<bool> {
+            const char *value = SDL_getenv(name);
+            if (value == nullptr || *value == '\0')
+                return std::nullopt;
+            return *value != '0';
+        };
+        overrides.motion_smoothing = flag("OPENMINERZ_MOTION_SMOOTHING");
+        overrides.low_latency = flag("OPENMINERZ_LOW_LATENCY");
+        overrides.legacy_limiter = flag("OPENMINERZ_LEGACY_LIMITER").value_or(false);
+        overrides.bench_vsync = flag("OPENMINERZ_BENCH_VSYNC").value_or(false);
+        if (const char *value = SDL_getenv("OPENMINERZ_BENCH_LIMIT"))
+            overrides.bench_limit = std::clamp(std::atoi(value), 0, 1000);
+        if (const char *value = SDL_getenv("OPENMINERZ_BENCH_MODE"))
+        {
+            overrides.bench_sweep = std::string_view{value} == "sweep";
+            overrides.bench_glide = overrides.bench_sweep || std::string_view{value} == "glide";
+        }
+        if (const char *value = SDL_getenv("OPENMINERZ_FAR_SWEEP_SPEED"))
+            overrides.sweep_speed = std::clamp(static_cast<float>(std::atof(value)), 1.0F, 400.0F);
+        if (const char *value = SDL_getenv("OPENMINERZ_FAR_SWEEP_SHOTS"))
+        {
+            overrides.sweep_shots = value;
+            if (const std::size_t comma = overrides.sweep_shots.rfind(',');
+                comma != std::string::npos)
+            {
+                overrides.sweep_shot_interval =
+                    std::clamp(std::atoi(overrides.sweep_shots.c_str() + comma + 1U), 1, 100000);
+                overrides.sweep_shots.resize(comma);
+            }
+        }
+        if (const char *value = SDL_getenv("OPENMINERZ_BENCH_TRACE"))
+            overrides.bench_trace = value;
+        return overrides;
+    }
+};
+
+// Where one frame's time went, in milliseconds.
+struct FramePhases final
+{
+    double interval{}; // Start of this frame to the start of the next one.
+    double delta{};    // Simulated time this frame advanced by.
+    double work{};     // Start of this frame until its present returned.
+    double events{};
+    double update{};
+    double physics{}; // Fixed ticks inside update.
+    double stream{};  // Terrain stream/mesh hand-off inside update.
+    double render{};  // Scene and interface submission, excluding present.
+    double present{};
+    double wait{}; // Limiter after this frame plus the next frame's late start.
+    int ticks{};
+    float alpha{};
+    double camera_step{}; // Horizontal distance the drawn camera moved.
+};
+
 } // namespace
 
 class Application::Impl final
@@ -381,6 +499,42 @@ class Application::Impl final
             settings_.presentation = options_.presentation_profile == 0
                                          ? PresentationProfile::classic
                                          : PresentationProfile::rebirth;
+        diagnostic_lagoon_water_ = options_.preview_environment == "water";
+        // Composed stills (--seed, --clean-view; see LaunchOptions).
+        if (options_.world_seed.has_value())
+            world_seed_ = *options_.world_seed;
+        stored_hud_visible_ = settings_.hud_visible;
+        stored_show_fps_ = settings_.show_fps;
+        stored_vertical_fov_ = settings_.vertical_fov;
+        if (options_.clean_view)
+        {
+            settings_.hud_visible = false;
+            settings_.show_fps = false;
+            // The renderer's own capture switch for the first-person arms.
+            SDL_SetEnvironmentVariable(SDL_GetEnvironment(), "OPENMINERZ_DIAGNOSTIC_HIDE_VIEWMODEL",
+                                       "1", true);
+        }
+        if (options_.still_fov.has_value())
+            settings_.vertical_fov = *options_.still_fov;
+        // A new installation may own only Classic content while settings
+        // default to Modern. Select a complete installed pack at startup;
+        // an explicit diagnostic --texture-style always keeps its meaning.
+        if (options_.asset_style < 0)
+        {
+            const auto installed = [](AssetStyle style) {
+                const auto pack = content_pack_path(style);
+                std::error_code error;
+                return std::filesystem::exists(pack / "DerivedData" / "terrain_diffuse.bmp", error) &&
+                       std::filesystem::exists(pack / "Content" / "Sounds.xgs", error);
+            };
+            if (!installed(settings_.texture_style))
+                for (const auto style : {AssetStyle::modern, AssetStyle::classic, AssetStyle::classic_hd})
+                    if (installed(style))
+                    {
+                        settings_.texture_style = style;
+                        break;
+                    }
+        }
         loaded_asset_style_ = settings_.texture_style;
         set_active_asset_style(loaded_asset_style_);
         SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, settings_.raw_mouse_input ? "0" : "1");
@@ -404,15 +558,98 @@ class Application::Impl final
         SDL_SetWindowMinimumSize(window_, 960, 540);
         SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
         SDL_SetRenderVSync(renderer_, settings_.vsync ? 1 : 0);
+        present_control_ = std::make_unique<PresentControl>(renderer_);
+        apply_present_policy();
         open_first_gamepad();
-        craft_modern_ = options_.craft_modern.value_or(settings_.crafting_menu_modern);
         game_mode_ = static_cast<GameMode>(std::clamp(settings_.game_mode, 0, 5));
+        // --craft-style classic|modern picks the ruleset for a diagnostic run
+        // without touching the saved choice.
+        gameplay_profile_ = options_.craft_modern.value_or(settings_.gameplay_profile == 1)
+                                ? InventoryProfile::modern
+                                : InventoryProfile::classic;
+        // --ui-style: the interface style for a diagnostic run (0 automatic,
+        // 1 classic, 2 modern, 3 remastered), and the Remastered capture aids.
+        if (options_.ui_style >= 0)
+            settings_.ui_style = static_cast<UiStyle>(std::clamp(options_.ui_style, 0, 3));
+        if (options_.vitals_style >= 0)
+            settings_.vitals_style =
+                static_cast<VitalsStyle>(std::clamp(options_.vitals_style, 0, 3));
+        if (options_.ui_scale > 0.0F)
+            settings_.ui_scale = options_.ui_scale;
+        for (const std::string &option : options_.hud_options)
+        {
+            const auto equals = option.find('=');
+            if (equals == std::string::npos)
+                continue;
+            const std::string_view name{option.data(), equals};
+            const bool on = option.compare(equals + 1U, std::string::npos, "0") != 0;
+            if (name == "compass")
+                settings_.hud_compass = on;
+            else if (name == "clock")
+                settings_.hud_clock = on;
+            else if (name == "hints")
+                settings_.hud_hints = on;
+            else if (name == "coordinates")
+                settings_.hud_coordinates = on;
+            else if (name == "server")
+                settings_.hud_server = on;
+            else if (name == "notifications")
+                settings_.hud_notifications = on;
+        }
+        settings_.normalize();
+        progress_path_ = (options_.world_directory ? *options_.world_directory
+                                                  : store_.path().parent_path()) / "player.omprogress";
+        progress_ = load_player_progress(progress_path_);
+        menu_.set_gameplay_profile(gameplay_profile_ == InventoryProfile::modern,
+                                  progress_.value(ProgressMetric::undead_dragon) > 0);
         difficulty_ = static_cast<GameDifficulty>(std::clamp(settings_.game_difficulty, 0, 3));
-        host_settings_.server_name = profile_name_ + "'S FRONTIER";
+        host_settings_.server_name = profile_name_ + "'S WORLD";
         join_client_manifest_.protocol = net::ProtocolVersion::classic_v3;
         join_browser_.set_client(join_client_manifest_, true);
         font_ = std::make_unique<FontRenderer>(renderer_, find_default_font());
         const auto derived = original_derived_data_path();
+        // Each build's interface art, wherever its import put it: the Classic
+        // and Modern looks do not need a complete pack of that build.
+        const auto classic_hud = interface_data_path(AssetStyle::classic);
+        const auto modern_hud = interface_data_path(AssetStyle::modern);
+        // Each build's own sprite fonts; a pack imported before fonts were
+        // exported has none and retail text falls back to the UI font.
+        classic_fonts_ = std::make_unique<RetailFonts>(renderer_, classic_hud);
+        modern_fonts_ = std::make_unique<RetailFonts>(renderer_, modern_hud);
+        for (const auto &[fonts, build] :
+             {std::pair<const RetailFonts *, std::string_view>{classic_fonts_.get(), "Classic"},
+              std::pair<const RetailFonts *, std::string_view>{modern_fonts_.get(), "Modern"}})
+            if (!fonts->complete())
+                std::cerr << "The " << build
+                          << " content pack has no imported sprite fonts; its retail text is "
+                             "shown in the built-in UI font. Re-import the game content to "
+                             "restore them.\n";
+        // The award pop-up's three sprites, per build (index 0 Classic).
+        for (std::size_t build = 0U; build < award_art_.size(); ++build)
+        {
+            const auto &directory = build == 0U ? classic_hud : modern_hud;
+            award_art_[build] = {load_bmp_texture(renderer_, directory / "award_end.bmp"),
+                                 load_bmp_texture(renderer_, directory / "award_center.bmp"),
+                                 load_bmp_texture(renderer_, directory / "award_circle.bmp"),
+                                 load_bmp_texture(renderer_, directory / "ui_bar.bmp")};
+        }
+        health_empty_texture_ =load_bmp_texture(renderer_, classic_hud / "health_empty.bmp");
+        health_full_texture_ = load_bmp_texture(renderer_, classic_hud / "health_full.bmp");
+        modern_health_empty_texture_ = load_bmp_texture(renderer_, modern_hud / "health_empty.bmp");
+        modern_health_full_texture_ = load_bmp_texture(renderer_, modern_hud / "health_full.bmp");
+        modern_stamina_texture_ = load_bmp_texture(renderer_, modern_hud / "stamina_empty.bmp");
+        for (SDL_Texture *texture :
+             {health_empty_texture_, health_full_texture_, modern_health_empty_texture_,
+              modern_health_full_texture_, modern_stamina_texture_})
+            if (texture != nullptr)
+                SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+        // Each build's own HUD sprites, for the retail HUD of either style.
+        load_hud_art(classic_hud_art_, UiStyle::classic, classic_hud);
+        load_hud_art(modern_hud_art_, UiStyle::modern, modern_hud);
+        // And each build's inventory / crate / crafting screen art and the
+        // item-icon atlas the game renders (see draw_retail_screens()).
+        load_screen_art(classic_screen_art_, UiStyle::classic, classic_hud);
+        load_screen_art(modern_screen_art_, UiStyle::modern, modern_hud);
         sniper_scope_texture_ = load_bmp_texture(renderer_, derived / "sniper_scope.bmp");
         missile_lock_texture_ = load_bmp_texture(renderer_, derived / "missile_lock.bmp");
         missile_locking_texture_ = load_bmp_texture(renderer_, derived / "missile_locking.bmp");
@@ -457,11 +694,20 @@ class Application::Impl final
         world_preview_->set_particle_density(particle_density(settings_.particle_quality));
         if (options_.tone_mapping >= 0)
             settings_.tone_mapping = static_cast<ToneMapping>(options_.tone_mapping);
-        apply_grading_settings();
+        apply_render_settings();
         enemy_horde_.set_clip_durations([this](world::EnemyModelKind model, std::string_view clip) {
             return world_preview_ != nullptr && world_preview_->enemy_models() != nullptr
                        ? world_preview_->enemy_models()->clip_duration(model, clip)
                        : 0.0F;
+        });
+        // Player.ResolveCollsion asks EnemyManager.AttentuateVelocity before
+        // it moves: the blocking enemies that target this player slow it.
+        player_.set_velocity_attenuation([this](world::Vec3 forward, world::Vec3 position) {
+            const float attenuation = enemy_horde_.attenuate_velocity(
+                online_gameplay_active() ? online_local_player_gid() : std::uint8_t{}, forward,
+                position);
+            // Modding, gameplay area: a mod's speed effect (exactly 1 without one).
+            return mod_speed_multiplier_ == 1.0F ? attenuation : attenuation * mod_speed_multiplier_;
         });
         audio_outputs_ = enumerate_audio_output_devices();
         auto selected_output =
@@ -482,6 +728,7 @@ class Application::Impl final
             dirty_ = true;
         }
         sound_bank_ = std::make_unique<OriginalSoundBank>(settings_.audio_output_id);
+        voice_audio_ = std::make_unique<VoiceChatAudio>();
         apply_audio_settings();
         const bool audio_ready = sound_bank_->available();
         if (audio_ready && !sound_bank_->output_name().empty())
@@ -523,7 +770,7 @@ class Application::Impl final
         {
             sound_bank_->play_menu_music();
             // FrontEndScreen starts the daytime Birds bed alongside Theme.
-            sound_bank_->set_ambience(1.0F, 0.0F, 0.0F, 0.0F, 1.0F);
+            sound_bank_->set_ambience(0.0F, 0.0F, 0.0F, 0.0F, 1.0F);
         }
         if (options_.no_enemies)
             difficulty_ = GameDifficulty::no_enemies;
@@ -556,9 +803,18 @@ class Application::Impl final
         }
         focus_.resize(16U, 0.0F);
         scan_addons();
-        if (options_.open_settings)
+        // (--diagnostic-menu pause-settings opens the screen later, from the
+        // pause menu of a running world; --settings-tab only names its page.)
+        if (options_.open_settings && options_.diagnostic_menu != "pause-settings")
         {
             menu_.open(ui::MenuScreen::settings);
+            if (options_.open_ui_settings)
+                while (menu_.settings_tab() != ui::SettingsTab::interface)
+                    menu_.change_tab(1, settings_);
+            if (options_.diagnostic_settings_tab >= 0)
+                while (static_cast<int>(menu_.settings_tab()) != options_.diagnostic_settings_tab)
+                    menu_.change_tab(1, settings_);
+            menu_.set_selection(options_.settings_selection, settings_);
         }
         else if (options_.open_host_settings)
         {
@@ -584,9 +840,9 @@ class Application::Impl final
         {
             menu_.open(ui::MenuScreen::join_browser);
             refresh_join_sessions(true);
-            if (options_.diagnostic_join_details && !join_row_sessions_.empty())
+            if (options_.diagnostic_join_details && !join_row_ids_.empty())
             {
-                selected_join_session_ = join_row_sessions_.front();
+                join_browser_.select(join_row_ids_.front());
                 menu_.open(ui::MenuScreen::join_details);
             }
         }
@@ -599,17 +855,78 @@ class Application::Impl final
         {
             refresh_world_list();
             menu_.open(ui::MenuScreen::world_select);
+            menu_.set_selection(std::min(options_.world_library_selection, world_slots_.size()),
+                                settings_);
+        }
+        else if (options_.world_file)
+        {
+            menu_.open(ui::MenuScreen::world_preview);
+            load_world(*options_.world_file);
         }
         else if (options_.open_world)
         {
             menu_.open(ui::MenuScreen::world_preview);
             waiting_for_world_ = !world_preview_->preload_complete();
+            // The diagnostic world plays by the chosen ruleset (--craft-style):
+            // without this the preview inventory stayed Classic, so a Modern
+            // world's second tray, stamina and recipe tree could not be seen.
+            inventory_.set_profile(gameplay_profile_);
             inventory_open_ = options_.open_inventory;
             inventory_focus_ = PlayerInventory::storage_size + inventory_.selected_index();
             if (!options_.screenshot_path.has_value())
             {
                 SDL_SetWindowRelativeMouseMode(window_, !waiting_for_world_ && !inventory_open_);
             }
+            // Mod runtime area: the diagnostic world runs installed mods too
+            // (storage in memory only: it has no save).
+            mod_world_prepare_new(); // mod-world: a new world takes a mod's generator
+            start_mod_session_local();
+        }
+        if (options_.diagnostic_menu == "chat")
+        {
+            chat_editing_ = true;
+            chat_draft_ = "Anyone want to explore the caves?";
+        }
+        else if (options_.diagnostic_menu == "locator")
+        {
+            locator_name_editing_ = true;
+            locator_name_draft_ = "Home";
+        }
+        else if (options_.diagnostic_menu == "crate")
+        {
+            inventory_open_ = true;
+            active_crate_ = CrateKey{0, 0, 0};
+        }
+        else if (!options_.diagnostic_menu.empty() && !diagnostic_in_game_menu().has_value())
+        {
+            const auto &name = options_.diagnostic_menu;
+            if (name == "modern-mode") menu_.set_gameplay_profile(true, false);
+            if (name == "travel")
+            {
+                travel_names_ = {"Home", "Cave", "Hell"};
+                std::vector<ui::MenuEntry> stations;
+                for (const auto &label : travel_names_)
+                    stations.push_back({label, "Travel to this station.", ui::MenuCommand::use_teleport_station, true, {}});
+                stations.push_back({"Back", "Return to the game.", ui::MenuCommand::back, true, {}});
+                menu_.set_travel_entries(std::move(stations));
+            }
+            menu_.open(name == "multiplayer"                  ? ui::MenuScreen::multiplayer
+                       : name == "mode" || name == "modern-mode" ? ui::MenuScreen::game_mode
+                       : name == "profile"                    ? ui::MenuScreen::game_profile
+                       : name == "achievements" || name == "achievement-last" || name == "achievement-unlocked" ? ui::MenuScreen::achievements
+                       : name == "travel"                     ? ui::MenuScreen::travel
+                       : name == "difficulty"                 ? ui::MenuScreen::difficulty
+                       : name == "addons"                     ? ui::MenuScreen::addons
+                       : name == "credits"                    ? ui::MenuScreen::credits
+                       : name == "exit"                       ? ui::MenuScreen::exit_confirmation
+                       : name == "name" || name == "password" ? ui::MenuScreen::host_details
+                                                              : ui::MenuScreen::main);
+            if (name == "achievement-last") menu_.set_selection(achievement_count - 1, settings_);
+            if (name == "achievement-unlocked") menu_.set_selection(3, settings_);
+            if (name == "addons") run_addon_diagnostic(); // (Add-Ons) OPENMINERZ_DIAGNOSTIC_ADDONS
+            if (name == "name" || name == "password")
+                begin_host_text_edit(name == "name" ? HostTextField::server_name
+                                                    : HostTextField::password);
         }
         if (options_.diagnostic_multiplayer)
         {
@@ -631,6 +948,9 @@ class Application::Impl final
                                               -(origin.z - remote.state.position.z));
                 remote.has_update = true;
                 remote.last_update = elapsed_;
+                // These stand in for gamers that have announced themselves, so
+                // the player picker lists them.
+                remote.presence_announced = true;
             };
             OnlineRemotePlayer host;
             host.gamer_tag = avatar_case.empty() ? "KirilchoAltov" : "AVATAR TEST";
@@ -650,6 +970,46 @@ class Application::Impl final
                 host.carried_item =
                     static_cast<std::uint16_t>(InventoryItemId::iron_pickaxe);
             }
+            else if (avatar_case == "walk" || avatar_case == "run")
+            {
+                // Character-rig captures: a generic-handed player in locomotion.
+                host.state.animation_mode = PlayerAnimationMode::generic;
+                host.state.movement_y = avatar_case == "run" ? 1.0F : 0.5F;
+            }
+            else if (avatar_case == "stand")
+                host.state.animation_mode = PlayerAnimationMode::generic;
+            else if (avatar_case == "aim")
+            {
+                host.state.animation_mode = PlayerAnimationMode::assault;
+                host.state.shouldering = true;
+                host.carried_item =
+                    static_cast<std::uint16_t>(InventoryItemId::assault_rifle);
+            }
+            else if (avatar_case == "dead")
+            {
+                // The Die clip, root motion and root turn included.
+                host.state.animation_mode = PlayerAnimationMode::generic;
+                host.state.dead = true;
+            }
+            else if (avatar_case == "reload" || avatar_case == "fire" || avatar_case == "hold")
+            {
+                // (GunFX) A gun of OPENMINERZ_DIAGNOSTIC_AVATAR_ITEM (default the
+                // assault rifle) reloading, firing or held, for weapon-part
+                // captures of another player (with ..._AVATAR_SECONDS).
+                const char *item_value = SDL_getenv("OPENMINERZ_DIAGNOSTIC_AVATAR_ITEM");
+                const auto item = item_value != nullptr
+                                      ? static_cast<InventoryItemId>(std::clamp(std::atoi(item_value), 0, 131))
+                                      : InventoryItemId::assault_rifle;
+                host.state.animation_mode = item_player_animation_mode(item);
+                host.state.reloading = avatar_case == "reload";
+                host.state.using_tool = avatar_case == "fire";
+                host.carried_item = static_cast<std::uint16_t>(item);
+            }
+            // OPENMINERZ_DIAGNOSTIC_AVATAR_YAW=<degrees> turns the single test
+            // player away from the camera, for side and back views of the rig.
+            if (const char *turn = SDL_getenv("OPENMINERZ_DIAGNOSTIC_AVATAR_YAW");
+                turn != nullptr && !avatar_case.empty())
+                host.state.yaw += static_cast<float>(std::atof(turn)) * 3.14159265F / 180.0F;
             online_remote_players_[0U] = host;
             if (avatar_case.empty())
             {
@@ -672,16 +1032,27 @@ class Application::Impl final
                     static_cast<std::uint16_t>(InventoryItemId::iron_pickaxe);
                 online_remote_players_[4U] = explorer;
             }
-            push_online_chat("KirilchoAltov: Welcome to the frontier.");
+            push_online_chat("KirilchoAltov: Hey, welcome!");
             push_online_chat("KikoTs: Avatar sync is online.");
             player_roster_visible_ =
                 SDL_getenv("OPENMINERZ_DIAGNOSTIC_HIDE_ROSTER") == nullptr;
             refresh_online_remote_visuals();
         }
+        // The Xbox Avatars add-on: the saved switches, then any capture aids.
+        configure_xbox_avatars();
+        start_xbox_avatar_diagnostics();
         if (options_.world_time.has_value())
         {
             day_night_.set_time(*options_.world_time);
             world_time_speed_ = 0.0F;
+        }
+        // Capture aid: OPENMINERZ_DIAGNOSTIC_AWARD=<index> shows that award's
+        // pop-up without earning it (no cue, no broadcast).
+        if (const char *award = SDL_getenv("OPENMINERZ_DIAGNOSTIC_AWARD"))
+        {
+            achievement_popup_ = static_cast<std::size_t>(
+                std::clamp(std::atoi(award), 0, static_cast<int>(achievement_count) - 1));
+            achievement_popup_seconds_ = 10.0F;
         }
         const bool deterministic_launch =
             options_.screenshot_path.has_value() || options_.bench_frames > 0 ||
@@ -691,6 +1062,11 @@ class Application::Impl final
         const bool live_browser_started = options_.open_join_browser || options_.open_join_details;
         if (!deterministic_launch && !live_browser_started)
             begin_online_discovery(true);
+        // Enter the saved display mode and read what the monitor supports.
+        initialize_display_settings();
+        // The player's own picture behind the menus, decoded off this thread
+        // now that the window has the shape it will be shown at.
+        begin_menu_backdrop();
         last_transition_serial_ = menu_.transition_serial();
         std::cout << "OpenMinerZ frontend initialized with " << SDL_GetRendererName(renderer_)
                   << '\n';
@@ -701,17 +1077,91 @@ class Application::Impl final
                                                             : "Modern";
         std::cout << "Content pack: " << loaded_style_name << " ("
                   << active_content_pack_path().string() << ")\n";
+        // Keep the game alive inside the Windows move/size/menu modal loop.
+        modal_watch_installed_ = SDL_AddEventWatch(&Impl::modal_loop_watch, this);
     }
 
     ~Impl()
     {
+        // Mod runtime area: world.unloading and storage while the world and
+        // every service are still alive (Integration: the menus' VM too).
+        shutdown_mod_runtime();
+        if (modal_watch_installed_)
+            SDL_RemoveEventWatch(&Impl::modal_loop_watch, this);
+        if (diagnostic_autofire_)
+        {
+            std::cout << std::format(
+                "AUTOFIRE shots={} blasts={} blocks={} blast_total={:.3f}ms blast_max={:.3f}ms\n",
+                diagnostic_shots_, diagnostic_blast_calls_, diagnostic_blocks_removed_,
+                diagnostic_blast_total_ms_, diagnostic_blast_max_ms_);
+            if (world_preview_ != nullptr)
+            {
+                const WorldPreviewStats &mesh = world_preview_->stats();
+                std::cout << std::format(
+                    "EDITMESH jobs={} sections={} peak_queue={} queue_depth={} "
+                    "apron_candidates={} apron_queued={} peak_pump={:.3f}ms "
+                    "latency_avg={:.1f}ms latency_peak={:.1f}ms samples={}\n",
+                    mesh.edit_mesh_jobs, mesh.edit_mesh_sections, mesh.edit_mesh_peak_queue,
+                    mesh.edit_mesh_queue_depth, mesh.light_probe_candidate_sections,
+                    mesh.light_probe_sections, mesh.edit_mesh_peak_pump_milliseconds,
+                    mesh.edit_mesh_latency_samples > 0U
+                        ? mesh.edit_mesh_total_latency_milliseconds /
+                              static_cast<float>(mesh.edit_mesh_latency_samples)
+                        : 0.0F,
+                    mesh.edit_mesh_peak_latency_milliseconds, mesh.edit_mesh_latency_samples);
+            }
+        }
+        persist_progress(true);
         shutdown_online_client();
         shutdown_online_host();
         world_slots_.clear();
+        world_thumbnail_.reset();
+        // The menu picture belongs to the renderer destroyed below.
+        release_menu_backdrop();
+        release_mod_ui(); // UI area: mod images, faces, cursors and sounds
+        release_mod_graphics(); // Graphics area: mod audio device and screen pass
         if (text_editing())
             SDL_StopTextInput(window_);
         sound_bank_.reset();
+        voice_audio_.reset();
         world_preview_.reset();
+        for (auto &build : award_art_)
+            for (SDL_Texture *&texture : build)
+            {
+                SDL_DestroyTexture(texture);
+                texture = nullptr;
+            }
+        SDL_DestroyTexture(health_empty_texture_);
+        SDL_DestroyTexture(health_full_texture_);
+        SDL_DestroyTexture(modern_health_empty_texture_);
+        SDL_DestroyTexture(modern_health_full_texture_);
+        SDL_DestroyTexture(modern_stamina_texture_);
+        for (HudArt *art : {&classic_hud_art_, &modern_hud_art_})
+            for (SDL_Texture *&texture : art->textures)
+            {
+                SDL_DestroyTexture(texture);
+                texture = nullptr;
+            }
+        for (ScreenArt *art : {&classic_screen_art_, &modern_screen_art_})
+        {
+            for (SDL_Texture *&texture : art->textures)
+            {
+                SDL_DestroyTexture(texture);
+                texture = nullptr;
+            }
+            for (SDL_Texture **texture : {&art->frame, &art->icons, &art->icons_large})
+            {
+                SDL_DestroyTexture(*texture);
+                *texture = nullptr;
+            }
+            if (art->pointer != nullptr)
+            {
+                if (screens_pointer_cursor_ == art->pointer)
+                    SDL_SetCursor(SDL_GetDefaultCursor());
+                SDL_DestroyCursor(art->pointer);
+                art->pointer = nullptr;
+            }
+        }
         SDL_DestroyTexture(sniper_scope_texture_);
         SDL_DestroyTexture(missile_lock_texture_);
         SDL_DestroyTexture(missile_locking_texture_);
@@ -726,6 +1176,8 @@ class Application::Impl final
                             &locator_art_,     &teleporter_art_,   &clock_art_,
                             &gunpowder_art_,   &grenade_icon_art_})
             asset->reset();
+        classic_fonts_.reset();
+        modern_fonts_.reset();
         font_.reset();
         if (gamepad_ != nullptr)
         {
@@ -741,23 +1193,65 @@ class Application::Impl final
     {
         const bool bench = options_.bench_frames > 0;
         std::size_t screenshot_frame_threshold = 2U;
-        if (options_.diagnostic_multiplayer)
-            if (const char *value = SDL_getenv("OPENMINERZ_DIAGNOSTIC_CAPTURE_FRAMES"))
-                screenshot_frame_threshold = static_cast<std::size_t>(
-                    std::clamp(std::atoi(value), 2, 600));
+        if (const char *value = SDL_getenv("OPENMINERZ_DIAGNOSTIC_CAPTURE_FRAMES"))
+            screenshot_frame_threshold = static_cast<std::size_t>(
+                std::clamp(std::atoi(value), 2, 600));
         std::vector<double> bench_samples;
+        std::vector<FramePhases> bench_phases;
         int bench_warmup = 90;
+        bool bench_glide_started{};
+        float bench_sweep_seconds{};
+        std::size_t bench_sweep_teleports{};
+        std::size_t bench_sweep_last_shot{static_cast<std::size_t>(-1)};
+        std::size_t bench_latency_begin{};
+        std::uint64_t bench_missed_begin{};
+        std::optional<world::Vec3> last_presented_camera;
+        std::optional<FramePhases> bench_pending;
         int browser_capture_ready_frames{};
+        int pause_capture_ready_frames{};
         if (bench)
         {
             bench_samples.reserve(static_cast<std::size_t>(options_.bench_frames));
-            SDL_SetRenderVSync(renderer_, 0);
+            bench_phases.reserve(static_cast<std::size_t>(options_.bench_frames));
+            SDL_SetRenderVSync(renderer_, pacing_overrides_.bench_vsync ? 1 : 0);
         }
+        const auto milliseconds = [](Clock::duration duration) {
+            return std::chrono::duration<double, std::milli>(duration).count();
+        };
         auto last_frame = Clock::now();
         while (running_)
         {
+            // Bench runs choose their own pacing so every scenario is repeatable.
+            const bool vsync_active = bench ? pacing_overrides_.bench_vsync : settings_.vsync;
+            apply_present_policy();
+            begin_frame_pacing(vsync_active);
             const auto frame_start = Clock::now();
-            float delta = std::chrono::duration<float>(frame_start - last_frame).count();
+            if (bench_pending.has_value())
+            {
+                // The previous frame's own length is only known once the next
+                // one starts; its limiter wait and this frame's late start both
+                // belong to it.
+                bench_pending->interval = milliseconds(frame_start - last_frame);
+                bench_pending->wait = pending_wait_milliseconds_;
+                bench_samples.push_back(bench_pending->work);
+                bench_phases.push_back(*bench_pending);
+                bench_pending.reset();
+                if (bench_samples.size() >= static_cast<std::size_t>(options_.bench_frames))
+                {
+                    report_bench(bench_samples, bench_phases, bench_latency_begin,
+                                 bench_missed_begin);
+                    running_ = false;
+                    break;
+                }
+            }
+            pending_wait_milliseconds_ = 0.0;
+            // Everything this frame shows is built from input no older than this.
+            frame_input_counter_ = SDL_GetPerformanceCounter();
+            frame_phases_ = {};
+            frame_phases_.delta = std::min(milliseconds(frame_start - last_frame), 50.0);
+            world_play_time_frame_seconds_ =
+                std::min(5.0, std::chrono::duration<double>(frame_start - last_frame).count());
+            float delta = static_cast<float>(world_play_time_frame_seconds_);
             last_frame = frame_start;
             delta = std::clamp(delta, 0.0F, 0.05F);
 
@@ -766,8 +1260,29 @@ class Application::Impl final
             {
                 process_event(event);
             }
+            const auto events_done = Clock::now();
             update(delta);
+            const auto update_done = Clock::now();
+            presented_camera_.reset();
             render();
+            const auto render_done = Clock::now();
+            frame_phases_.events = milliseconds(events_done - frame_start);
+            frame_phases_.update = milliseconds(update_done - events_done);
+            frame_phases_.render = milliseconds(render_done - update_done) - frame_phases_.present;
+            frame_phases_.work = milliseconds(render_done - frame_start);
+            if (presented_camera_.has_value())
+            {
+                if (last_presented_camera.has_value())
+                    frame_phases_.camera_step =
+                        std::hypot(presented_camera_->x - last_presented_camera->x,
+                                   presented_camera_->z - last_presented_camera->z);
+                last_presented_camera = presented_camera_;
+            }
+            else
+                last_presented_camera.reset();
+            if (in_game_menu_screen() || settings_over_world() ||
+                (menu_.screen() == ui::MenuScreen::addons && menu_.pause_overlay_active())) // (Add-Ons)
+                ++pause_capture_ready_frames;
 
             const bool live_browser_capture =
                 options_.screenshot_path.has_value() &&
@@ -778,12 +1293,38 @@ class Application::Impl final
                 browser_capture_ready_frames = 0;
             const bool browser_capture_ready =
                 !live_browser_capture || browser_capture_ready_frames >= 2;
+            const std::size_t world_capture_threshold =
+                menu_.screen() == ui::MenuScreen::world_preview && !options_.diagnostic_save_exit
+                    ? screenshot_frame_threshold
+                    : 2U;
+            // (Add-Ons) A world refused for a mod that is off shows its prompt
+            // instead of the world: that is the picture.
+            const bool addon_prompt_capture = addon_world_prompt_.has_value() && frames_rendered_ >= 3U;
             if (options_.screenshot_path.has_value() &&
                 frames_rendered_ >= screenshot_frame_threshold &&
-                (!options_.open_world || world_ready_frames_ >= 2U) && browser_capture_ready)
+                (!options_.open_world || world_ready_frames_ >= world_capture_threshold ||
+                 addon_prompt_capture) &&
+                // A scripted inventory screen has been on screen for a few
+                // frames (the read-back is the frame before the last present).
+                (!options_.screen_script.has_value() || screens_script_frames_ >= 3U) &&
+                hud_samples_ready() &&
+                mod_ui_diagnostic_ready() && // UI area (app_mod_ui.inc)
+                mod_ai_capture_ready() &&    // mod-ai (app_mod_ai.inc)
+                mod_survival_capture_ready() && // wave 5, survival (app_mod_survival.inc)
+                gunfx_capture_ready() &&        // (GunFX) app_mod_gunfx.inc
+                browser_capture_ready &&
+                // A world still is taken once the far landscape has arrived
+                // (at most a few seconds; it never holds a capture hostage).
+                (!options_.open_world || world_preview_ == nullptr || addon_prompt_capture ||
+                 world_preview_->far_terrain_settled() || frames_rendered_ > 6000U) &&
+                (!diagnostic_in_game_menu().has_value() || pause_capture_ready_frames >= 3) &&
+                (!options_.diagnostic_save_exit || !options_.world_file || !running_))
             {
-                capture(*options_.screenshot_path);
-                running_ = false;
+                if (!gunfx_capture_sequence(*options_.screenshot_path))
+                {
+                    capture(*options_.screenshot_path);
+                    running_ = false;
+                }
             }
             ++frames_rendered_;
 
@@ -791,47 +1332,67 @@ class Application::Impl final
             {
                 // Sweep the camera slowly while walking so the measured frames cover
                 // chunk streaming and remeshing along a wide arc, not one cached angle.
-                player_.look(delta * 0.15F, 0.0F);
-                if (bench_warmup > 0)
-                {
-                    --bench_warmup;
-                }
+                if (!pacing_overrides_.bench_sweep)
+                    player_.look(delta * 0.15F, 0.0F);
                 else
                 {
-                    bench_samples.push_back(
-                        std::chrono::duration<double, std::milli>(Clock::now() - frame_start)
-                            .count());
-                    if (bench_samples.size() >= static_cast<std::size_t>(options_.bench_frames))
+                    // The far-terrain flight: outward (east), meandering, level.
+                    bench_sweep_seconds += delta;
+                    player_.state().yaw = 1.5707963F + 0.6F * std::sin(bench_sweep_seconds * 0.35F);
+                    player_.state().pitch = -0.10F + 0.06F * std::sin(bench_sweep_seconds * 0.23F);
+                    const std::size_t quarter =
+                        std::max<std::size_t>(static_cast<std::size_t>(options_.bench_frames) / 4U, 1U);
+                    if (bench_warmup == 0 && bench_samples.size() / quarter > bench_sweep_teleports &&
+                        bench_sweep_teleports < 3U && world_preview_ != nullptr)
                     {
-                        std::vector<double> sorted = bench_samples;
-                        std::sort(sorted.begin(), sorted.end());
-                        double total = 0.0;
-                        for (const double sample : sorted)
-                            total += sample;
-                        const double average = total / static_cast<double>(sorted.size());
-                        const double median = sorted[sorted.size() / 2U];
-                        const double percentile_95 = sorted[static_cast<std::size_t>(
-                            static_cast<double>(sorted.size() - 1U) * 0.95)];
-                        SDL_Log("BENCH frames=%zu avg=%.3fms median=%.3fms p95=%.3fms "
-                                "max=%.3fms fps=%.1f",
-                                sorted.size(), average, median, percentile_95, sorted.back(),
-                                1000.0 / average);
-                        running_ = false;
+                        // A teleport: the detailed window recentres as it does
+                        // in play; the far landscape has to follow on its own.
+                        ++bench_sweep_teleports;
+                        snap_render_interpolation();
+                        player_.state().position.x += 1000.0F;
+                        player_.state().velocity = {};
+                        world_preview_->recenter_on(player_.state());
+                    }
+                    if (!pacing_overrides_.sweep_shots.empty() && bench_warmup == 0 &&
+                        bench_samples.size() %
+                                static_cast<std::size_t>(pacing_overrides_.sweep_shot_interval) ==
+                            0U &&
+                        bench_samples.size() != bench_sweep_last_shot)
+                    {
+                        bench_sweep_last_shot = bench_samples.size();
+                        std::error_code ignored;
+                        std::filesystem::create_directories(pacing_overrides_.sweep_shots, ignored);
+                        capture(std::filesystem::path{pacing_overrides_.sweep_shots} /
+                                std::format("sweep-{:05}.bmp", bench_samples.size()));
                     }
                 }
-                continue; // No frame limiter while measuring.
+                if (pacing_overrides_.bench_glide && !bench_glide_started)
+                {
+                    // Constant-velocity flight above the terrain: nothing but
+                    // presentation can make the camera's per-frame step uneven.
+                    bench_glide_started = true;
+                    player_.state().fly_mode = true;
+                    player_.state().velocity = {};
+                    player_.state().position.y =
+                        static_cast<float>(world::world_min_y + world::chunk_height) - 2.0F;
+                }
+                if (bench_warmup > 0)
+                {
+                    if (--bench_warmup == 0 && present_control_ != nullptr)
+                    {
+                        bench_latency_begin = present_control_->latency_milliseconds().size();
+                        bench_missed_begin = present_control_->missed_refreshes();
+                    }
+                }
+                else
+                    bench_pending = frame_phases_;
+                if (pacing_overrides_.bench_limit <= 0)
+                    continue; // Uncapped unless the scenario asks for a limiter.
             }
 
-            if (!settings_.vsync && settings_.frame_limit > 0)
-            {
-                const double target = 1.0 / static_cast<double>(settings_.frame_limit);
-                const double elapsed =
-                    std::chrono::duration<double>(Clock::now() - frame_start).count();
-                if (elapsed < target)
-                {
-                    SDL_Delay(static_cast<Uint32>((target - elapsed) * 1000.0));
-                }
-            }
+            finish_frame_pacing(vsync_active,
+                                bench ? pacing_overrides_.bench_limit : settings_.frame_limit,
+                                frame_start);
         }
         int exit_code{};
         if (ui_join_probe_failed_)
@@ -904,16 +1465,44 @@ class Application::Impl final
     struct OnlineRemotePlayer final
     {
         std::string gamer_tag;
+        // What this peer calls ITSELF, from its PlayerExistsMessage. Admission
+        // de-duplicates a colliding display tag, so a peer admitted as
+        // "Name (2)" still names itself "Name" in the name-addressed Modern
+        // messages. Both have to resolve to this GID, and neither may resolve
+        // to whoever else is listed under the same label.
+        std::string self_reported_tag;
         net::RemotePlayerReplicationState state;
+        net::RemotePlayerPresentation presentation;
         std::uint16_t carried_item{};
+        // ChangeCarriedItem is change-only state and MeleePlayerMessage is sent
+        // on a different delivery class, so a swing can reach the host after the
+        // switch that followed it. Keep the item it replaced for that window so
+        // the melee validator does not reject the hit that really happened.
+        std::uint16_t previous_carried_item{};
+        float carried_item_changed{};
+        bool carried_item_known{};
         std::int64_t connected_ticks{};
         net::IntVector3 focus_crate{};
         std::int32_t focus_item_x{};
         std::int32_t focus_item_y{};
         float last_update{};
         float death_animation_started{};
+        // Player.UpdateAnimation for this peer's avatar: stepped by each
+        // PlayerUpdateMessage it sends (and only then, as in the original),
+        // with its clip clocks advanced every tick in between.
+        world::PlayerAnimator animator{};
+        bool animator_started{};
+        // Player._footStepTimer: every Player runs UpdateAudio, so the
+        // original plays other players' footsteps at their own position.
+        world::FootstepClock footsteps{};
         bool presence_announced{};
+        // Sender.Tag == null in _processPlayerExistsMessage: the first
+        // PlayerExists from this peer, which is the only one the original acts
+        // on. The host marks a roster entry announced on any packet, so this
+        // cannot be folded into presence_announced.
+        bool presence_seen{};
         bool has_update{};
+        bool pending_use_animation{};
     };
 
     struct PendingPrePresencePacket final
@@ -971,6 +1560,506 @@ class Application::Impl final
         float expires{};
     };
 
+    // ---- Frame pacing -------------------------------------------------------
+    // Presentation only: none of this changes what a simulation tick computes.
+
+    [[nodiscard]] bool motion_smoothing_active() const noexcept
+    {
+        return pacing_overrides_.motion_smoothing.value_or(settings_.motion_smoothing);
+    }
+
+    [[nodiscard]] bool low_latency_active() const noexcept
+    {
+        return pacing_overrides_.low_latency.value_or(settings_.low_latency ==
+                                                      LowLatencyMode::on);
+    }
+
+    // The two presentation hooks for code outside the frame loop.
+    //
+    // render_interpolation_alpha(): how far the frame being drawn is from the
+    // previous simulation tick (0) to the current one (1). Anything the fixed
+    // tick moves should be drawn at lerp(previous, current, alpha) to sit on
+    // the same timeline as the camera. Returns 1 (draw the live state) when
+    // motion smoothing is off.
+    [[nodiscard]] float render_interpolation_alpha() const noexcept
+    {
+        return motion_smoothing_active()
+                   ? pacing::interpolation_alpha(physics_accumulator_, 1.0F / 60.0F)
+                   : 1.0F;
+    }
+
+    // --- Field of view (openminerz/view_projection.hpp) ---------------------
+    //
+    // A frame has two projections. Everything drawn over the 3D picture that
+    // has to line up with the WORLD (nametags, the lock box, anything projected
+    // from a world position) must use the camera the frame was really drawn
+    // with: world_preview_->overlay_camera(). Use these two to BUILD a frame.
+    //
+    // presented_world_fov(): the world camera's vertical angle - the player's
+    // "Field of view" setting, narrowed by retail's zoom ratio for the gun in
+    // hand at shoulder progress `aim`. Presentation only: no rule, hit test or
+    // network message may read it (see view::retail_lock_cone_radians).
+    [[nodiscard]] float presented_world_fov(const GunStats *gun, float aim) const noexcept
+    {
+        return view::presented_vertical_fov_degrees(
+            settings_.vertical_fov, gun != nullptr ? gun->shoulder_magnification : 1.0F, aim);
+    }
+    // Hands and held item share one projection, scaled with the player's FOV.
+    [[nodiscard]] float presented_viewmodel_fov(float aim) const noexcept
+    {
+        return view::presented_viewmodel_fov_degrees(settings_.viewmodel_fov,
+                                                    settings_.vertical_fov, aim);
+    }
+
+    // snap_render_interpolation(): call after placing the local player or the
+    // world's creatures somewhere new in one go (teleport, respawn, world
+    // load, network correction). The next frame cuts straight to the live
+    // state instead of blending from the old place. The camera also detects a
+    // player moved outside a tick by itself; calling this is never wrong.
+    void snap_render_interpolation() noexcept
+    {
+        fixed_step_camera_.reset();
+        previous_enemy_poses_.clear();
+        previous_dragon_pose_.reset();
+    }
+
+    struct TickPose final
+    {
+        world::Vec3 position{};
+        float yaw{};
+        float pitch{};
+        float roll{};
+    };
+
+    [[nodiscard]] static std::uint64_t tick_pose_key(const world::Enemy &enemy) noexcept
+    {
+        return (static_cast<std::uint64_t>(enemy.id) << 8U) | enemy.target_gid;
+    }
+
+    // Called at the start of every simulation tick, before anything moves.
+    void record_tick_poses()
+    {
+        previous_enemy_poses_.clear();
+        for (const world::Enemy &enemy : enemy_horde_.enemies())
+            previous_enemy_poses_.insert_or_assign(tick_pose_key(enemy),
+                                                   TickPose{enemy.position, enemy.yaw});
+        previous_dragon_pose_.reset();
+        if (dragon_.visible())
+        {
+            const world::Dragon &dragon = dragon_.dragon();
+            previous_dragon_pose_ =
+                TickPose{dragon.position, dragon.yaw, dragon.pitch, dragon.roll};
+        }
+    }
+
+    // Enemies as the frame should show them: between their last two ticks.
+    // Simulation state is never touched; this is a per-frame copy.
+    [[nodiscard]] const std::vector<world::Enemy> *presented_enemies(float alpha)
+    {
+        const std::vector<world::Enemy> &live = enemy_horde_.enemies();
+        if (alpha >= 1.0F || live.empty() || previous_enemy_poses_.empty())
+            return &live;
+        presented_enemies_ = live;
+        for (world::Enemy &enemy : presented_enemies_)
+        {
+            const auto previous = previous_enemy_poses_.find(tick_pose_key(enemy));
+            // Spawned this tick, or moved further than any walk allows: show
+            // it where it is.
+            if (previous == previous_enemy_poses_.end() ||
+                pacing::distance(previous->second.position, enemy.position) >
+                    pacing::teleport_snap_distance)
+                continue;
+            enemy.position = pacing::lerp(previous->second.position, enemy.position, alpha);
+            enemy.yaw = pacing::lerp_angle(previous->second.yaw, enemy.yaw, alpha);
+        }
+        return &presented_enemies_;
+    }
+
+    [[nodiscard]] const world::Dragon *presented_dragon(float alpha)
+    {
+        if (!dragon_.visible())
+            return nullptr;
+        const world::Dragon &live = dragon_.dragon();
+        if (alpha >= 1.0F || !previous_dragon_pose_.has_value() ||
+            pacing::distance(previous_dragon_pose_->position, live.position) >
+                pacing::teleport_snap_distance)
+            return &live;
+        presented_dragon_ = live;
+        presented_dragon_.position =
+            pacing::lerp(previous_dragon_pose_->position, live.position, alpha);
+        presented_dragon_.yaw = pacing::lerp_angle(previous_dragon_pose_->yaw, live.yaw, alpha);
+        presented_dragon_.pitch =
+            pacing::lerp_angle(previous_dragon_pose_->pitch, live.pitch, alpha);
+        presented_dragon_.roll = pacing::lerp_angle(previous_dragon_pose_->roll, live.roll, alpha);
+        return &presented_dragon_;
+    }
+
+    // Where a freely flying projectile was presentation_lag_seconds_ ago: its
+    // place on the same timeline as the interpolated camera. Never further
+    // back than it has existed, so a fresh shot does not start behind the gun.
+    [[nodiscard]] world::Vec3 presented_projectile(world::Vec3 position, world::Vec3 velocity,
+                                                   float age_seconds = 1.0F) const noexcept
+    {
+        const float lag = std::min(presentation_lag_seconds_, std::max(age_seconds, 0.0F));
+        return {position.x - velocity.x * lag, position.y - velocity.y * lag,
+                position.z - velocity.z * lag};
+    }
+
+    // Keeps the display queue depth in step with the low-latency setting.
+    void apply_present_policy()
+    {
+        if (present_control_ == nullptr)
+            return;
+        if (!initial_present_queue_.has_value())
+            initial_present_queue_ = present_control_->info();
+        if (!initial_present_queue_->available)
+            return;
+        const unsigned wanted =
+            low_latency_active() ? 1U : initial_present_queue_->maximum_frame_latency;
+        if (wanted == applied_frame_latency_)
+            return;
+        applied_frame_latency_ = wanted;
+        (void)present_control_->set_maximum_frame_latency(wanted);
+    }
+
+    [[nodiscard]] std::int64_t display_refresh_interval_ns()
+    {
+        if (frames_rendered_ >= refresh_interval_checked_frame_ + 240U ||
+            refresh_interval_ns_ < 0)
+        {
+            refresh_interval_checked_frame_ = frames_rendered_;
+            refresh_interval_ns_ = 0;
+            const SDL_DisplayID display = SDL_GetDisplayForWindow(window_);
+            const SDL_DisplayMode *mode =
+                display != 0U ? SDL_GetCurrentDisplayMode(display) : nullptr;
+            if (mode != nullptr && mode->refresh_rate > 1.0F)
+                refresh_interval_ns_ =
+                    static_cast<std::int64_t>(1'000'000'000.0 / static_cast<double>(mode->refresh_rate));
+        }
+        return refresh_interval_ns_;
+    }
+
+    // Sleeps through most of the wait and spins the last stretch, so the wake
+    // lands on the deadline instead of on the scheduler's next timer tick.
+    void wait_until(Clock::time_point deadline)
+    {
+        const auto nanoseconds = [](Clock::duration duration) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+        };
+        const auto started = Clock::now();
+        const std::int64_t coarse = frame_limiter_.coarse_sleep_ns(0, nanoseconds(deadline - started));
+        if (coarse > 0)
+        {
+            SDL_DelayNS(static_cast<Uint64>(coarse));
+            frame_limiter_.record_sleep(coarse, nanoseconds(Clock::now() - started));
+        }
+        while (Clock::now() < deadline)
+            SDL_CPUPauseInstruction();
+    }
+
+    // Under vsync a finished frame sits in Present until the display takes the
+    // previous one. Spend that idle time before input is sampled instead.
+    void begin_frame_pacing(bool vsync_active)
+    {
+        if (!vsync_active || !low_latency_active())
+        {
+            present_pacer_.reset();
+            last_present_block_ns_ = 0;
+            return;
+        }
+        const std::int64_t delay =
+            present_pacer_.update(last_present_block_ns_, display_refresh_interval_ns());
+        last_present_block_ns_ = 0;
+        if (delay <= 0)
+            return;
+        const auto started = Clock::now();
+        wait_until(started + std::chrono::nanoseconds{delay});
+        pending_wait_milliseconds_ +=
+            std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+    }
+
+    void finish_frame_pacing(bool vsync_active, int frame_cap, Clock::time_point frame_start)
+    {
+        const auto started = Clock::now();
+        if (pacing_overrides_.legacy_limiter)
+        {
+            // The limiter as it was before: one sleep, truncated to whole
+            // milliseconds. Kept only so the difference can be measured.
+            if (!vsync_active && frame_cap > 0)
+            {
+                const double target = 1.0 / static_cast<double>(frame_cap);
+                const double elapsed = std::chrono::duration<double>(started - frame_start).count();
+                if (elapsed < target)
+                    SDL_Delay(static_cast<Uint32>((target - elapsed) * 1000.0));
+            }
+        }
+        else
+        {
+            // Vsync paces the loop by itself; the cap applies when it is off.
+            int cap = vsync_active ? 0 : frame_cap;
+            // Nothing is visible while minimised, and Present stops blocking,
+            // so without a cap the loop would spin flat out for no picture.
+            const bool diagnostic_run =
+                options_.bench_frames > 0 || options_.screenshot_path.has_value();
+            if (!diagnostic_run &&
+                (SDL_GetWindowFlags(window_) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED)) != 0U)
+                cap = cap > 0 ? std::min(cap, 60) : 60;
+            if (cap > 0)
+            {
+                const auto nanoseconds = [](Clock::time_point point) {
+                    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               point.time_since_epoch())
+                        .count();
+                };
+                const std::int64_t now_ns = nanoseconds(started);
+                const std::int64_t deadline_ns =
+                    frame_limiter_.next_deadline(now_ns, 1'000'000'000LL / cap);
+                if (deadline_ns > now_ns)
+                    wait_until(started + std::chrono::nanoseconds{deadline_ns - now_ns});
+            }
+            else
+                frame_limiter_.reset();
+        }
+        pending_wait_milliseconds_ +=
+            std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+    }
+
+    // Every frame ends here so the time spent blocked in Present is known.
+    void present_frame()
+    {
+        const auto started = Clock::now();
+        SDL_RenderPresent(renderer_);
+        const auto blocked = Clock::now() - started;
+        last_present_block_ns_ =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(blocked).count();
+        frame_phases_.present += std::chrono::duration<double, std::milli>(blocked).count();
+        if (options_.bench_frames > 0 && present_control_ != nullptr)
+            present_control_->note_present(frame_input_counter_);
+    }
+
+    // Mouse motion that arrived while the simulation and interface were being
+    // updated would otherwise wait for the next frame. Apply it now, just
+    // before the view is built. Only motion at the head of the queue is taken,
+    // so a click is never reordered after movement that followed it.
+    void sample_late_mouse_look()
+    {
+        if (!low_latency_active() || !world_controls_active() || inspector_view_ ||
+            inventory_open_ || text_editing() || online_join_stage_ != OnlineJoinStage::idle)
+            return;
+        SDL_PumpEvents();
+        // The view about to be built reflects all mouse movement up to here.
+        frame_input_counter_ = SDL_GetPerformanceCounter();
+        std::array<SDL_Event, 32> events{};
+        for (int pass = 0; pass < 8; ++pass)
+        {
+            const int queued =
+                SDL_PeepEvents(events.data(), static_cast<int>(events.size()), SDL_PEEKEVENT,
+                               SDL_EVENT_FIRST, SDL_EVENT_LAST);
+            int leading{};
+            while (leading < queued && events[static_cast<std::size_t>(leading)].type ==
+                                           SDL_EVENT_MOUSE_MOTION)
+                ++leading;
+            if (leading <= 0)
+                return;
+            const int taken = SDL_PeepEvents(events.data(), leading, SDL_GETEVENT,
+                                             SDL_EVENT_MOUSE_MOTION, SDL_EVENT_MOUSE_MOTION);
+            for (int index = 0; index < taken; ++index)
+                process_event(events[static_cast<std::size_t>(index)]);
+            if (leading < queued || taken < leading)
+                return;
+        }
+    }
+
+    void report_bench(const std::vector<double> &work, const std::vector<FramePhases> &phases,
+                      std::size_t latency_begin, std::uint64_t missed_begin)
+    {
+        const pacing::FrameTimeSummary summary = pacing::summarize_frame_times(work);
+        // First line keeps its original shape for anything that parses it.
+        SDL_Log("BENCH frames=%zu avg=%.3fms median=%.3fms p95=%.3fms "
+                "max=%.3fms fps=%.1f",
+                summary.frames, summary.average_ms, summary.median_ms, summary.p95_ms,
+                summary.maximum_ms, 1000.0 / summary.average_ms);
+        std::vector<double> intervals;
+        std::vector<pacing::MotionSample> motion;
+        std::vector<pacing::MotionSample> steps;
+        FramePhases total{};
+        FramePhases worst{};
+        std::size_t tickless{};
+        std::size_t multi_tick{};
+        for (const FramePhases &frame : phases)
+        {
+            intervals.push_back(frame.interval);
+            motion.push_back({frame.delta / 1000.0, frame.camera_step});
+            steps.push_back({1.0, frame.camera_step});
+            total.events += frame.events;
+            total.update += frame.update;
+            total.physics += frame.physics;
+            total.stream += frame.stream;
+            total.render += frame.render;
+            total.present += frame.present;
+            total.wait += frame.wait;
+            total.ticks += frame.ticks;
+            worst.events = std::max(worst.events, frame.events);
+            worst.update = std::max(worst.update, frame.update);
+            worst.physics = std::max(worst.physics, frame.physics);
+            worst.stream = std::max(worst.stream, frame.stream);
+            worst.render = std::max(worst.render, frame.render);
+            worst.present = std::max(worst.present, frame.present);
+            worst.wait = std::max(worst.wait, frame.wait);
+            tickless += frame.ticks == 0 ? 1U : 0U;
+            multi_tick += frame.ticks > 1 ? 1U : 0U;
+        }
+        const double count = static_cast<double>(std::max<std::size_t>(phases.size(), 1U));
+        const pacing::FrameTimeSummary pace = pacing::summarize_frame_times(intervals);
+        SDL_Log("BENCH.interval avg=%.3fms median=%.3fms p95=%.3fms p99=%.3fms max=%.3fms "
+                "stddev=%.3fms hitches=%zu over16ms=%zu fps=%.1f",
+                pace.average_ms, pace.median_ms, pace.p95_ms, pace.p99_ms, pace.maximum_ms,
+                pace.deviation_ms, pace.hitches, pace.slow_frames,
+                pace.average_ms > 0.0 ? 1000.0 / pace.average_ms : 0.0);
+        SDL_Log("BENCH.histogram <1ms=%zu <2ms=%zu <4ms=%zu <8ms=%zu <16ms=%zu <33ms=%zu "
+                "<66ms=%zu >=66ms=%zu",
+                pace.histogram[0], pace.histogram[1], pace.histogram[2], pace.histogram[3],
+                pace.histogram[4], pace.histogram[5], pace.histogram[6], pace.histogram[7]);
+        SDL_Log("BENCH.phases avg/max ms: events=%.3f/%.3f update=%.3f/%.3f "
+                "(physics=%.3f/%.3f stream=%.3f/%.3f) render=%.3f/%.3f present=%.3f/%.3f "
+                "wait=%.3f/%.3f",
+                total.events / count, worst.events, total.update / count, worst.update,
+                total.physics / count, worst.physics, total.stream / count, worst.stream,
+                total.render / count, worst.render, total.present / count, worst.present,
+                total.wait / count, worst.wait);
+        const pacing::MotionSummary moved = pacing::summarize_motion(motion);
+        const pacing::MotionSummary stepped = pacing::summarize_motion(steps);
+        SDL_Log("BENCH.motion smoothing=%d speed=%.3f/s speed_variation=%.2f%% "
+                "rms_step_error=%.2fmm worst_step_error=%.2fmm stalled_frames=%.1f%% "
+                "step_variation=%.2f%% ticks/frame=%.3f tickless=%.1f%% multitick=%.1f%%",
+                motion_smoothing_active() ? 1 : 0, moved.mean_speed,
+                moved.speed_variation * 100.0, moved.rms_step_error * 1000.0,
+                moved.worst_step_error * 1000.0, moved.stalled_fraction * 100.0,
+                stepped.speed_variation * 100.0, static_cast<double>(total.ticks) / count,
+                static_cast<double>(tickless) * 100.0 / count,
+                static_cast<double>(multi_tick) * 100.0 / count);
+        int output_width{};
+        int output_height{};
+        SDL_GetRenderOutputSize(renderer_, &output_width, &output_height);
+        const std::int64_t refresh_ns = display_refresh_interval_ns();
+        const PresentQueueInfo queue =
+            present_control_ != nullptr ? present_control_->info() : PresentQueueInfo{};
+        const PresentQueueInfo initial = initial_present_queue_.value_or(PresentQueueInfo{});
+        SDL_Log("BENCH.present output=%dx%d display=%.2fHz vsync=%d limit=%d low_latency=%d "
+                "queue_available=%d max_frame_latency=%u (sdl_default=%u) buffers=%u "
+                "swap_effect=%u flip_model=%d tearing_allowed=%d limiter_spin=%.2fms "
+                "late_start=%.2fms",
+                output_width, output_height,
+                refresh_ns > 0 ? 1'000'000'000.0 / static_cast<double>(refresh_ns) : 0.0,
+                pacing_overrides_.bench_vsync ? 1 : 0, pacing_overrides_.bench_limit,
+                low_latency_active() ? 1 : 0, queue.available ? 1 : 0,
+                queue.maximum_frame_latency, initial.maximum_frame_latency, queue.buffer_count,
+                queue.swap_effect, queue.flip_model ? 1 : 0, queue.tearing_allowed ? 1 : 0,
+                static_cast<double>(frame_limiter_.spin_margin_ns()) / 1'000'000.0,
+                static_cast<double>(present_pacer_.delay_ns()) / 1'000'000.0);
+        if (present_control_ != nullptr)
+        {
+            const std::vector<double> &all = present_control_->latency_milliseconds();
+            const std::span<const double> measured{
+                all.data() + std::min(latency_begin, all.size()),
+                all.size() - std::min(latency_begin, all.size())};
+            const pacing::FrameTimeSummary latency = pacing::summarize_frame_times(measured);
+            SDL_Log("BENCH.latency input_to_scanout samples=%zu avg=%.2fms median=%.2fms "
+                    "p95=%.2fms max=%.2fms measured_refresh=%.3fms missed_refreshes=%llu",
+                    latency.frames, latency.average_ms, latency.median_ms, latency.p95_ms,
+                    latency.maximum_ms, present_control_->refresh_interval_milliseconds(),
+                    static_cast<unsigned long long>(present_control_->missed_refreshes() -
+                                                    missed_begin));
+        }
+        if (world_preview_ != nullptr)
+        {
+            const WorldPreviewStats &terrain = world_preview_->stats();
+            const auto mean = [](float total, std::size_t count) {
+                return count > 0U ? total / static_cast<float>(count) : 0.0F;
+            };
+            SDL_Log("BENCH.terrain region_installs=%zu region_avg=%.3fms region_max=%.3fms "
+                    "mesh_sections=%zu mesh_avg=%.3fms mesh_max=%.3fms deferred_peak=%zu "
+                    "pump_max=%.3fms probe_jobs=%zu probe_sections=%zu probe_candidates=%zu "
+                    "probe_max=%.3fms",
+                    terrain.region_install_count,
+                    mean(terrain.region_install_total_milliseconds, terrain.region_install_count),
+                    terrain.region_install_peak_milliseconds, terrain.mesh_install_sections,
+                    mean(terrain.mesh_install_total_milliseconds, terrain.mesh_install_sections),
+                    terrain.mesh_install_peak_milliseconds, terrain.mesh_install_peak_deferred,
+                    terrain.edit_mesh_peak_pump_milliseconds, terrain.light_probe_jobs,
+                    terrain.light_probe_sections, terrain.light_probe_candidate_sections,
+                    terrain.light_probe_peak_milliseconds);
+            // Far terrain: what streamed, what it cost the game thread and the
+            // GPU, and what it holds (GPU times need OPENMINERZ_FAR_TRACE).
+            const world::FarTerrainStats far = world_preview_->far_terrain_stats();
+            if (far.updates > 0U)
+            {
+                const world::FarTerrainGpuStats gpu = world_preview_->far_terrain_gpu_stats();
+                const auto per = [](double total, std::size_t count) {
+                    return count > 0U ? total / static_cast<double>(count) : 0.0;
+                };
+                SDL_Log("BENCH.far tiles=%zu/%zu built=%zu (disk=%zu generated=%zu evicted=%zu) "
+                        "build_avg=%.2fms build_max=%.2fms generate_avg=%.2fms "
+                        "columns_per_ms=%.0f update_avg=%.4fms update_max=%.3fms quadrants=%zu "
+                        "triangles=%zu boxes=%zu uploads=%zu upload_avg=%.4fms upload_max=%.3fms "
+                        "gpu_geometry=%.3fms gpu_composite=%.3fms memory=%.1fMB cpu + %.1fMB gpu "
+                        "arrays + %.1fMB targets shadow_builds=%zu shadow_avg=%.1fms",
+                        far.tiles_loaded, far.tile_capacity, far.tiles_built, far.tiles_from_disk,
+                        far.tiles_generated, far.tiles_evicted,
+                        per(far.build_milliseconds_total, far.tiles_built),
+                        far.build_milliseconds_peak,
+                        per(far.generate_milliseconds_total, far.tiles_generated),
+                        far.generate_milliseconds_total > 0.0
+                            ? static_cast<double>(far.columns_generated) /
+                                  far.generate_milliseconds_total
+                            : 0.0,
+                        per(far.update_milliseconds_total, far.updates),
+                        far.update_milliseconds_peak, far.quadrants_drawn, gpu.triangles_submitted,
+                        far.boxes_drawn, gpu.uploads,
+                        per(gpu.upload_milliseconds_total, gpu.uploads),
+                        gpu.upload_milliseconds_peak, gpu.geometry_milliseconds,
+                        gpu.composite_milliseconds,
+                        static_cast<double>(far.memory_bytes) / 2.0 / 1048576.0,
+                        static_cast<double>(gpu.array_bytes) / 1048576.0,
+                        static_cast<double>(gpu.target_bytes) / 1048576.0, far.shadow_builds,
+                        per(far.shadow_milliseconds_total, far.shadow_builds));
+            }
+        }
+        // The slowest frames, with where their time went.
+        std::vector<std::size_t> order(phases.size());
+        for (std::size_t index = 0U; index < order.size(); ++index)
+            order[index] = index;
+        const std::size_t shown = std::min<std::size_t>(order.size(), 6U);
+        std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown),
+                          order.end(), [&](std::size_t left, std::size_t right) {
+                              return phases[left].interval > phases[right].interval;
+                          });
+        for (std::size_t rank = 0U; rank < shown; ++rank)
+        {
+            const FramePhases &frame = phases[order[rank]];
+            SDL_Log("BENCH.slow frame=%zu interval=%.3fms events=%.3f update=%.3f "
+                    "(physics=%.3f stream=%.3f ticks=%d) render=%.3f present=%.3f wait=%.3f",
+                    order[rank], frame.interval, frame.events, frame.update, frame.physics,
+                    frame.stream, frame.ticks, frame.render, frame.present, frame.wait);
+        }
+        if (!pacing_overrides_.bench_trace.empty())
+        {
+            std::ofstream trace{pacing_overrides_.bench_trace, std::ios::trunc};
+            trace << "frame,interval_ms,delta_ms,work_ms,events_ms,update_ms,physics_ms,stream_ms,"
+                     "render_ms,present_ms,wait_ms,ticks,alpha,camera_step\n";
+            for (std::size_t index = 0U; index < phases.size(); ++index)
+            {
+                const FramePhases &frame = phases[index];
+                trace << index << ',' << frame.interval << ',' << frame.delta << ','
+                      << frame.work << ','
+                      << frame.events << ',' << frame.update << ',' << frame.physics << ','
+                      << frame.stream << ',' << frame.render << ',' << frame.present << ','
+                      << frame.wait << ',' << frame.ticks << ',' << frame.alpha << ','
+                      << frame.camera_step << '\n';
+            }
+        }
+    }
+
     [[nodiscard]] bool world_controls_active() const noexcept
     {
         return world_controls_enabled(menu_.screen() == ui::MenuScreen::world_preview,
@@ -982,10 +2071,203 @@ class Application::Impl final
         return chat_editing_ || locator_name_editing_ || host_text_field_ != HostTextField::none;
     }
 
+    // InGameMenu and the screens GameScreen pushes on it (TeleportMenu,
+    // HostOptions, SelectPlayerScreen): each is a list drawn over the scene.
+    [[nodiscard]] bool in_game_menu_screen() const noexcept
+    {
+        const ui::MenuScreen screen = menu_.screen();
+        return screen == ui::MenuScreen::pause || screen == ui::MenuScreen::teleport ||
+               screen == ui::MenuScreen::host_options || screen == ui::MenuScreen::select_player;
+    }
+
+    // --diagnostic-menu pause | teleport | host-options | players
+    [[nodiscard]] std::optional<ui::MenuScreen> diagnostic_in_game_menu() const noexcept
+    {
+        const std::string &name = options_.diagnostic_menu;
+        if (name == "pause")
+            return ui::MenuScreen::pause;
+        if (name == "teleport")
+            return ui::MenuScreen::teleport;
+        if (name == "host-options")
+            return ui::MenuScreen::host_options;
+        if (name == "players")
+            return ui::MenuScreen::select_player;
+        // The settings screen as the pause menu opens it, over the live world
+        // (settings_over_world); --settings-tab / --settings-row pick the row.
+        if (name == "pause-settings")
+            return ui::MenuScreen::settings;
+        // (Add-Ons) The Add-Ons screen over a running world, where it refuses
+        // to switch mods and says why.
+        if (name == "pause-addons")
+            return ui::MenuScreen::addons;
+        return std::nullopt;
+    }
+
+    // LIVE PREVIEW. The settings screen opened from the pause menu keeps the
+    // live world - and the first-person hands - on screen behind it, so moving
+    // "Field of view" (or any other picture option) shows its effect while it
+    // is being changed. Opened from the main menu there is no world to show.
+    [[nodiscard]] bool settings_over_world() const noexcept
+    {
+        return menu_.screen() == ui::MenuScreen::settings && menu_.pause_overlay_active() &&
+               world_preview_ != nullptr && world_ready_frames_ > 0U;
+    }
+
+    // Which screen family sits in front of the world; see input_contract.hpp.
+    [[nodiscard]] WorldOverlay world_overlay() const noexcept
+    {
+        // UI area (app_mod_ui.inc): a mod screen over the world is a dialog,
+        // or the pause menu when it asks to pause (which stops a private game
+        // only, exactly as the game's own menu does).
+        if (mod_ui_ != nullptr && mod_ui_->screen_open() && menu_.screen() == ui::MenuScreen::world_preview)
+            return mod_ui_->pauses_world() ? WorldOverlay::pause_menu : WorldOverlay::dialog;
+        // The station picker is only an overlay once a world has actually run.
+        return classify_world_overlay(menu_.screen() == ui::MenuScreen::world_preview,
+                                      menu_.pause_overlay_active(),
+                                      menu_.screen() == ui::MenuScreen::travel &&
+                                          world_ready_frames_ > 0U);
+    }
+
+    [[nodiscard]] bool local_controls_enabled() const noexcept
+    {
+        return local_player_controls_enabled(world_overlay(), waiting_for_world_, inspector_view_,
+                                             inventory_open_, text_editing());
+    }
+
+    // Marks the stretches in which the main thread is inside the frame's own
+    // code, so a modal-loop frame can never start in the middle of one.
+    struct MainThreadBusy final
+    {
+        explicit MainThreadBusy(int &depth) noexcept : depth_{depth}
+        {
+            ++depth_;
+        }
+        ~MainThreadBusy()
+        {
+            --depth_;
+        }
+        MainThreadBusy(const MainThreadBusy &) = delete;
+        MainThreadBusy &operator=(const MainThreadBusy &) = delete;
+
+      private:
+        int &depth_;
+    };
+
+    // While a window is dragged, resized or showing its system menu, Windows
+    // runs a modal loop inside SDL_PollEvent and run() does not get the thread
+    // back until the user lets go: a host would stop simulating and pumping the
+    // network for every guest. SDL keeps a timer alive in that loop and reports
+    // each tick, on the main thread, as a live-resize expose that event watchers
+    // may draw from. Windows starves that timer while the pointer keeps moving,
+    // but every step of the drag arrives as a move or size event, so those
+    // count too once the loop has visibly stalled. Either way the tick becomes
+    // an ordinary frame here.
+    static bool SDLCALL modal_loop_watch(void *userdata, SDL_Event *event)
+    {
+        auto *self = static_cast<Impl *>(userdata);
+        switch (event->type)
+        {
+        case SDL_EVENT_WINDOW_EXPOSED:
+            if (event->window.data1 == 1)
+                self->modal_loop_frame(StalledLoopSignal::modal_timer);
+            break;
+        case SDL_EVENT_WINDOW_MOVED:
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+            self->modal_loop_frame(StalledLoopSignal::window_changed);
+            break;
+        default:
+            break;
+        }
+        return true;
+    }
+
+    void modal_loop_frame(StalledLoopSignal signal)
+    {
+        // Watchers may be called from other threads for other event types, and
+        // must never re-enter update() or an event handler. render() pumps
+        // messages in exactly one place, the late mouse-look sample taken
+        // before the view is built; a modal loop that starts there holds that
+        // frame open until the user lets go, so the world and the network are
+        // kept alive from here and only the drawing waits.
+        if (SDL_GetCurrentThreadID() != main_thread_id_ || main_thread_busy_ != 0 || !running_)
+            return;
+        const double stalled =
+            std::chrono::duration<double>(Clock::now() - last_update_time_).count();
+        if (!stalled_loop_frame_due(signal, stalled))
+            return;
+        const bool draw = render_busy_ == 0;
+        // One tick may owe several updates. Pay them in ordinary bounded
+        // steps, never as one long delta, and never more than the cap.
+        double owed = std::min(maximum_stalled_frame_debt_seconds, stalled);
+        int steps{};
+        do
+        {
+            const float delta = bounded_update_delta(owed);
+            owed -= static_cast<double>(delta);
+            world_play_time_frame_seconds_ = static_cast<double>(delta);
+            modal_frame_ = true;
+            update(delta);
+            modal_frame_ = false;
+        } while (++steps < 5 && owed > 0.001 && running_);
+        if (draw)
+            render();
+        ++modal_frames_;
+        modal_frames_since_loop_frame_ = true;
+    }
+
+    // OPENMINERZ_DIAGNOSTIC_ACTIVITY: one line per wall-clock second that shows
+    // whether the frame loop, the world clock and the fixed step are advancing,
+    // and the longest stretch the loop went without an update.
+    void trace_activity(float delta, bool simulating)
+    {
+        const Uint64 now = SDL_GetTicks();
+        if (activity_last_update_ms_ != 0U)
+            activity_longest_gap_ms_ =
+                std::max(activity_longest_gap_ms_, now - activity_last_update_ms_);
+        activity_last_update_ms_ = now;
+        ++activity_updates_;
+        activity_delta_seconds_ += static_cast<double>(delta);
+        if (now - activity_report_ms_ < 1000U)
+            return;
+        const WorldOverlay overlay = world_overlay();
+        std::cout << std::format(
+                         "diagnostic.activity wall={:.1f}s updates={} modal_frames={} "
+                         "delta_sum={:.2f}s longest_gap={}ms simulating={} overlay={} online={} "
+                         "world_clock={:.2f}s fixed_step_clock={:.2f}s day={:.4f} "
+                         "player_y={:.2f} life={} focused={} minimized={}\n",
+                         static_cast<double>(now) / 1000.0, activity_updates_, modal_frames_,
+                         activity_delta_seconds_, activity_longest_gap_ms_, simulating ? 1 : 0,
+                         overlay == WorldOverlay::none         ? "none"
+                         : overlay == WorldOverlay::pause_menu ? "pause"
+                         : overlay == WorldOverlay::dialog     ? "dialog"
+                                                               : "frontend",
+                         online_gameplay_active() ? 1 : 0, world_elapsed_, world_game_time_,
+                         day_night_.day(), player_.state().position.y,
+                         player_life_ == PlayerLife::alive ? "alive" : "dead",
+                         window_focused_ ? 1 : 0,
+                         (SDL_GetWindowFlags(window_) & SDL_WINDOW_MINIMIZED) != 0U ? 1 : 0)
+                  << std::flush;
+        activity_report_ms_ = now;
+        activity_updates_ = 0U;
+        activity_delta_seconds_ = 0.0;
+        activity_longest_gap_ms_ = 0U;
+    }
+
     void process_event(SDL_Event event)
     {
+        const MainThreadBusy busy{main_thread_busy_};
         if (event.type == SDL_EVENT_QUIT)
         {
+            if (!prepare_online_inventory_for_exit())
+                return;
+            if ((menu_.screen() == ui::MenuScreen::world_preview || in_game_menu_screen()) &&
+                world_ready() && !active_world_path_.empty())
+            {
+                pending_world_exit_ = true;
+                return;
+            }
+            save_world();
             running_ = false;
             return;
         }
@@ -994,16 +2276,39 @@ class Application::Impl final
              event.type == SDL_EVENT_MOUSE_BUTTON_UP || event.type == SDL_EVENT_MOUSE_WHEEL ||
              event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN))
         {
+            // (Network) Enter answers a mod download prompt (app_mod_net.inc).
+            if (mod_download_input(event))
+                return;
+            // Escape (or B) abandons a join that has not reached the world, so a
+            // host that never answers cannot trap the player behind this panel.
+            // Every other input stays blocked while it is shown.
+            if ((event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE &&
+                 !event.key.repeat) ||
+                (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN &&
+                 event.gbutton.button == SDL_GAMEPAD_BUTTON_EAST))
+                abandon_online_join("JoinCancelled");
             return;
         }
         SDL_ConvertEventToRenderCoordinates(renderer_, &event);
+        // UI area (app_mod_ui.inc): a mod screen or dialog has the pointer,
+        // the keys and the pad while it is up.
+        if (mod_ui_event(event))
+            return;
+        // (Add-Ons) So does the prompt for a world whose generator mod is off.
+        if (addon_prompt_event(event))
+            return;
         switch (event.type)
         {
         case SDL_EVENT_MOUSE_MOTION:
             note_mouse_activity();
             if (world_controls_active() && !inspector_view_ && !inventory_open_ && !text_editing())
             {
-                const float sensitivity = settings_.mouse_sensitivity * 0.0022F;
+                // An angle per mouse count: 0.0022 rad (0.126 degrees) at 1.0,
+                // whatever the field of view. FPSRig.UpdateRotation multiplies
+                // the look by Player.ControlSensitivity (look_scale_: retail's
+                // 0.25 while a gun is shouldered), a fixed factor that does
+                // not read the field of view either.
+                const float sensitivity = settings_.mouse_sensitivity * 0.0022F * look_scale_;
                 player_.look(event.motion.xrel * sensitivity,
                              -event.motion.yrel * sensitivity *
                                  (settings_.invert_y ? -1.0F : 1.0F));
@@ -1065,10 +2370,15 @@ class Application::Impl final
             break;
         case SDL_EVENT_MOUSE_BUTTON_UP:
             note_mouse_button(event.button.button, false);
+            // The original screens' frame buttons (Craft, Create Item) act on
+            // release.
+            if (world_controls_active() && inventory_open_ && !text_editing() &&
+                retail_screens_ready())
+                screens_button(event.button.x, event.button.y, event.button.button, false);
             if (event.button.button == SDL_BUTTON_LEFT)
             {
                 if (grenade_cooking_ && world_controls_active())
-                    throw_grenade();
+                    release_grenade();
                 mine_button_down_ = false;
             }
             else if (event.button.button == SDL_BUTTON_RIGHT)
@@ -1132,9 +2442,20 @@ class Application::Impl final
                 open_first_gamepad();
             }
             break;
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+            // Dragged to another monitor: its modes and refresh rate differ.
+            refresh_display_capabilities();
+            sync_frame_limit_to_display();
+            break;
+        case SDL_EVENT_WINDOW_RESIZED:
+            note_window_resized(event.window.data1, event.window.data2);
+            break;
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
             window_focused_ = true;
             apply_audio_settings();
+            // (Add-Ons) Back from Explorer: mods copied in meanwhile show up.
+            if (menu_.screen() == ui::MenuScreen::addons)
+                refresh_addons_from_disk();
             break;
         case SDL_EVENT_WINDOW_FOCUS_LOST:
             window_focused_ = false;
@@ -1142,7 +2463,7 @@ class Application::Impl final
             mouse_secondary_down_ = false;
             gamepad_input_active_ = false;
             player_roster_visible_ = false;
-            cancel_world_action();
+            cancel_world_action(true);
             apply_audio_settings();
             break;
         default:
@@ -1307,6 +2628,14 @@ class Application::Impl final
             process_world_key(key);
             return;
         }
+        if (menu_.screen() == ui::MenuScreen::world_select && key == SDLK_F)
+        {
+            world_sort_ = (world_sort_ + 1) % 3;
+            refresh_world_list();
+            return;
+        }
+        if (menu_.screen() == ui::MenuScreen::settings && settings_screen_key(key))
+            return;
         switch (key)
         {
         case SDLK_UP:
@@ -1338,20 +2667,9 @@ class Application::Impl final
         case SDLK_ESCAPE:
             handle(menu_.back());
             break;
-        case SDLK_R:
-            if (menu_.screen() == ui::MenuScreen::settings)
-            {
-                settings_ = Settings{};
-                world_preview_->set_view_distance(settings_.view_distance);
-                world_preview_->set_particle_density(particle_density(settings_.particle_quality));
-                apply_grading_settings();
-                apply_audio_settings();
-                SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE,
-                            settings_.raw_mouse_input ? "0" : "1");
-                dirty_ = true;
-                toast("DEFAULT SETTINGS RESTORED", "All categories returned to balanced defaults.");
-            }
-            break;
+        // R on the settings screen is handled by settings_screen_key above. It
+        // used to replace every setting, including ones no page shows, on a
+        // single unconfirmed key press.
         default:
             break;
         }
@@ -1359,6 +2677,14 @@ class Application::Impl final
 
     void process_world_key(SDL_Keycode key)
     {
+        if (key == SDLK_F2 || key == SDLK_F3)
+        {
+            bool &value = key == SDLK_F2 ? settings_.hud_visible : settings_.hud_debug;
+            value = !value;
+            dirty_ = true;
+            save_settings();
+            return;
+        }
         if (player_life_ != PlayerLife::alive)
         {
             // The original's respawn inputs: Jump or Enter (plus left click,
@@ -1383,7 +2709,7 @@ class Application::Impl final
         switch (key)
         {
         case SDLK_ESCAPE:
-            cancel_world_action();
+            cancel_world_action(true);
             SDL_SetWindowRelativeMouseMode(window_, false);
             menu_.open(ui::MenuScreen::pause);
             break;
@@ -1410,9 +2736,15 @@ class Application::Impl final
             inventory_focus_ = PlayerInventory::storage_size + inventory_.selected_index();
             SDL_SetWindowRelativeMouseMode(window_, !inventory_open_ && !inspector_view_);
             if (!inventory_open_)
+            {
                 close_inventory();
+            }
             else
-                cancel_world_action();
+            {
+                cancel_world_action(true);
+                // Both originals click when the inventory binding opens it.
+                sound_bank_->play_click();
+            }
             break;
         case SDLK_T:
             if (online_gameplay_active())
@@ -1435,23 +2767,37 @@ class Application::Impl final
                 begin_gun_reload();
             break;
         case SDLK_F:
-            // Creative flight toggle (the original Player._flyMode, cued with
-            // the fly/teleport chirp). Survival keeps its feet on the ground.
-            if (infinite_resources_)
+            // CastleMinerZControllerMapping.FlyMode. In 1.9.9.8 Creative it
+            // flips Player._flyMode and that is all (no cue, no message); in
+            // 1.6.3.8 nothing reads the key, and here it flies in Creative
+            // all the same (the owner's choice). That flight and the Free
+            // flight extra, in any unrestricted world, are this project's own
+            // and come with its own feedback.
+            if (flight_available())
             {
                 auto &state = player_.state();
                 state.fly_mode = !state.fly_mode;
-                if (state.fly_mode)
-                    state.velocity.y = 0.0F;
-                sound_bank_->play_cue(state.fly_mode ? "Teleport" : "locator");
-                caption(state.fly_mode ? "[ FLIGHT ON ]" : "[ FLIGHT OFF ]", 1.2F);
-                toast(state.fly_mode ? "FLIGHT ENABLED" : "FLIGHT DISABLED",
-                      state.fly_mode ? "SPACE RISES  /  SHIFT SINKS  /  F LANDS"
-                                     : "Gravity is back in charge.");
+                if (flight_is_free())
+                {
+                    if (state.fly_mode)
+                        state.velocity.y = 0.0F;
+                    sound_bank_->play_cue(state.fly_mode ? "Teleport" : "locator");
+                    caption(state.fly_mode ? "[ FLIGHT ON ]" : "[ FLIGHT OFF ]", 1.2F);
+                    toast(state.fly_mode ? "FLIGHT ENABLED" : "FLIGHT DISABLED",
+                          state.fly_mode ? "SPACE RISES  /  SHIFT SINKS  /  F LANDS" : "");
+                }
             }
-            else
+            else if (has_unrestricted_resources(game_mode_, infinite_resources_))
             {
-                toast("FLIGHT IS A CREATIVE POWER", "Only Creative mode can fly.");
+                // This world could fly before the original's rule was matched;
+                // say where that went instead of leaving a dead key.
+                if (enhancement_enabled(settings_, Enhancement::free_flight))
+                    toast("FREE FLIGHT IS PAUSED", "Extras are off while you are online.");
+                else
+                    toast("FLIGHT IS AN EXTRA",
+                          inventory_.profile() == InventoryProfile::modern
+                              ? "The original flies in Creative only. Settings > Extras > Free flight."
+                              : "The original Classic game cannot fly. Settings > Extras > Free flight.");
             }
             break;
         case SDLK_F1:
@@ -1469,89 +2815,58 @@ class Application::Impl final
         case SDLK_6:
         case SDLK_7:
         case SDLK_8:
-            // GrenadeCook owns the active item until release/auto-throw. Letting
+            // InGameHUD ignores the slot keys while UsingAnimationPlaying. That
+            // also keeps GrenadeCook in hand until release/auto-throw: letting
             // a number key replace it mid-fuse made the grenade vanish without
             // consuming or throwing anything.
-            if (grenade_cooking_)
+            if (use_animation_playing())
                 break;
-            inventory_.select(static_cast<std::size_t>(key - SDLK_1));
-            cancel_world_action();
+            {
+                // Re-selecting the slot already in hand equips nothing new, so
+                // (as in EquipActiveItem) its reload carries on.
+                const auto wanted = static_cast<std::size_t>(key - SDLK_1);
+                const bool same_item = wanted == inventory_.selected_index();
+                inventory_.select(wanted);
+                cancel_world_action(same_item);
+            }
             sync_selected_item();
             sound_bank_->play_cue("Click");
             break;
         default:
+            // UI area (app_mod_ui.inc): a key the game does not use here may
+            // be a mod's binding.
+            (void)mod_ui_world_key(key);
             break;
         }
     }
 
+    // A key while the inventory, crate or crafting screen is up. Every style's
+    // screen is screens::Session, which decides what the key does.
     void process_inventory_key(SDL_Keycode key)
     {
-        switch (key)
+        // The retail screens read Escape, E, Q, Enter and the arrows;
+        // Remastered adds its own (screens_keycode). G is the game's own tray
+        // switch: it works on the Classic screens (whose panel has room for
+        // one tray row, so a two-tray world shows the tray in hand) and on
+        // the Remastered ones, and 1.9.9.8's screen, as in the original, does
+        // not read it.
+        if (key == SDLK_G && !screens_modern_layout())
         {
-        case SDLK_ESCAPE:
-        case SDLK_E:
-            sound_bank_->play_click();
-            close_inventory();
-            break;
-        case SDLK_LEFT:
-        case SDLK_A:
-            move_inventory_focus(-1, 0);
-            sound_bank_->play_click();
-            break;
-        case SDLK_RIGHT:
-        case SDLK_D:
-            move_inventory_focus(1, 0);
-            sound_bank_->play_click();
-            break;
-        case SDLK_UP:
-        case SDLK_W:
-            move_inventory_focus(0, -1);
-            sound_bank_->play_click();
-            break;
-        case SDLK_DOWN:
-        case SDLK_S:
-            move_inventory_focus(0, 1);
-            sound_bank_->play_click();
-            break;
-        case SDLK_RETURN:
-        case SDLK_SPACE: {
-            const Rect rect = inventory_slot_rect(inventory_focus_);
-            inventory_pointer(rect.x + rect.width * 0.5F, rect.y + rect.height * 0.5F,
-                              SDL_BUTTON_LEFT);
-            break;
-        }
-        case SDLK_Q:
-            drop_inventory_selection();
-            break;
-        case SDLK_G:
             switch_hotbar_tray();
             inventory_focus_ = PlayerInventory::storage_size + inventory_.selected_index();
-            break;
-        case SDLK_TAB:
-            if (active_crate_.has_value())
-            {
-                if (inventory_focus_ >= crate_slot_base)
-                    inventory_focus_ = inventory_focus_ - crate_slot_base;
-                else
-                {
-                    const std::size_t row = std::min<std::size_t>(inventory_focus_ / 8U, 3U);
-                    inventory_focus_ = crate_slot_base + row * 8U + inventory_focus_ % 8U;
-                }
-                sound_bank_->play_click();
-            }
-            break;
-        case SDLK_Y:
-            if (quick_move_inventory_slot(inventory_focus_))
-                sound_bank_->play_click();
-            break;
-        default:
-            break;
+        }
+        else
+        {
+            (void)screens_keycode(key);
         }
     }
 
     void select_hotbar(int direction)
     {
-        if (grenade_cooking_)
+        // InGameHUD ignores NextItem/PreviousItem (and the slot keys) while
+        // LocalPlayer.UsingAnimationPlaying: a shot, swing, placement or
+        // grenade clip always finishes on the item that started it.
+        if (use_animation_playing())
             return;
         cancel_world_action();
         inventory_.select_relative(direction);
@@ -1579,21 +2894,18 @@ class Application::Impl final
             fired_launcher_tray_ == inventory_.current_tray_index() &&
             *fired_launcher_slot_ == inventory_.selected_index())
             return;
+        // Modding, gameplay area: item.used may stop the item's own action, and
+        // a mod item's own use replaces it.
+        if (!mod_gameplay_using())
+            return;
         if (selected_gun() != nullptr)
         {
             mine_button_down_ = true;
-            if (gun_reloading_)
-            {
-                // GunInventoryItem.ProcessInput cancels Reloading on a fresh Use
-                // press, then allows that same press to fire any shell/round
-                // already inserted by a completed reload cycle.
-                gun_reloading_ = false;
-                gun_reload_time_ = 0.0F;
-                gun_reload_cue_started_ = false;
-            }
-            // Semi-automatic guns fire once per trigger pull here; automatics
-            // keep cycling in the fixed tick while the button stays held.
-            fire_gun();
+            // One Use.Pressed sample. gun_trigger_step alone decides whether it
+            // fires, abandons a reload for a round that is already loaded, asks
+            // for a reload, or does nothing; automatics keep sampling the held
+            // trigger in the fixed tick.
+            gun_input(true, false);
             return;
         }
         if (item_grenade_type(inventory_.selected_item()).has_value())
@@ -1611,21 +2923,40 @@ class Application::Impl final
             begin_locator_name_edit();
             return;
         }
-        // Every melee-capable item uses the same entity-or-block construction
-        // ray as the original. An enemy hit owns the action and suppresses
-        // placement/mining behind it.
-        if (try_melee())
+        const auto target = player_.state().target;
+        const InventoryItemId held_item = inventory_.selected_item();
+        if (item_uses_tool_input(held_item))
         {
+            // InventoryItem.ProcessInput: the items that keep the base input
+            // path (hands, picks, spades, axes, knives, laser swords, compass,
+            // clock, materials) share one entity-or-block construction ray. An
+            // enemy hit owns the action and suppresses mining behind it.
+            if (!try_melee() && target.has_value() &&
+                (target->block == world::BlockType::tnt || target->block == world::BlockType::c4))
+            {
+                // `if (TNT or C4) and the held item is not a SpadeInventoryClass:
+                // Use.Pressed || Shoulder.Pressed -> SetFuseForExplosive`. A
+                // spade digs the charge out instead.
+                const auto held = static_cast<std::uint16_t>(held_item);
+                const bool spade =
+                    held >= static_cast<std::uint16_t>(InventoryItemId::stone_spade) &&
+                    held <= static_cast<std::uint16_t>(InventoryItemId::diamond_spade);
+                if (!spade)
+                    (void)arm_placed_explosive(target->x, target->y, target->z,
+                                               target->block == world::BlockType::tnt
+                                                   ? world::ExplosiveKind::tnt
+                                                   : world::ExplosiveKind::c4,
+                                               true);
+            }
             mine_button_down_ = true;
             return;
         }
-        const auto target = player_.state().target;
+        // BlockInventoryItem.ProcessInput (blocks, torch, doors) replaces the base
+        // input entirely: a press only ever tries to build. It cannot melee,
+        // and an enemy standing in the ray does not stop the placement.
         const world::BlockType selected = inventory_.selected_block();
         if (selected == world::BlockType::empty || !target.has_value())
-        {
-            mine_button_down_ = true;
             return;
-        }
         if (!world::can_build_on(target->block))
             return;
 
@@ -1665,8 +2996,16 @@ class Application::Impl final
                 region.block(x, y - 1, z) == world::BlockType::empty ||
                 region.block(x, y + 1, z) != world::BlockType::empty)
                 return;
-            const bool x_neighbor = world::is_solid(region.block(x + 1, y, z)) ||
-                                    world::is_solid(region.block(x - 1, y, z));
+            // DoorInventoryitem.GetConstructedBlockType, in its order: both X
+            // neighbours -> ClosedX; both Z -> ClosedZ; either X -> ClosedX;
+            // otherwise ClosedZ. (A door set into a Z-aligned wall gap with one
+            // extra X neighbour therefore still lies along Z.)
+            const bool positive_x = world::is_solid(region.block(x + 1, y, z));
+            const bool negative_x = world::is_solid(region.block(x - 1, y, z));
+            const bool both_z = world::is_solid(region.block(x, y, z + 1)) &&
+                                world::is_solid(region.block(x, y, z - 1));
+            const bool x_neighbor =
+                (positive_x && negative_x) || (!both_z && (positive_x || negative_x));
             const world::BlockType base_door = selected_item == InventoryItemId::door
                                                    ? world::BlockType::lower_door
                                                    : world::BlockType::strong_lower_door;
@@ -1678,9 +3017,77 @@ class Application::Impl final
                 return;
         }
 
+        if (selected_item == InventoryItemId::modern_teleport_station && !station_placement_confirmed_)
+        {
+            if (inventory_.teleport_stations().size() >= net::maximum_teleport_stations)
+            {
+                toast("STATION LIMIT", "Remove a station before placing another.");
+                return;
+            }
+            pending_station_placement_ = *target;
+            locator_name_slot_ = inventory_.selected_index();
+            // InventoryItem.SetDefaultValues: _keyboardDefaultText = "Beta".
+            // ("Delta" is only what an empty name is serialized as.)
+            locator_name_draft_ = "Beta";
+            locator_key_fallback_.clear();
+            locator_name_editing_ = true;
+            cancel_world_action();
+            SDL_SetWindowRelativeMouseMode(window_, false);
+            (void)SDL_StartTextInput(window_);
+            return;
+        }
         player_.state().selected_block = constructed;
+        {
+            // InGameHUD.Build refuses a cell that fails BlockTerrain.OkayToBuildHere
+            // (local Y strictly inside 0..127, i.e. world Y -63..62), that any
+            // player's 0.7 x 1.7 box (lifted 0.05) touches, or that an enemy's
+            // box reaches into. Only the local player's own box was tested, so
+            // a block could be built into another player or a zombie, and at
+            // the world's top and bottom layers where a stock peer refuses it.
+            const int cell_x = target->place_x;
+            const int cell_y = target->place_y;
+            const int cell_z = target->place_z;
+            if (cell_y <= world::world_min_y ||
+                cell_y >= world::world_min_y + world::chunk_height - 1)
+                return;
+            const auto box_reaches_cell = [&](world::Vec3 feet, float half_width, float height,
+                                              float inset) {
+                return feet.x + half_width > static_cast<float>(cell_x) + inset &&
+                       feet.x - half_width < static_cast<float>(cell_x + 1) - inset &&
+                       feet.y + height > static_cast<float>(cell_y) + inset &&
+                       feet.y < static_cast<float>(cell_y + 1) - inset &&
+                       feet.z + half_width > static_cast<float>(cell_z) + inset &&
+                       feet.z - half_width < static_cast<float>(cell_z + 1) - inset;
+            };
+            if (online_gameplay_active())
+                for (const auto &[gid, remote] : online_remote_players_)
+                {
+                    static_cast<void>(gid);
+                    world::Vec3 feet = remote.state.position;
+                    feet.y += 0.05F;
+                    if (remote.has_update &&
+                        box_reaches_cell(feet, world::PlayerSimulation::body_half_width,
+                                         world::PlayerSimulation::body_height, 0.0F))
+                        return;
+                }
+            // EnemyManager.TouchesZombies over the cell shrunk by 0.01.
+            for (const world::Enemy &enemy : enemy_horde_.enemies())
+                if (box_reaches_cell(enemy.position, 0.35F, 1.65F, 0.01F))
+                    return;
+        }
+        // Modding, gameplay area: block.placing may refuse it.
+        if (!mod_gameplay_placing(target->place_x, target->place_y, target->place_z, constructed))
+            return;
         if (!player_.place_target(world_preview_->region()))
             return;
+        const std::array<float, 3> destination{float(target->place_x), float(target->place_y), float(target->place_z)};
+        if (selected_item == InventoryItemId::modern_spawn_basic)
+        {
+            (void)inventory_.register_spawn_point(destination);
+            toast("SPAWN POINT SET", "You will return here after death.");
+        }
+        else if (selected_item == InventoryItemId::modern_teleport_station)
+            (void)inventory_.register_teleport_station(destination, locator_name_draft_);
         if (placing_door)
         {
             world_preview_->region().set_block(target->place_x, target->place_y + 1,
@@ -1706,7 +3113,8 @@ class Application::Impl final
             }
             dirty_ = true;
         }
-        if (!infinite_resources_)
+        progress_.items[static_cast<std::size_t>(selected_item)].used += 1;
+        if (!infinite_resources_ || selected_item == InventoryItemId::modern_teleport_station)
             (void)inventory_.consume_selected();
         sound_bank_->play_place();
         caption(std::format("[ {} PLACED ]", world::block_name(selected)));
@@ -1744,11 +3152,15 @@ class Application::Impl final
                                                target->place_z);
         // Vanilla placement sends DigMessage(placing=true) with the struck face's hit point,
         // normal, and block type. ProcessDigMessage then runs the same smoke/spark/rock burst
-        // as mining while selecting the separate Place sound above.
-        world_preview_->spawn_mining_impact(placement);
+        // as mining while selecting the separate Place sound above. (That burst is what
+        // spawn_block_placed draws in the Original presentation; the Enhanced one shows a
+        // block being seated instead of one being struck.)
+        world_preview_->spawn_block_placed(placement);
         placement_animation_time_ = 0.35F;
-        toast("BLOCK PLACED", std::string{world::block_name(selected)});
+        animation_use_pulse_ = true; // BlockInventoryItem.ProcessInput: UsingTool
         sync_selected_item();
+        // Modding, gameplay area: block.placed (a mod item places its mod block).
+        mod_gameplay_placed(target->place_x, target->place_y, target->place_z, constructed);
     }
 
     void begin_grenade_cook()
@@ -1764,9 +3176,20 @@ class Application::Impl final
         grenade_cooking_ = true;
         grenade_cooking_type_ = *grenade_type;
         grenade_cook_time_ = 0.0F;
+        grenade_arm_.press();
         mine_button_down_ = true;
         sound_bank_->play_cue("GrenadeArm");
         caption("[ GRENADE ARMED ]", 0.8F);
+    }
+
+    // Use released: ReadyToThrowGrenade. The grenade itself leaves when the
+    // cook and throw clips have played (net::GrenadeArm), as in the original;
+    // throwing here made every peer see the swing after the grenade was gone,
+    // or no swing at all for a quick tap.
+    void release_grenade() noexcept
+    {
+        if (grenade_cooking_)
+            grenade_arm_.release();
     }
 
     void throw_grenade()
@@ -1803,17 +3226,22 @@ class Application::Impl final
                                       net::MessageDeliveryPolicy::reliable_unordered,
                                       network_error))
             std::cerr << "network.local.grenade.failure=" << network_error << '\n';
-        // Player.ProcessGrenadeMessage checks specifically for
-        // GrenadeInventoryItemClass. StickyGrenadeInventoryItemClass is a
-        // sibling, so the shipped game accidentally never pops sticky stacks.
-        if (!infinite_resources_ && grenade_cooking_type_ == 0U)
+        // Player.ProcessGrenadeMessage pops one item when the held class `is
+        // GrenadeInventoryItemClass`. 1.9.9.8 registers the sticky grenade with
+        // that very class (GrenadeTypeEnum.Sticky); the separate
+        // StickyGrenadeInventoryItemClass exists in the assembly but is never
+        // registered, so sticky stacks are consumed like HE ones.
+        progress_.items[static_cast<std::size_t>(grenade_cooking_type_ == 0U
+            ? InventoryItemId::grenade : InventoryItemId::modern_sticky_grenade)].used += 1;
+        if (!infinite_resources_)
             (void)inventory_.consume_selected();
         sync_selected_item();
         grenade_cooking_ = false;
         grenade_cooking_type_ = 0U;
         grenade_cook_time_ = 0.0F;
         grenade_cooldown_ = 1.0F;
-        grenade_animation_time_ = 0.3166666F;
+        // The throw swing has already played by the time the grenade leaves.
+        grenade_animation_time_ = 0.0F;
         mine_button_down_ = false;
         caption("[ GRENADE THROWN ]", 0.8F);
     }
@@ -1863,6 +3291,15 @@ class Application::Impl final
         }
     }
 
+    // There is deliberately no "non-admin occupied-cell" rule here any more.
+    // It was modelled on BlockTerrain.SetBlock(worldIndex, type, admin), which
+    // exists only in the OpenClassic mod's source. The shipped Classic 1.6.3.8
+    // and Modern 1.9.9.8 assemblies both declare SetBlock(IntVector3,
+    // BlockTypeEnum) alone and call it unconditionally from
+    // _processAlterBlocksMessage, so a stock peer applies every edit from
+    // every sender. Enforcing the mod's rule whenever a stock peer was present
+    // refused exactly the edits that peer had already applied.
+
     [[nodiscard]] bool send_authoritative_block_correction(net::PeerId peer,
                                                             net::IntVector3 location)
     {
@@ -1897,10 +3334,120 @@ class Application::Impl final
         return true;
     }
 
+    // A refused CreatePickupMessage is an item-destroying event: the sender has
+    // already debited the stack from its inventory or from a crate it ejected.
+    // The stock protocol expresses the only conserving answer with an ordinary
+    // directed ConsumePickupMessage naming the sender as the picker-upper, which
+    // is exactly what PickupManager.HandleConsumePickupMessage needs to delete
+    // the orphaned entity and hand the item back through AddInventoryItem.
+    [[nodiscard]] bool return_refused_pickup_to_sender(net::PeerId peer, std::uint8_t sender_gid,
+                                                        const net::CreatePickupPayload &pickup)
+    {
+        if (online_host_ == nullptr || sender_gid == 0U)
+            return false;
+        net::ConsumePickupPayload refund;
+        refund.pickup_position = pickup.spawn_position;
+        refund.pickup_id = pickup.pickup_id;
+        refund.spawner_id = sender_gid;
+        refund.picker_upper = sender_gid;
+        refund.item = pickup.item;
+        refund.display_on_pickup = pickup.display_on_pickup;
+        net::PayloadError payload_error{};
+        const auto payload =
+            net::encode_consume_pickup_payload(refund, host_settings_.protocol, payload_error);
+        const net::MessageDescriptor *descriptor =
+            net::message_by_name(host_settings_.protocol, "ConsumePickupMessage");
+        net::PacketError packet_error{};
+        const auto packet = payload.has_value() && descriptor != nullptr
+                                ? net::encode_packet(host_settings_.protocol, descriptor->id,
+                                                     *payload, packet_error)
+                                : std::nullopt;
+        if (!packet.has_value())
+            return false;
+        net::LegacySteamOutbound refusal;
+        refusal.recipient = peer;
+        refusal.application_packet = *packet;
+        refusal.delivery = net::MessageDeliveryPolicy::reliable_unordered;
+        std::string error;
+        if (!online_host_->send_authoritative(refusal, error))
+        {
+            std::cerr << "network.authority.pickup-refund.failure peer=" << peer
+                      << " reason=" << error << '\n';
+            return false;
+        }
+        return true;
+    }
+
+    // A refused ItemCrateMessage leaves the sender's crate view permanently
+    // disagreeing with every other peer and with the saved world. ItemCrateMessage
+    // is an absolute slot assignment in both generations, so echoing the
+    // authoritative slot back restores agreement without a new message type.
+    [[nodiscard]] bool correct_refused_crate_slot(net::PeerId peer, net::IntVector3 location,
+                                                   std::int32_t index)
+    {
+        if (online_host_ == nullptr || index < 0 ||
+            index >= static_cast<std::int32_t>(world_save_crate_slot_count))
+            return false;
+        const CrateKey key{location.x, location.y, location.z};
+        const auto found = crate_inventories_.find(key);
+        // A crate the host does not know about is authoritatively empty: the
+        // original's GetCreate(location, true) materializes empty slots.
+        const PlayerInventory::Slot authoritative =
+            found == crate_inventories_.end()
+                ? PlayerInventory::Slot{}
+                : found->second[static_cast<std::size_t>(index)];
+        net::InventorySlotPayload item;
+        if (!net::inventory_slot_to_payload(authoritative, host_settings_.protocol, item))
+            return false;
+        net::PayloadError payload_error{};
+        const auto payload = net::encode_item_crate_payload({location, index, std::move(item)},
+                                                             host_settings_.protocol, payload_error);
+        const net::MessageDescriptor *descriptor =
+            net::message_by_name(host_settings_.protocol, "ItemCrateMessage");
+        net::PacketError packet_error{};
+        const auto packet = payload.has_value() && descriptor != nullptr
+                                ? net::encode_packet(host_settings_.protocol, descriptor->id,
+                                                     *payload, packet_error)
+                                : std::nullopt;
+        if (!packet.has_value())
+            return false;
+        net::LegacySteamOutbound correction;
+        correction.recipient = peer;
+        correction.application_packet = *packet;
+        correction.delivery = net::MessageDeliveryPolicy::reliable_ordered;
+        std::string error;
+        if (!online_host_->send_authoritative(correction, error))
+        {
+            std::cerr << "network.authority.crate-correction.failure peer=" << peer
+                      << " reason=" << error << '\n';
+            return false;
+        }
+        return true;
+    }
+
     void correct_rejected_block_mutation(net::PeerId peer, const net::DecodedPacket &decoded)
     {
         constexpr std::size_t maximum_corrections = 256U;
         net::PayloadError payload_error{};
+        if (decoded.message != nullptr && decoded.message->name == "CreatePickupMessage")
+        {
+            net::CreatePickupPayload pickup;
+            const auto sender_gid =
+                online_host_ != nullptr ? online_host_->gid_for(peer) : std::nullopt;
+            if (sender_gid.has_value() &&
+                net::decode_create_pickup_payload(decoded.payload, host_settings_.protocol, pickup,
+                                                  payload_error))
+                static_cast<void>(return_refused_pickup_to_sender(peer, *sender_gid, pickup));
+            return;
+        }
+        if (decoded.message != nullptr && decoded.message->name == "ItemCrateMessage")
+        {
+            net::ItemCratePayload crate;
+            if (net::decode_item_crate_payload(decoded.payload, host_settings_.protocol, crate,
+                                               payload_error))
+                static_cast<void>(correct_refused_crate_slot(peer, crate.location, crate.index));
+            return;
+        }
         if (decoded.message != nullptr && decoded.message->name == "AlterBlockMessage")
         {
             net::AlterBlockPayload edit;
@@ -2026,7 +3573,8 @@ class Application::Impl final
                                        static_cast<float>(position.y),
                                        static_cast<float>(position.z)};
             play_positional("Explosion", location);
-            world_preview_->spawn_fireball_explosion(location, false, true);
+            // (The style only picks the Enhanced presentation's look.)
+            world_preview_->spawn_fireball_explosion(location, false, true, ExplosionStyle::tnt);
             return true;
         }
         if (decoded.message->name == "AddExplosiveFlashMessage")
@@ -2073,9 +3621,17 @@ class Application::Impl final
     {
         if (world_preview_ == nullptr)
             return false;
+        // Modding, gameplay area: talking to a mod NPC comes first.
+        if (mod_gameplay_live() && mod_gameplay_interact())
+            return true;
         if (!player_.state().target.has_value())
             return false;
         const world::VoxelRaycastHit &target = *player_.state().target;
+        if (target.block == world::BlockType::teleport_station)
+        {
+            open_station_menu({float(target.x), float(target.y), float(target.z)});
+            return true;
+        }
         if (world::is_spawner_clickable(target.block))
         {
             if (online_gameplay_active() &&
@@ -2100,9 +3656,12 @@ class Application::Impl final
         {
             active_crate_ = CrateKey{target.x, target.y, target.z};
             (void)crate_inventories_[*active_crate_];
+            // Modding (Integration): stacks that arrived by the joiner's world
+            // snapshot get their mod item identities as the crate opens.
+            mod_gameplay_crate_opened(*active_crate_);
             inventory_open_ = true;
             inventory_focus_ = crate_slot_base;
-            cancel_world_action();
+            cancel_world_action(true);
             SDL_SetWindowRelativeMouseMode(window_, false);
             sound_bank_->play_click();
             caption("[ CRATE OPENED ]", 0.8F);
@@ -2148,12 +3707,20 @@ class Application::Impl final
                                           net::MessageDeliveryPolicy::reliable_ordered,
                                           network_error))
                 std::cerr << "network.local.door-sound.failure=" << network_error << '\n';
+            // InGameHUD sends DoorOpenCloseMessage and the two AlterBlockMessages
+            // and the sender applies them through its own echo; every stock peer
+            // then applies the relayed edits unconditionally. A guest's door
+            // therefore moves for everyone in a stock session. (The belief that
+            // it was sound-only came from the OpenClassic mod's `admin` rule in
+            // SetBlock. Waiting for "the host's word" under a stock host, which
+            // never sends one, left this client looking at a shut door that
+            // every stock player saw open.)
+            static_cast<void>(publish_local_block_edit(target.x, lower_y, target.z, lower));
+            static_cast<void>(publish_local_block_edit(target.x, lower_y + 1, target.z, upper));
             region.set_block(target.x, lower_y, target.z, lower);
             region.set_block(target.x, lower_y + 1, target.z, upper);
             world_preview_->remember_edit(target.x, lower_y, target.z, lower);
             world_preview_->remember_edit(target.x, lower_y + 1, target.z, upper);
-            static_cast<void>(publish_local_block_edit(target.x, lower_y, target.z, lower));
-            static_cast<void>(publish_local_block_edit(target.x, lower_y + 1, target.z, upper));
             world_preview_->rebuild_block_edit(target.x, lower_y, target.z);
             world_preview_->rebuild_block_edit(target.x, lower_y + 1, target.z);
             play_positional(opening ? "DoorOpen" : "DoorClose",
@@ -2178,17 +3745,21 @@ class Application::Impl final
         return true;
     }
 
-    void cancel_world_action()
+    // Releases every held world input. The original only abandons a reload
+    // when a different item is equipped (Player.Equip): opening the inventory
+    // or a crate, pausing, or losing focus all leave it running, so those
+    // callers pass keep_gun_reload.
+    void cancel_world_action(bool keep_gun_reload = false)
     {
         mine_button_down_ = false;
         secondary_action_down_ = false;
         shouldering_ = false;
         air_punch_time_ = 0.0F;
-        gun_reloading_ = false;
-        gun_reload_time_ = 0.0F;
-        gun_reload_cue_started_ = false;
+        if (!keep_gun_reload)
+            withdraw_gun_reload();
         gun_aim_progress_ = 0.0F;
         grenade_cooking_ = false;
+        grenade_arm_.cancel();
         grenade_cooking_type_ = 0U;
         grenade_cook_time_ = 0.0F;
         player_.cancel_breaking();
@@ -2251,8 +3822,8 @@ class Application::Impl final
 
     void update_equipped_item_sound()
     {
-        const bool gameplay_screen = menu_.screen() == ui::MenuScreen::world_preview ||
-                                     menu_.screen() == ui::MenuScreen::pause;
+        // The world, or any pause overlay or in-world picker in front of it.
+        const bool gameplay_screen = world_overlay() != WorldOverlay::frontend;
         const InventoryItemId selected = inventory_.selected_item();
         const std::optional<InventoryItemId> wanted =
             gameplay_screen && !waiting_for_world_ && is_laser_sword_item(selected)
@@ -2290,7 +3861,8 @@ class Application::Impl final
         const auto value = static_cast<std::uint16_t>(item);
         const bool shotgun = value == 52U || value == 58U || value == 64U || value == 70U ||
                              value == 84U || value == 89U || value == 94U || value == 99U ||
-                             value == 103U || value == 104U ||
+                             value == 103U || value == 104U || value == 112U || value == 113U ||
+                             // 1.9.9.8 GrenadeLauncherInventoryItemClass: SHOTGUN.
                              item == InventoryItemId::modern_basic_grenade_launcher;
         if (shotgun)
             return world::DamageFlags::shotgun;
@@ -2298,7 +3870,9 @@ class Application::Impl final
             return world::DamageFlags::bullet;
         const bool blade = (value >= 23U && value <= 28U) || (value >= 34U && value <= 38U) ||
                            value == 49U || value == 55U || value == 61U || value == 67U ||
-                           value == 81U || (value >= 114U && value <= 118U);
+                           value == 81U || (value >= 114U && value <= 118U) ||
+                           // 1.9.9.8 ChainsawInventoryItemClass: BLADE.
+                           item == InventoryItemId::modern_chainsaw_1;
         return blade ? world::DamageFlags::blade : world::DamageFlags::blunt;
     }
 
@@ -2312,7 +3886,8 @@ class Application::Impl final
         const world::Vec3 direction = player_.view_direction();
         // InGameHUD's ConstructionProbe is five blocks long. Terrain is
         // traced first and the enemy test is clipped to that intersection.
-        constexpr float construction_reach = 5.0F;
+        // (Items) A mod weapon reaches its own distance.
+        const float construction_reach = held_melee_reach();
         const float reach = clear_range(eye, direction, construction_reach);
         return enemy_horde_.trace_along_ray(eye, direction, reach);
     }
@@ -2357,7 +3932,8 @@ class Application::Impl final
                               player_.state().position.y + world::PlayerSimulation::eye_height,
                               player_.state().position.z};
         const world::Vec3 direction = player_.view_direction();
-        const world::Vec3 delta{direction.x * 5.0F, direction.y * 5.0F, direction.z * 5.0F};
+        const float probe = held_melee_reach(); // (Items) 5, or a mod weapon's
+        const world::Vec3 delta{direction.x * probe, direction.y * probe, direction.z * probe};
         // ConstructionProbe checks living remote gamers in session order and
         // accepts the first 0.7 x 1.7 x 0.7 player box hit before t = 0.5.
         for (const RemotePlayerVisual &remote : online_remote_visuals_)
@@ -2380,6 +3956,9 @@ class Application::Impl final
 
     void publish_local_enemy_kill(world::EnemyIdentity identity, InventoryItemId weapon)
     {
+        if (const auto index = enemy_horde_.find_enemy(identity))
+            progress_.record_enemy_kill(game_mode_, enemy_horde_.enemies()[*index].type, weapon);
+        mod_gameplay_enemy_killed(identity); // Modding, gameplay area: enemy.killed
         if (!online_gameplay_active())
             return;
         std::int16_t wire_weapon{};
@@ -2411,6 +3990,8 @@ class Application::Impl final
         const world::EnemyIdentity identity{before.target_gid, before.id};
         const bool was_alive =
             before.state != world::EnemyState::die && before.state != world::EnemyState::despawn;
+        if (was_alive && locally_authoritative && valid_inventory_item_id(weapon))
+            progress_.items[static_cast<std::size_t>(weapon)].hits += 1;
         enemy_horde_.damage_enemy(index, damage, flags, headshot, locally_authoritative);
         if (!locally_authoritative || !online_gameplay_active() || !was_alive ||
             index >= enemy_horde_.enemies().size() ||
@@ -2418,8 +3999,12 @@ class Application::Impl final
         {
             if (locally_authoritative && was_alive && index < enemy_horde_.enemies().size() &&
                 enemy_horde_.enemies()[index].state == world::EnemyState::die)
+            {
+                if (!online_gameplay_active())
+                    publish_local_enemy_kill(identity, weapon);
                 notify_local_spawner_enemy_defeated(
                     identity, online_gameplay_active() ? online_local_player_gid() : 0U);
+            }
             return;
         }
         publish_local_enemy_kill(identity, weapon);
@@ -2454,10 +4039,16 @@ class Application::Impl final
             return;
         const bool was_alive =
             dragon_.dragon().state != world::DragonState::dying && dragon_.dragon().health > 0.0F;
+        // EnemyManager.DragonHasBeenHit: a dragon that was only investigating
+        // gunshots (ChancesToNotAttack) starts attacking once it is hit.
+        if (was_alive)
+            dragon_.note_hit();
         dragon_.damage(damage);
         if (!was_alive || dragon_.dragon().health > 0.0F || dragon_kill_announced_)
             return;
         dragon_kill_announced_ = true;
+        progress_.record_dragon_kill(game_mode_, static_cast<std::size_t>(dragon_.dragon().kind),
+                                    !online_gameplay_active() || killer_gid == online_local_player_gid(), weapon);
         dragon_loot_pending_ = !online_gameplay_active() || killer_gid == online_local_player_gid();
         queued_dragon_fireball_ids_.clear();
         if (online_gameplay_active())
@@ -2474,7 +4065,8 @@ class Application::Impl final
         if (!hit)
             return;
         const InventoryItemId item = inventory_.selected_item();
-        damage_enemy_with_network(static_cast<std::size_t>(hit.index), item_enemy_damage(item),
+        // (Items) A mod weapon strikes with its own damage and rate.
+        damage_enemy_with_network(static_cast<std::size_t>(hit.index), held_melee_damage(item),
                                   weapon_damage_flags(item), hit.headshot, item, true);
         const world::Vec3 eye{player_.state().position.x,
                               player_.state().position.y + world::PlayerSimulation::eye_height,
@@ -2485,7 +4077,8 @@ class Application::Impl final
                                             eye.z + direction.z * hit.distance},
                                            {1.0F, 1.0F, 1.0F});
         caption("[ ENEMY STRUCK ]", 0.7F);
-        melee_cooldown_ = item_use_cooldown_seconds(item);
+        melee_cooldown_ = held_melee_cooldown(item);
+        animation_use_pulse_ = true; // InventoryItem.ProcessInput: UsingTool
         (void)damage_selected_item();
     }
 
@@ -2504,11 +4097,33 @@ class Application::Impl final
             !publish_online_direct(hit.gid, "MeleePlayerMessage", *payload,
                                    net::MessageDeliveryPolicy::reliable_ordered, error))
             std::cerr << "network.local.melee-player.failure=" << error << '\n';
+        authority_local_melee(hit.gid, wire_item, hit.intersection); // (Authority) the host's own swing
         world_preview_->spawn_impact_smoke(hit.intersection, {1.0F, 1.0F, 1.0F});
         sound_bank_->play_cue("Hit");
         caption("[ PLAYER STRUCK ]", 0.7F);
-        melee_cooldown_ = item_use_cooldown_seconds(item);
+        melee_cooldown_ = held_melee_cooldown(item); // (Items)
+        animation_use_pulse_ = true; // InventoryItem.ProcessInput: UsingTool
         (void)damage_selected_item();
+    }
+
+    // InventoryItem.TimeToDig for the held item against the aimed block, in the
+    // world's generation. InGameHUD.IsValidDigTarget (1.9.9.8) additionally
+    // lets a teleport station be dug only by the player who registered a
+    // station at that cell.
+    [[nodiscard]] float held_dig_seconds(InventoryItemId item,
+                                         const world::VoxelRaycastHit &target) const noexcept
+    {
+        if (target.block == world::BlockType::teleport_station)
+        {
+            const std::array<float, 3> cell{static_cast<float>(target.x),
+                                            static_cast<float>(target.y),
+                                            static_cast<float>(target.z)};
+            const auto &stations = inventory_.teleport_stations();
+            if (std::none_of(stations.begin(), stations.end(),
+                             [&](const InventoryStack &station) { return station.waypoint == cell; }))
+                return std::numeric_limits<float>::infinity();
+        }
+        return dig_time_seconds(item, target.block, inventory_.profile());
     }
 
     // Returns true whenever an enemy owns the construction ray, even while
@@ -2516,16 +4131,21 @@ class Application::Impl final
     // zombie from receiving the same held action.
     [[nodiscard]] bool try_melee()
     {
+        // Modding, gameplay area: a mod creature nearer than any retail target.
+        if (mod_gameplay_live() && mod_gameplay_melee())
+            return true;
+        // `if (CoolDownTimer.Expired)`, on the original tick timer's frame
+        // (world::one_shot_expired).
         if (const auto player_hit = melee_player_target(); player_hit.has_value())
         {
-            if (melee_cooldown_ <= 0.0F)
+            if (world::one_shot_expired(melee_cooldown_))
                 apply_melee_player_hit(*player_hit);
             return true;
         }
         const world::EnemyHorde::RayHit hit = melee_target();
         if (!hit)
             return false;
-        if (melee_cooldown_ <= 0.0F)
+        if (world::one_shot_expired(melee_cooldown_))
             apply_melee_hit(hit);
         return true;
     }
@@ -2542,21 +4162,326 @@ class Application::Impl final
         return block_hit.has_value() ? block_hit->distance : maximum;
     }
 
-    void begin_gun_reload()
+    // Player._reloadCue.Stop(Immediate): the reload cue belongs to the reload
+    // clip and dies with it, so an abandoned reload can never keep ringing
+    // over the next one.
+    void stop_gun_reload_cue()
     {
+        if (gun_reload_cue_ != nullptr)
+            sound_bank_->stop_looping_cue(gun_reload_cue_);
+        gun_reload_cue_ = nullptr;
+    }
+
+    // Player.Equip: abandon the reload request, its clip and its cue.
+    void withdraw_gun_reload()
+    {
+        gun_reloading_ = false;
+        gun_reload_time_ = 0.0F;
+        if (gun_reload_clip_active_)
+            stop_gun_reload_cue();
+        gun_reload_clip_active_ = false;
+    }
+
+    // Player.usingAnimationPlaying || GrenadeAnimPlaying: the channel-3 use
+    // clip of whatever is in hand. InGameHUD refuses every slot change while it
+    // runs, which is what keeps a half-played shot, swing or throw from being
+    // carried into another item.
+    [[nodiscard]] bool use_animation_playing() const noexcept
+    {
+        // The original's own flag, on the original's clip clock. A use that
+        // was raised after this tick's animation pass (a shot, a swing, a
+        // grenade press) blocks the slot keys from the next pass on, so it
+        // counts already.
+        return local_animator_.using_animation_playing() || animation_use_pulse_ ||
+               grenade_cooking_;
+    }
+
+    // The first-person cue the viewmodel understands, read off the animator:
+    // the clip on the use channel and what the upper-body channel is doing,
+    // each at the original's clip time (carried forward through the part of a
+    // tick that has not been simulated yet). The full channel list is
+    // local_animator_.pose().
+    void apply_local_animation_cue(world::PlayerState &shown, float &aim_progress,
+                                   const world::PlayerAnimator &animator) const
+    {
+        const auto fraction = [&](const world::AnimationPlayerState &clip) {
+            if (clip.duration <= 0)
+                return 0.0F;
+            return std::clamp(static_cast<float>(static_cast<double>(clip.ticks) /
+                                                 static_cast<double>(clip.duration)),
+                              0.0F, 1.0F);
+        };
+        const auto &use = animator.channel(world::AnimationChannel::upper_use).current;
+        const auto &upper = animator.channel(world::AnimationChannel::upper).current;
+        const world::ShoulderState state = animator.shoulder_state();
+        shown.viewmodel_cue = world::ViewmodelCue::idle;
+        shown.viewmodel_cue_progress = 0.0F;
+        shown.using_tool = false;
+        aim_progress = 0.0F;
+        if (state == world::ShoulderState::shouldered)
+        {
+            shown.viewmodel_cue = world::ViewmodelCue::shoulder_idle;
+            aim_progress = 1.0F;
+        }
+        else if (upper.has_value() && state == world::ShoulderState::shouldering)
+        {
+            shown.viewmodel_cue = world::ViewmodelCue::shoulder;
+            shown.viewmodel_cue_progress = fraction(*upper);
+            aim_progress = shown.viewmodel_cue_progress;
+        }
+        else if (upper.has_value() && state == world::ShoulderState::unshouldering)
+        {
+            shown.viewmodel_cue = world::ViewmodelCue::unshoulder;
+            shown.viewmodel_cue_progress = fraction(*upper);
+            aim_progress = 1.0F - shown.viewmodel_cue_progress;
+        }
+        else if (upper.has_value() && state == world::ShoulderState::reloading)
+        {
+            shown.viewmodel_cue = world::ViewmodelCue::reload;
+            shown.viewmodel_cue_progress = fraction(*upper);
+        }
+        if (selected_gun() == nullptr)
+            aim_progress = 0.0F;
+        if (!use.has_value())
+            return;
+        switch (use->clip)
+        {
+        case world::AnimationClip::Grenade_Cook:
+            shown.viewmodel_cue = world::ViewmodelCue::grenade_cook;
+            break;
+        case world::AnimationClip::Grenade_Throw:
+            shown.viewmodel_cue = world::ViewmodelCue::grenade_throw;
+            break;
+        case world::AnimationClip::Grenade_Reset:
+            // The hand coming back after the throw; the viewmodel has no cue
+            // for it and shows the idle hold underneath.
+            return;
+        default:
+            shown.viewmodel_cue = state == world::ShoulderState::shouldered
+                                      ? world::ViewmodelCue::shoulder_use
+                                      : world::ViewmodelCue::primary_use;
+            break;
+        }
+        shown.using_tool = true;
+        shown.viewmodel_cue_progress = fraction(*use);
+        shown.tool_swing_progress = shown.viewmodel_cue_progress;
+    }
+
+    // Player.ProcessInput -> Player.UpdateAnimation and Avatar.OnUpdate for the
+    // local player, once per fixed tick, in the order the original runs them:
+    // the pass reads the flags the previous tick's item input left behind.
+    void step_local_animation(const GunStats *active_gun, const world::PlayerInput &movement)
+    {
+        const world::AnimationGeneration generation =
+            inventory_.profile() == InventoryProfile::modern ? world::AnimationGeneration::modern
+                                                             : world::AnimationGeneration::classic;
+        if (local_animator_.generation() != generation)
+        {
+            local_animator_ = world::PlayerAnimator{generation};
+            local_animation_started_ = false;
+        }
+        if (std::exchange(animation_throw_grenade_, false))
+            local_animator_.play_grenade_reset();
+        const InventoryItemId item = inventory_.selected_item();
+        const bool dead = player_life_ != PlayerLife::alive;
+        world::PlayerAnimationInput input;
+        // A dead player's ProcessInput calls UpdateAnimation(0, 0, ...).
+        input.walk = dead ? 0.0F : movement.forward;
+        input.strafe = dead ? 0.0F : movement.strafe;
+        input.torso_pitch_radians = player_.state().pitch;
+        // Player._playerMode follows the hand through ChangeCarriedItemMessage's
+        // own echo: the item the previous tick ended with. (Items) A mod
+        // item's hold style picks it instead.
+        input.mode = static_cast<std::uint8_t>(held_item_animation_mode(item));
+        // UsingTool is true for the one frame the item's ProcessInput acted.
+        input.using_tool = std::exchange(animation_use_pulse_, false);
+        if (input.using_tool)
+            mod_items_note_use(); // (Items) the held mod item's use clip
+        // Only GunInventoryItem.ProcessInput writes Shouldering.
+        input.shouldering = shouldering_ && active_gun != nullptr && !dead;
+        input.reloading = gun_reloading_;
+        input.dead = dead;
+        input.play_grenade_anim = grenade_cooking_ && grenade_arm_.playing();
+        input.ready_to_throw_grenade = grenade_arm_.ready();
+        // InGameHUD.KillPlayer leaves first person; RefreshPlayer returns to it.
+        input.fps_mode = !dead;
+        input.local = true;
+        input.fly_mode = player_.state().fly_mode;
+        input.holding_gun = active_gun != nullptr;
+        input.reload_ticks =
+            active_gun != nullptr
+                ? world::animation_ticks_from_seconds(static_cast<double>(active_gun->reload_seconds))
+                : 0;
+        input.holding_grenade = item_grenade_type(item).has_value();
+        input.empty_handed = item == InventoryItemId::bare_hands;
+        const world::PlayerAnimationResult result = local_animator_.update(input, [&]() -> bool {
+            // Player.FinishReload -> GunInventoryItem.Reload: one cycle's rounds
+            // go in, and a shotgun with tube space and reserve left asks for
+            // the next shell at once.
+            if (active_gun == nullptr)
+                return false;
+            auto &active = inventory_.tray()[inventory_.selected_index()];
+            if (!active.has_value())
+                return false;
+            const GunReloadCycle cycle = gun_reload_cycle(*active_gun, active->rounds_in_clip,
+                                                          inventory_.count(active_gun->ammo_item));
+            if (cycle.loaded == 0U ||
+                !(infinite_resources_ || inventory_.consume_item(active_gun->ammo_item, cycle.loaded)))
+                return false;
+            active->rounds_in_clip =
+                static_cast<std::uint16_t>(active->rounds_in_clip + cycle.loaded);
+            return cycle.continue_reloading;
+        });
+        local_animator_.active_item_read(input.empty_handed);
+        local_animation_input_ = input;
+        gun_reloading_ = result.reloading;
+        if (result.reload_cue_started && active_gun != nullptr)
+        {
+            // One stoppable instance per clip, so the cue can neither double
+            // nor outlive an abandoned reload.
+            stop_gun_reload_cue();
+            // (GunFX) a client mod's reload sounds may replace the retail cue.
+            const auto &reloading_slot = inventory_.tray()[inventory_.selected_index()];
+            const bool pack_mutes_cue = gunfx_local_reload_starts(
+                item, reloading_slot.has_value() ? reloading_slot->rounds_in_clip : std::uint16_t{1},
+                active_gun->reload_cue);
+            if (!pack_mutes_cue)
+            {
+                gun_reload_cue_ = active_gun->reload_cue;
+                sound_bank_->start_looping_cue(gun_reload_cue_);
+            }
+            caption(std::format("[ {} RELOADS ]", item_name(item)), 1.7F);
+        }
+        if (result.reload_cue_stopped)
+            stop_gun_reload_cue();
+        // The grenade leaves the hand when the Grenade_Throw clip has run out;
+        // Player.ProcessGrenadeMessage plays Grenade_Reset on the next pass.
+        if (result.throw_grenade && grenade_cooking_)
+        {
+            grenade_arm_.thrown();
+            throw_grenade();
+            animation_throw_grenade_ = true;
+        }
+        // The field of view is taken before the clock advances, as the original
+        // reads Animations[2].Progress inside UpdateAnimation.
+        gun_aim_progress_ = active_gun != nullptr ? local_animator_.shoulder_zoom() : 0.0F;
+        // Player.ControlSensitivity is set in that same switch: 1 unshouldered,
+        // 0.25 in every shouldering state for every gun, and left as it was
+        // while a reload plays (the switch has no case for Reloading). It
+        // scales the look INPUT, an angle per mouse count, so it is the same
+        // at every field of view.
+        switch (local_animator_.shoulder_state())
+        {
+        case world::ShoulderState::unshouldered:
+            look_scale_ = view::look_scale(false);
+            break;
+        case world::ShoulderState::shouldering:
+        case world::ShoulderState::unshouldering:
+        case world::ShoulderState::shouldered:
+            look_scale_ = view::look_scale(true);
+            break;
+        default:
+            break;
+        }
+        local_animator_.advance();
+        if (!std::exchange(local_animation_started_, true))
+        {
+            // The original constructs its Player - SetupAnimation puts GenericIdle
+            // on the item channel - before the loading screen, so the 0.25 s
+            // AnimBlender fade from that into the held item's stance is long
+            // over when the arms are first drawn. Let the same quarter second
+            // pass here instead of showing that construction fade at spawn.
+            for (int tick = 0; tick < 16; ++tick)
+                local_animator_.advance();
+        }
+        const auto &upper = local_animator_.channel(world::AnimationChannel::upper).current;
+        gun_reload_clip_active_ =
+            local_animator_.shoulder_state() == world::ShoulderState::reloading;
+        gun_reload_time_ =
+            gun_reload_clip_active_ && upper.has_value() && upper->speed > 0.0F
+                ? static_cast<float>(static_cast<double>(upper->duration - upper->ticks) * 1e-7 /
+                                     static_cast<double>(upper->speed))
+                : 0.0F;
+        if (diagnostic_autofire_reload_)
+        {
+            const auto name = [&](world::AnimationChannel channel) {
+                const auto &current = local_animator_.channel(channel).current;
+                return current.has_value() ? world::animation_clip_info(current->clip).name
+                                           : std::string_view{"-"};
+            };
+            const auto &slot = inventory_.tray()[inventory_.selected_index()];
+            std::string now = std::format(
+                "state={} use_playing={} rounds={} upper={} use={}",
+                static_cast<int>(local_animator_.shoulder_state()),
+                local_animator_.using_animation_playing() ? 1 : 0,
+                slot.has_value() ? static_cast<int>(slot->rounds_in_clip) : -1,
+                name(world::AnimationChannel::upper), name(world::AnimationChannel::upper_use));
+            if (now != diagnostic_animation_last_)
+                std::cout << "ANIM tick=" << diagnostic_animation_tick_ << ' ' << now << '\n';
+            diagnostic_animation_last_ = std::move(now);
+            ++diagnostic_animation_tick_;
+        }
+    }
+
+    // Every trigger and reload input reaches a gun as one sample of the
+    // original GunInventoryItem.ProcessInput decision (gun_trigger_step). The
+    // decision never touches the reload clip itself: a trigger pull on an empty
+    // gun withdraws and restores the request inside one sample, so a reload in
+    // progress keeps its time, its animation and its cue.
+    void gun_input(bool use_pressed, bool reload_pressed)
+    {
+        // RocketLauncherBaseItem.ProcessInput: a spent launcher only waits for
+        // its launch clip before it is removed.
+        if (fired_launcher_slot_.has_value() &&
+            fired_launcher_tray_ == inventory_.current_tray_index() &&
+            *fired_launcher_slot_ == inventory_.selected_index())
+            return;
         const GunStats *stats = selected_gun();
-        if (stats == nullptr || gun_reloading_)
+        if (stats == nullptr)
             return;
         auto &slot = inventory_.tray()[inventory_.selected_index()];
-        if (!slot.has_value() || slot->rounds_in_clip >= stats->clip_capacity ||
-            inventory_.count(stats->ammo_item) == 0U)
+        if (!slot.has_value() || gun_stats(slot->item) == nullptr)
             return;
-        gun_reloading_ = true;
-        gun_reload_time_ = stats->reload_seconds;
-        gun_reload_cue_started_ = false;
-        mine_button_down_ = false;
-        toast("RELOADING",
-              std::format("{} / {}", slot->rounds_in_clip, inventory_.count(stats->ammo_item)));
+        const net::ProtocolVersion item_protocol =
+            online_gameplay_active() ? online_gameplay_protocol()
+                                     : (inventory_.profile() == InventoryProfile::modern
+                                            ? net::ProtocolVersion::modern_v4
+                                            : net::ProtocolVersion::classic_v3);
+        std::int16_t wire_item{};
+        if (!net::inventory_item_to_wire(slot->item, item_protocol, wire_item))
+            return;
+        GunTriggerInput input;
+        input.use_pressed = use_pressed;
+        input.use_held = mine_button_down_;
+        input.reload_pressed = reload_pressed;
+        // The gun's own CoolDownTimer, on the frame the original's expires.
+        input.cooldown_expired = world::one_shot_expired(gun_cooldown_);
+        // GunInventoryItem.ProcessInput: the guided launcher fires only once
+        // RocketLauncherGuidedInventoryItemClass.LockedOnToDragon is set.
+        input.fire_permitted =
+            slot->item != InventoryItemId::guided_rocket_launcher || guided_locked_;
+        const bool was_reloading = gun_reloading_;
+        const std::uint32_t reserve = inventory_.count(stats->ammo_item);
+        const GunTriggerDecision decision =
+            gun_trigger_step(*stats, {gun_reloading_, slot->trigger_released},
+                             slot->rounds_in_clip, reserve, input);
+        slot->trigger_released = decision.state.released;
+        gun_reloading_ = decision.state.reloading;
+        if (decision.fire)
+        {
+            // The shot may consume the weapon (wear, one-use launchers); the
+            // reload requested for its emptied clip goes with it.
+            if (!fire_gun_round(*stats, wire_item))
+                withdraw_gun_reload();
+            return;
+        }
+        if (gun_reloading_ && !was_reloading)
+            toast("RELOADING", std::format("{} / {}", slot->rounds_in_clip, reserve));
+    }
+
+    void begin_gun_reload()
+    {
+        gun_input(false, true);
     }
 
     void reset_guided_lock() noexcept
@@ -2600,9 +4525,12 @@ class Application::Impl final
         const float angle = std::acos(cosine);
         const GunStats *stats = selected_gun();
         const float magnification = stats != nullptr ? stats->shoulder_magnification : 2.0F;
-        const float current_fov_degrees = std::lerp(
-            settings_.vertical_fov, settings_.vertical_fov / magnification, gun_aim_progress_);
-        const float angle_limit = current_fov_degrees * 0.01745329251994329577F * 0.3F;
+        // CheckIfLocked: `angle < 0.3f * FPSCamera.FieldOfView`. This is a RULE
+        // (who may lock, and how long it takes), so it is evaluated on retail's
+        // 73-degree camera and its zoom - never on the player's own field of
+        // view, which is presentation only.
+        const float angle_limit =
+            view::retail_lock_cone_radians(magnification, gun_aim_progress_);
         if (angle >= angle_limit)
         {
             reset_guided_lock();
@@ -2647,32 +4575,17 @@ class Application::Impl final
         }
     }
 
-    void fire_gun()
+    // One round leaves the selected gun. Whether it may is decided solely by
+    // gun_input; this only performs the shot. Returns false when the shot
+    // consumed the weapon (it wore out, or it was a one-use launcher).
+    [[nodiscard]] bool fire_gun_round(const GunStats &gun, std::int16_t wire_item)
     {
-        if (fired_launcher_slot_.has_value() &&
-            fired_launcher_tray_ == inventory_.current_tray_index() &&
-            *fired_launcher_slot_ == inventory_.selected_index())
-            return;
-        const GunStats *stats = selected_gun();
-        if (stats == nullptr || gun_cooldown_ > 0.0F || gun_reloading_)
-            return;
+        const GunStats *stats = &gun;
         auto &slot = inventory_.tray()[inventory_.selected_index()];
-        if (!slot.has_value() || gun_stats(slot->item) == nullptr)
-            return;
-        const net::ProtocolVersion item_protocol =
-            online_gameplay_active() ? online_gameplay_protocol()
-                                     : (inventory_.profile() == InventoryProfile::modern
-                                            ? net::ProtocolVersion::modern_v4
-                                            : net::ProtocolVersion::classic_v3);
-        std::int16_t wire_item{};
-        if (!net::inventory_item_to_wire(slot->item, item_protocol, wire_item))
-            return;
-        if (slot->rounds_in_clip == 0U)
-        {
-            begin_gun_reload();
-            return;
-        }
         sound_bank_->play_cue(stats->shoot_cue);
+        mod_ai_noise(player_.state().position, 32.0F, "gunshot", mod_ai_local_gid()); // mod-ai: creatures hear it
+        ++diagnostic_shots_;
+        animation_use_pulse_ = true; // GunInventoryItem.ProcessInput: UsingTool
         caption(std::format("[ {} SHOT ]", item_name(slot->item)), 0.8F);
         {
             // Conventional shots use TracerManager's camera-origin ballistic
@@ -2688,7 +4601,9 @@ class Application::Impl final
             const bool pump_shotgun =
                 weapon_damage_flags(slot->item) == world::DamageFlags::shotgun &&
                 slot->item != InventoryItemId::rocket_launcher &&
-                slot->item != InventoryItemId::guided_rocket_launcher;
+                slot->item != InventoryItemId::guided_rocket_launcher &&
+                // SHOTGUN is only its damage type; it fires one projectile.
+                slot->item != InventoryItemId::modern_basic_grenade_launcher;
             const bool launcher = slot->item == InventoryItemId::rocket_launcher ||
                                   slot->item == InventoryItemId::guided_rocket_launcher;
             // RocketLauncherGuidedInventoryItemClass.IsGuided snapshots the
@@ -2710,6 +4625,25 @@ class Application::Impl final
             const world::Vec3 muzzle{eye.x + direction.x * 0.55F + right.x * 0.28F - up.x * 0.22F,
                                      eye.y + direction.y * 0.55F + right.y * 0.28F - up.y * 0.22F,
                                      eye.z + direction.z * 0.55F + right.z * 0.28F - up.z * 0.22F};
+            // PRESENTATION ONLY (Enhanced; nothing in the Original, which has
+            // no muzzle flash): GunEntity.ShowMuzzleFlash, once per trigger
+            // pull, on the muzzle the viewmodel pass drew. A launcher's rocket
+            // makes its own backblast when it appears.
+            if (!launcher && world_preview_ != nullptr)
+                world_preview_->spawn_gun_flash(slot->item, laser, pump_shotgun,
+                                                projectile_tint(slot->item), std::nullopt,
+                                                direction, player_.state().velocity);
+            // PRESENTATION ONLY - never simulated, never sent. The bolt is
+            // SIMULATED from the fixed point above at every field of view. It
+            // has to be SEEN leaving the gun the player is looking at, and that
+            // gun is drawn by the viewmodel pass with its own projection, so
+            // the same camera-space point lands on a different pixel there.
+            // Take the muzzle the last frame drew, find the world-camera point
+            // that covers the same pixel at the same distance, and remember how
+            // far that is from the simulated start; build_projectile_visuals
+            // wears the difference off over the bolt's first metres.
+            const world::Vec3 seen_muzzle_offset =
+                laser ? local_bolt_seen_offset(stats, right, up, direction) : world::Vec3{};
             auto &spread_rng = enemy_horde_.rng();
             for (int pellet = 0; pellet < pellets; ++pellet)
             {
@@ -2735,9 +4669,17 @@ class Application::Impl final
                     aim.z /= length;
                 }
                 fired_directions[static_cast<std::size_t>(pellet)] = aim;
+                // Modding, gameplay area: mod creatures on the round's line.
+                if (!launcher && mod_gameplay_live())
+                    mod_gameplay_gunshot(laser ? muzzle : eye, aim, stats->enemy_damage, slot->item);
                 spawn_tracer(laser ? muzzle : eye, aim, stats->enemy_damage,
                              weapon_damage_flags(slot->item), slot->item, homing_launch,
                              online_gameplay_active() ? online_local_player_gid() : 0U, true);
+                if (laser && !tracers_.empty())
+                {
+                    tracers_.back().seen_offset = seen_muzzle_offset;
+                    tracers_.back().seen_from_muzzle = true;
+                }
             }
             net::PayloadError payload_error{};
             std::optional<std::vector<std::uint8_t>> payload;
@@ -2787,18 +4729,37 @@ class Application::Impl final
         // GunInventoryItem always drains the clip, including Creative; only
         // PlayerInventory.Consume makes its later reload free.
         --slot->rounds_in_clip;
-        const bool empty_clip = slot->rounds_in_clip == 0U;
         const bool one_shot_launcher = slot->item == InventoryItemId::rocket_launcher ||
                                        slot->item == InventoryItemId::guided_rocket_launcher;
         const bool grenade_launcher = slot->item == InventoryItemId::modern_basic_grenade_launcher;
+        if (one_shot_launcher || grenade_launcher)
+            progress_.items[static_cast<std::size_t>(slot->item)].used += 1;
         // GrenadeLauncherBaseItem overrides InflictDamage: it publishes the
         // fired-rocket visual but deliberately returns false and never marks
         // itself for deletion. It remains in the tray for a normal reload.
-        const bool depleted = one_shot_launcher  ? true
-                              : grenade_launcher ? false
-                                                 : damage_selected_item();
         gun_recoil_duration_ = item_fire_animation_seconds(slot->item, shouldering_);
-        if (one_shot_launcher || grenade_launcher)
+        // 1.9.9.8 RocketLauncherBaseItem.InflictDamage: only the LAST launcher
+        // of a stack (they stack to three there) takes the fired pose and is
+        // removed. With more behind it, `Consume(this, 1,
+        // ignoreInfiniteResources: true); RoundsInClip++` uses one up, Creative
+        // included, and leaves a loaded launcher in the hand. 1.6.3.8 launchers
+        // never stack, so this is always the last one there.
+        const bool stacked_launcher = one_shot_launcher && slot->count > 1U;
+        if (stacked_launcher)
+        {
+            slot->count = static_cast<std::uint16_t>(slot->count - 1U);
+            ++slot->rounds_in_clip;
+        }
+        const bool depleted = stacked_launcher    ? false
+                              : one_shot_launcher ? true
+                              : grenade_launcher  ? false
+                                                  : damage_selected_item();
+        if (stacked_launcher)
+        {
+            sync_selected_item();
+            reset_guided_lock();
+        }
+        else if (one_shot_launcher || grenade_launcher)
         {
             // RocketLauncherBaseItem.InflictDamage swaps to its fired visual,
             // then removes the one-use launcher after the shot animation.
@@ -2816,9 +4777,7 @@ class Application::Impl final
         const GunRecoil recoil =
             gun_recoil(stats->recoil_radians, recoil_rng_.next01(), recoil_rng_.next01());
         player_.look(recoil.yaw_radians, recoil.pitch_radians);
-        if (!depleted && !one_shot_launcher && empty_clip &&
-            inventory_.count(stats->ammo_item) > 0U)
-            begin_gun_reload();
+        return !depleted && !one_shot_launcher;
     }
 
     // Per-gun tracer ballistics (GunInventoryItemClass ctors): velocity /
@@ -2829,36 +4788,7 @@ class Application::Impl final
         const GunStats *stats = gun_stats(item);
         velocity = stats != nullptr ? stats->tracer_velocity : 100.0F;
         flight = stats != nullptr ? stats->tracer_flight_seconds : 2.0F;
-        const std::string_view name = item_name(item);
-        const auto has = [&](std::string_view token) {
-            return name.find(token) != std::string_view::npos;
-        };
-        color = {1.0F, 1.0F, 1.0F};
-        const auto value = static_cast<std::uint16_t>(item);
-        if (value >= 82U && value <= 101U)
-        {
-            // LaserGunInventoryItemClass only replaces TracerColor. Velocity
-            // and FlightTime remain the base gun values (100 and 2 seconds).
-            if (has("COPPER"))
-                color = {0.0F, 1.0F, 0.0F};
-            else if (has("IRON"))
-                color = {1.0F, 0.0F, 0.0F};
-            else if (has("GOLD"))
-                color = {1.0F, 1.0F, 0.0F};
-            else if (has("DIAMOND"))
-                color = {0.0F, 0.0F, 1.0F};
-            return;
-        }
-        if (has("COPPER"))
-            color = {184.0F / 255.0F, 115.0F / 255.0F, 51.0F / 255.0F};
-        else if (has("IRON"))
-            color = {0.5F, 0.5F, 0.5F};
-        else if (has("GOLD"))
-            color = {1.0F, 215.0F / 255.0F, 0.0F};
-        else if (has("DIAMOND"))
-            color = {0.0F, 1.0F, 1.0F};
-        else if (has("BLOOD"))
-            color = {139.0F / 255.0F, 0.0F, 0.0F};
+        color = projectile_tint(item);
     }
 
     void spawn_tracer(world::Vec3 origin, world::Vec3 direction, float damage,
@@ -2924,6 +4854,10 @@ class Application::Impl final
             // _runningTime starts at -0.25 and detonates after it exceeds 10.
             tracer.time_left = tracer.flight_time = 10.25F;
         }
+        // TracerManager.AddTracer -> EnemyManager.RegisterGunShot: a dragon
+        // this peer owns hears every bullet tracer, whoever fired it.
+        if (!tracer.rocket)
+            dragon_.register_gunshot(origin);
         tracers_.push_back(tracer);
     }
 
@@ -3145,7 +5079,16 @@ class Application::Impl final
                                 player_life_ != PlayerLife::alive);
                 for (const auto &[gid, remote] : online_remote_players_)
                     if (remote.has_update && elapsed_ - remote.last_update <= 10.0F)
+                    {
+                        // (Authority) An authoritative host tests where the
+                        // victim was over the shooter's lag as well.
+                        if (const auto lagged = authority_tracer_victim(gid, tracer.tail, tracer.head);
+                            lagged.has_value() && gid != tracer.owner_gid && !remote.state.dead &&
+                            *lagged <= terrain_range &&
+                            (!player_hit.has_value() || *lagged < player_hit->second))
+                            player_hit = std::pair{gid, *lagged};
                         consider_player(gid, remote.state.position, remote.state.dead);
+                    }
             }
             if (player_hit.has_value() &&
                 (!enemy_hit || player_hit->second < enemy_hit.distance))
@@ -3158,9 +5101,12 @@ class Application::Impl final
                                      online_lobby_host_is_friend_))
                     // TracerManager's PvP path is deliberately weapon-agnostic:
                     // every accepted gun tracer removes 0.21 normalized health.
-                    apply_player_damage(21.0F, impact);
+                    apply_player_damage(21.0F, impact, modding::gameplay::DamageCause::player);
+                else if (player_hit->first != online_local_player_gid())
+                    authority_tracer_hit(tracer.owner_gid, player_hit->first, impact); // (Authority)
                 play_positional("BulletHitHuman", impact);
-                world_preview_->spawn_impact_smoke(impact, {1.0F, 1.0F, 1.0F});
+                // (SmokeEffect in the Original presentation, exactly as before.)
+                world_preview_->spawn_creature_hit(impact);
                 tracer.dead = true;
                 continue;
             }
@@ -3186,12 +5132,14 @@ class Application::Impl final
                         blaster.normal_x = static_cast<int>(std::lround(enemy_hit.normal.x));
                         blaster.normal_y = static_cast<int>(std::lround(enemy_hit.normal.y));
                         blaster.normal_z = static_cast<int>(std::lround(enemy_hit.normal.z));
-                        world_preview_->spawn_blaster_impact(blaster);
+                        world_preview_->spawn_blaster_impact(blaster, tracer.color);
                     }
                     else
                         // TracerManager never recolors SmokeEffect per enemy;
                         // zombies, skeletons, demons and aliens share its authored tint.
-                        world_preview_->spawn_impact_smoke(impact, {1.0F, 1.0F, 1.0F});
+                        // (That SmokeEffect is what this draws in the Original
+                        // presentation; the Enhanced one knocks matter off the body.)
+                        world_preview_->spawn_creature_hit(impact);
                 }
                 tracer.dead = true;
                 continue;
@@ -3217,7 +5165,7 @@ class Application::Impl final
                 {
                     // BlasterShot always emits its flash/sparks/smoke triplet,
                     // including impacts which immediately ricochet.
-                    world_preview_->spawn_blaster_impact(burst);
+                    world_preview_->spawn_blaster_impact(burst, tracer.color);
                     if (world::bounces_lasers(terrain_hit->block) && tracer.bounces > 0)
                     {
                         --tracer.bounces;
@@ -3241,14 +5189,17 @@ class Application::Impl final
                         tracer.tail_velocity = tracer.head_velocity;
                         continue;
                     }
-                    if (world::can_be_dug(terrain_hit->block))
+                    if (tracer.locally_authoritative && world::can_be_dug(terrain_hit->block))
                     {
                         // FindBlocksToRemove(blockToDestroy, Laser, true): a
                         // zero-range laser blast, not a damaging explosion.
                         destroy_blocks_with_explosive({static_cast<float>(cell_x) + 0.5F,
                                                        static_cast<float>(cell_y) + 0.5F,
                                                        static_cast<float>(cell_z) + 0.5F},
-                                                      world::ExplosiveKind::laser);
+                                                      (tracer.item == InventoryItemId::modern_laser_drill ||
+                                                       tracer.item == InventoryItemId::modern_precision_laser)
+                                                          ? world::ExplosiveKind::harvest
+                                                          : world::ExplosiveKind::laser);
                     }
                     tracer.dead = true;
                     continue;
@@ -3289,7 +5240,7 @@ class Application::Impl final
                         blaster.normal_x = static_cast<int>(std::lround(-direction.x));
                         blaster.normal_y = static_cast<int>(std::lround(-direction.y));
                         blaster.normal_z = static_cast<int>(std::lround(-direction.z));
-                        world_preview_->spawn_blaster_impact(blaster);
+                        world_preview_->spawn_blaster_impact(blaster, tracer.color);
                     }
                     else
                         world_preview_->spawn_impact_smoke(impact, {1.0F, 1.0F, 1.0F});
@@ -3351,8 +5302,13 @@ class Application::Impl final
             if (distance >= bands.kill_range && distance > 0.001F)
                 damage *= world::dragon_fireball_damage_multiplier(
                     world_preview_->region(), world::DragonKind::fire, location, ear);
-            apply_player_damage(std::clamp(damage, 0.0F, 1.0F) * 100.0F, location);
+            apply_player_damage(std::clamp(damage, 0.0F, 1.0F) * 100.0F, location,
+                                modding::gameplay::DamageCause::explosion);
         }
+        // (Authority) This host's own blast against every remote player (a
+        // remote player's blast is judged as its message arrives).
+        if (locally_authoritative_enemy_damage)
+            authority_local_explosion(location, bands);
         const std::vector<std::size_t> killed = enemy_horde_.apply_explosive_damage(
             location, bands.enemy_range, locally_authoritative_enemy_damage);
         if (locally_authoritative_enemy_damage)
@@ -3391,24 +5347,9 @@ class Application::Impl final
 
     void destroy_blocks_with_explosive(world::Vec3 location, world::ExplosiveKind root_kind)
     {
-        if (root_kind == world::ExplosiveKind::laser)
-        {
-            const net::IntVector3 effect_cell{static_cast<int>(std::floor(location.x)),
-                                              static_cast<int>(std::floor(location.y)),
-                                              static_cast<int>(std::floor(location.z))};
-            net::PayloadError payload_error{};
-            const auto payload = net::encode_int_vector_payload(effect_cell, payload_error);
-            std::string error;
-            if (!payload.has_value() ||
-                !publish_online_broadcast("AddExplosionEffectsMessage", *payload,
-                                          net::MessageDeliveryPolicy::reliable_unordered, error))
-                std::cerr << "network.local.explosion-effects.failure=" << error << '\n';
-            const world::Vec3 effect_location{static_cast<float>(effect_cell.x),
-                                              static_cast<float>(effect_cell.y),
-                                              static_cast<float>(effect_cell.z)};
-            play_positional("Explosion", effect_location);
-            world_preview_->spawn_fireball_explosion(effect_location, false, true);
-        }
+        const auto diagnostic_started = Clock::now();
+        // Laser excavation shares the block-removal traversal, not the blast.
+        // Real TNT/C4 reached by the traversal still detonates below.
         struct Source final
         {
             int x{};
@@ -3420,6 +5361,7 @@ class Application::Impl final
         std::vector<Source> queue;
         std::set<std::array<int, 3>> sources;
         std::set<std::array<int, 3>> removed;
+        std::set<std::array<int, 3>> harvested;
         const Source root{static_cast<int>(std::floor(location.x)),
                           static_cast<int>(std::floor(location.y)),
                           static_cast<int>(std::floor(location.z)), root_kind};
@@ -3468,7 +5410,12 @@ class Application::Impl final
                         }
                         if (!world::explosive_breaks_block(source.kind, block, dx, dy, dz))
                             continue;
+                        // (mod-liquid) A blast leaves a liquid where it is.
+                        if (world::liquid_at(region, x, y, z))
+                            continue;
                         removed.insert({x, y, z});
+                        if (source.kind == world::ExplosiveKind::harvest && world::harvested_block(block))
+                            harvested.insert({x, y, z});
                         // Lower doors own the upper half; ProcessOneExplosion
                         // removes both even though upper halves are otherwise skipped.
                         if (world::is_lower_door(block))
@@ -3519,12 +5466,37 @@ class Application::Impl final
         for (const auto &[key, door] : removed_doors)
             publish_local_custom_door_destroy(key, door.first);
 
+        // One pass over the set so the cell list and what each cell held line up
+        // index for index; the renderer's shading probe compares the exact
+        // previous light field instead of bracketing it.
+        std::vector<std::array<int, 3>> removed_cells;
+        std::vector<world::BlockType> removed_previous;
+        removed_cells.reserve(removed.size());
+        removed_previous.reserve(removed.size());
+        for (const std::array<int, 3> &cell : removed)
+        {
+            removed_cells.push_back(cell);
+            removed_previous.push_back(region.contains(cell[0], cell[1], cell[2])
+                                           ? region.block(cell[0], cell[1], cell[2])
+                                           : world::BlockType::empty);
+        }
         for (const std::array<int, 3> &cell : removed)
         {
             if (!region.contains(cell[0], cell[1], cell[2]))
                 continue;
             if (world::is_container(region.block(cell[0], cell[1], cell[2])))
                 eject_crate_contents({cell[0], cell[1], cell[2]});
+            if (harvested.contains(cell))
+                world_preview_->spawn_created_stack_at(
+                    InventoryStack{mined_item(region.block(cell[0], cell[1], cell[2])), 1U},
+                    {float(cell[0]) + 0.5F, float(cell[1]) + 0.5F, float(cell[2]) + 0.5F});
+            if (inventory_.profile() == InventoryProfile::modern)
+                if (const auto loot = world::process_modern_loot_block(
+                        loot_random_, region.block(cell[0], cell[1], cell[2]), cell[1]))
+                    for (const auto &drop : loot->drops)
+                        world_preview_->spawn_loot_stack_at(drop.stack,
+                            {float(cell[0]) + 0.5F, float(cell[1]) + 0.5F, float(cell[2]) + 0.5F},
+                            {drop.spawn_velocity[0], drop.spawn_velocity[1], drop.spawn_velocity[2]});
             region.set_block(cell[0], cell[1], cell[2], world::BlockType::empty);
             world_preview_->remember_edit(cell[0], cell[1], cell[2], world::BlockType::empty);
         }
@@ -3536,10 +5508,13 @@ class Application::Impl final
                 const auto door = removed_doors.find(key);
                 if (door != removed_doors.end())
                 {
+                    // Explosive / EnemyManager: CreatePickup(item,
+                    // IntVector3.ToVector3(cell) + (0.5, 0.5, 0.5)) - the
+                    // centre of the detached door's cell, not its corner.
                     world_preview_->spawn_created_stack_at(InventoryStack{door->second.second, 1U},
-                                                           {static_cast<float>(key[0]),
-                                                            static_cast<float>(key[1]),
-                                                            static_cast<float>(key[2])});
+                                                           {static_cast<float>(key[0]) + 0.5F,
+                                                            static_cast<float>(key[1]) + 0.5F,
+                                                            static_cast<float>(key[2]) + 0.5F});
                     continue;
                 }
             }
@@ -3555,10 +5530,21 @@ class Application::Impl final
             std::erase_if(armed_explosives_, [&](const ArmedExplosive &armed) {
                 return removed.contains({armed.x, armed.y, armed.z});
             });
-            const std::vector<std::array<int, 3>> removed_cells{removed.begin(), removed.end()};
-            world_preview_->rebuild_block_edits(removed_cells);
+            world_preview_->rebuild_block_edits(removed_cells, removed_previous);
             if (!publish_local_block_removals(removed_cells, false))
                 std::cerr << "network.local.explosion-removal.failure\n";
+            // Modding, gameplay area: block.broken for each blasted cell.
+            mod_gameplay_blasted(removed_cells, removed_previous);
+        }
+        if (diagnostic_autofire_)
+        {
+            const double elapsed =
+                std::chrono::duration<double, std::milli>(Clock::now() - diagnostic_started)
+                    .count();
+            ++diagnostic_blast_calls_;
+            diagnostic_blocks_removed_ += removed.size();
+            diagnostic_blast_total_ms_ += elapsed;
+            diagnostic_blast_max_ms_ = std::max(diagnostic_blast_max_ms_, elapsed);
         }
     }
 
@@ -3583,7 +5569,16 @@ class Application::Impl final
                 std::cerr << "network.local.detonate-grenade.failure=" << error << '\n';
         }
         play_positional("Explosion", location);
-        world_preview_->spawn_fireball_explosion(location, false, want_rock_chunks);
+        // Which explosive it was only picks the Enhanced presentation's look;
+        // the splash below is what the blast does.
+        const ExplosionStyle explosion_style =
+            kind == world::ExplosiveKind::tnt          ? ExplosionStyle::tnt
+            : kind == world::ExplosiveKind::c4         ? ExplosionStyle::c4
+            : kind == world::ExplosiveKind::he_grenade ? ExplosionStyle::grenade
+            : kind == world::ExplosiveKind::rocket     ? ExplosionStyle::rocket
+                                                       : ExplosionStyle::fireball;
+        world_preview_->spawn_fireball_explosion(location, false, want_rock_chunks,
+                                                 explosion_style);
         apply_explosion_splash(location, world::explosive_definition(kind).damage, true, true,
                                explosive_weapon(kind));
         destroy_blocks_with_explosive(location, kind);
@@ -3682,6 +5677,19 @@ class Application::Impl final
         for (const auto &[key, door] : removed_doors)
             publish_local_custom_door_destroy(key, door.first);
 
+        // See the local explosion path: one pass so the cell list and what each
+        // cell held stay index-aligned for the shading probe.
+        std::vector<std::array<int, 3>> removed_cells;
+        std::vector<world::BlockType> removed_previous;
+        removed_cells.reserve(removed.size());
+        removed_previous.reserve(removed.size());
+        for (const std::array<int, 3> &cell : removed)
+        {
+            removed_cells.push_back(cell);
+            removed_previous.push_back(region.contains(cell[0], cell[1], cell[2])
+                                           ? region.block(cell[0], cell[1], cell[2])
+                                           : world::BlockType::empty);
+        }
         for (const std::array<int, 3> &cell : removed)
         {
             if (!region.contains(cell[0], cell[1], cell[2]))
@@ -3704,6 +5712,9 @@ class Application::Impl final
                                    static_cast<float>(cell[2]) + 0.5F};
             impact.normal_y = 1;
             play_positional("GroundCrash", impact.intersection);
+            // (Presentation only: tells the Enhanced effects the block is
+            // gone, so it comes apart; the Original recipe never reads it.)
+            impact.completed = true;
             world_preview_->spawn_mining_impact(impact);
             region.set_block(cell[0], cell[1], cell[2], world::BlockType::empty);
             world_preview_->remember_edit(cell[0], cell[1], cell[2], world::BlockType::empty);
@@ -3716,10 +5727,13 @@ class Application::Impl final
                 const auto door = removed_doors.find(key);
                 if (door != removed_doors.end())
                 {
+                    // Explosive / EnemyManager: CreatePickup(item,
+                    // IntVector3.ToVector3(cell) + (0.5, 0.5, 0.5)) - the
+                    // centre of the detached door's cell, not its corner.
                     world_preview_->spawn_created_stack_at(InventoryStack{door->second.second, 1U},
-                                                           {static_cast<float>(key[0]),
-                                                            static_cast<float>(key[1]),
-                                                            static_cast<float>(key[2])});
+                                                           {static_cast<float>(key[0]) + 0.5F,
+                                                            static_cast<float>(key[1]) + 0.5F,
+                                                            static_cast<float>(key[2]) + 0.5F});
                     continue;
                 }
             }
@@ -3735,8 +5749,7 @@ class Application::Impl final
             std::erase_if(armed_explosives_, [&](const ArmedExplosive &armed) {
                 return removed.contains({armed.x, armed.y, armed.z});
             });
-            const std::vector<std::array<int, 3>> removed_cells{removed.begin(), removed.end()};
-            world_preview_->rebuild_block_edits(removed_cells);
+            world_preview_->rebuild_block_edits(removed_cells, removed_previous);
         }
 
         // The original removes the successful dig set first, then processes each
@@ -3789,9 +5802,14 @@ class Application::Impl final
         grenade_animation_time_ = std::max(0.0F, grenade_animation_time_ - fixed_delta);
         if (grenade_cooking_)
         {
-            grenade_cook_time_ += fixed_delta;
-            if (grenade_cook_time_ >= world::grenade_max_cook_seconds)
-                throw_grenade();
+            // Player.grenadeCookTime only runs until release (or four seconds).
+            // The throw itself waits for the avatar's Grenade_Cook and
+            // Grenade_Throw clips: step_local_animation performs it on the
+            // frame Player.UpdateAnimation would send GrenadeMessage.
+            grenade_arm_.cook(fixed_delta);
+            grenade_cook_time_ = grenade_arm_.cook_seconds();
+            if (!grenade_arm_.playing())
+                grenade_cooking_ = false; // the arm was reset underneath (death)
         }
 
         for (Grenade &grenade : grenades_)
@@ -3940,14 +5958,89 @@ class Application::Impl final
         std::erase_if(grenades_, [](const Grenade &grenade) { return grenade.dead; });
     }
 
+    // How far a locally fired bolt flies before it is drawn exactly on its
+    // simulated path (70 ms at the bolt's 200 m/s); see Tracer::seen_offset.
+    static constexpr float local_bolt_muzzle_blend_distance = 14.0F;
+    // Where fire_gun_round simulates a bolt from, in the camera's own space
+    // (right, up, ahead). The same at every field of view.
+    static constexpr view::ViewPoint simulated_bolt_origin{0.28F, -0.22F, 0.55F};
+
+    // (seen start - simulated start) of a bolt fired now, in world space, for
+    // a camera with the given basis. See fire_gun_round.
+    [[nodiscard]] world::Vec3 local_bolt_seen_offset(const GunStats *gun, world::Vec3 right,
+                                                     world::Vec3 up,
+                                                     world::Vec3 direction) const noexcept
+    {
+        const float world_fov = presented_world_fov(gun, gun_aim_progress_);
+        const std::optional<view::ViewmodelPoint> drawn =
+            world_preview_ != nullptr ? world_preview_->first_person_muzzle() : std::nullopt;
+        const view::ViewPoint seen =
+            drawn.has_value() && drawn->point.z > 0.05F && drawn->point.z < 3.0F
+                ? view::viewmodel_to_world_view(drawn->point, drawn->fov_degrees, world_fov)
+                // No gun on screen (scoped, or a character without the retail
+                // rig): keep the simulated start on the pixel it has at the
+                // default field of view.
+                : view::viewmodel_to_world_view(simulated_bolt_origin,
+                                                view::default_vertical_fov_degrees, world_fov);
+        const float along_right = seen.x - simulated_bolt_origin.x;
+        const float along_up = seen.y - simulated_bolt_origin.y;
+        const float along_view = seen.z - simulated_bolt_origin.z;
+        return {right.x * along_right + up.x * along_up + direction.x * along_view,
+                right.y * along_right + up.y * along_up + direction.y * along_view,
+                right.z * along_right + up.z * along_up + direction.z * along_view};
+    }
+
+    // OPENMINERZ_DIAGNOSTIC_BOLT_TRAVEL=<metres>: a still of the held laser
+    // gun's bolt frozen that far out of the muzzle, drawn every frame through
+    // the same path as a real one. Captures use it to check that a bolt leaves
+    // the weapon on screen at every field of view. Never simulated.
+    // (Deduced return type: Tracer is declared with the other state below.)
+    [[nodiscard]] auto diagnostic_frozen_bolt() const
+    {
+        const InventoryItemId item = inventory_.selected_item();
+        if (!(diagnostic_bolt_travel_ > 0.0F) || !is_laser_gun(item))
+            return std::optional<Tracer>{};
+        const world::Vec3 eye{player_.state().position.x,
+                              player_.state().position.y + world::PlayerSimulation::eye_height,
+                              player_.state().position.z};
+        const world::Vec3 direction = player_.view_direction();
+        const float yaw = player_.state().yaw;
+        const world::Vec3 right{std::cos(yaw), 0.0F, std::sin(yaw)};
+        const world::Vec3 up{right.y * direction.z - right.z * direction.y,
+                             right.z * direction.x - right.x * direction.z,
+                             right.x * direction.y - right.y * direction.x};
+        Tracer bolt;
+        bolt.laser = true;
+        bolt.item = item;
+        bolt.seen_from_muzzle = true;
+        bolt.seen_offset = local_bolt_seen_offset(gun_stats(item), right, up, direction);
+        // The drawn head sits presentation_lag_seconds_ behind the simulated one.
+        const float age = diagnostic_bolt_travel_ / laser_projectile_speed + presentation_lag_seconds_;
+        const float ahead = simulated_bolt_origin.z + laser_projectile_speed * age;
+        bolt.head = {eye.x + direction.x * ahead + right.x * simulated_bolt_origin.x +
+                         up.x * simulated_bolt_origin.y,
+                     eye.y + direction.y * ahead + right.y * simulated_bolt_origin.x +
+                         up.y * simulated_bolt_origin.y,
+                     eye.z + direction.z * ahead + right.z * simulated_bolt_origin.x +
+                         up.z * simulated_bolt_origin.y};
+        bolt.head_velocity = {direction.x * laser_projectile_speed,
+                              direction.y * laser_projectile_speed,
+                              direction.z * laser_projectile_speed};
+        bolt.flight_time = laser_projectile_lifetime_seconds;
+        bolt.time_left = bolt.flight_time - age;
+        float velocity{};
+        float flight{};
+        tracer_ballistics(item, velocity, flight, bolt.color);
+        return std::optional<Tracer>{bolt};
+    }
+
     [[nodiscard]] std::vector<ProjectileVisual> build_projectile_visuals() const
     {
         std::vector<ProjectileVisual> visuals;
         visuals.reserve(tracers_.size() + arrows_.size() + fireballs_.size() + grenades_.size());
-        for (const Tracer &tracer : tracers_)
-        {
+        const auto add_tracer = [&](const Tracer &tracer) {
             if (tracer.rocket)
-                continue;
+                return;
             ProjectileVisual visual;
             visual.head = tracer.head;
             if (tracer.laser)
@@ -3962,10 +6055,61 @@ class Application::Impl final
             }
             else
                 visual.tail = tracer.tail;
+            // Presentation only: drawn on the interpolated camera's timeline.
+            // A bullet streak's tail has its own delayed motion, so only its
+            // head moves; a laser bolt keeps its length.
+            const float tracer_age = tracer.flight_time - tracer.time_left;
+            visual.head = presented_projectile(visual.head, tracer.head_velocity, tracer_age);
+            if (tracer.laser)
+                visual.tail = presented_projectile(visual.tail, tracer.head_velocity, tracer_age);
+            float seen_width = 1.0F;
+            if (tracer.laser && tracer.seen_from_muzzle)
+            {
+                // A bolt the local player fired: drawn from the muzzle on
+                // screen, joining its simulated path over the first metres so
+                // it still arrives exactly where the shot goes. The streak
+                // grows out of the muzzle instead of reaching back past it.
+                const float speed =
+                    std::sqrt(tracer.head_velocity.x * tracer.head_velocity.x +
+                              tracer.head_velocity.y * tracer.head_velocity.y +
+                              tracer.head_velocity.z * tracer.head_velocity.z);
+                const float lag = std::min(presentation_lag_seconds_, std::max(tracer_age, 0.0F));
+                const float head_travel = speed * std::max(tracer_age - lag, 0.0F);
+                const float streak = std::min(1.6F, head_travel);
+                const float tail_travel = head_travel - streak;
+                if (speed > 0.001F)
+                    visual.tail = {visual.head.x - tracer.head_velocity.x / speed * streak,
+                                   visual.head.y - tracer.head_velocity.y / speed * streak,
+                                   visual.head.z - tracer.head_velocity.z / speed * streak};
+                const float head_blend =
+                    view::muzzle_blend(head_travel, local_bolt_muzzle_blend_distance);
+                const float tail_blend =
+                    view::muzzle_blend(tail_travel, local_bolt_muzzle_blend_distance);
+                visual.head = {visual.head.x + tracer.seen_offset.x * head_blend,
+                               visual.head.y + tracer.seen_offset.y * head_blend,
+                               visual.head.z + tracer.seen_offset.z * head_blend};
+                visual.tail = {visual.tail.x + tracer.seen_offset.x * tail_blend,
+                               visual.tail.y + tracer.seen_offset.y * tail_blend,
+                               visual.tail.z + tracer.seen_offset.z * tail_blend};
+                // Beside the weapon the bolt is judged against the weapon, which
+                // does not change size with the field of view: keep the bolt
+                // the width it has there at the default field of view, and let
+                // it become an ordinary 7.5 cm world object as it flies off.
+                seen_width = std::lerp(
+                    1.0F,
+                    view::half_tangent(
+                        presented_world_fov(gun_stats(tracer.item), gun_aim_progress_)) /
+                        view::half_tangent(view::default_vertical_fov_degrees),
+                    0.5F * (head_blend + tail_blend));
+            }
             visual.color = tracer.color;
-            visual.width = tracer.laser ? 0.075F : 0.025F;
+            visual.width = (tracer.laser ? 0.075F : 0.025F) * seen_width;
             visuals.push_back(visual);
-        }
+        };
+        for (const Tracer &tracer : tracers_)
+            add_tracer(tracer);
+        if (const auto frozen = diagnostic_frozen_bolt(); frozen.has_value())
+            add_tracer(*frozen);
         for (const Arrow &arrow : arrows_)
         {
             // Tracer.Init(target, Color.Pink) renders the authored delayed-tail
@@ -3994,25 +6138,8 @@ class Application::Impl final
             visual.width = 0.1F;
             visuals.push_back(visual);
         }
-        for (const Fireball &fireball : fireballs_)
-        {
-            // The dragon's fireball reads as a fat glowing streak plus its
-            // particle trail — the "big fireball" presentation.
-            ProjectileVisual visual;
-            visual.head = fireball.position;
-            const float speed =
-                std::max(0.001F, std::sqrt(fireball.velocity.x * fireball.velocity.x +
-                                           fireball.velocity.y * fireball.velocity.y +
-                                           fireball.velocity.z * fireball.velocity.z));
-            visual.tail = {fireball.position.x - fireball.velocity.x / speed * 2.4F,
-                           fireball.position.y - fireball.velocity.y / speed * 2.4F,
-                           fireball.position.z - fireball.velocity.z / speed * 2.4F};
-            visual.color = fireball.kind == world::DragonKind::ice
-                               ? std::array<float, 3>{0.55F, 0.85F, 1.0F}
-                               : std::array<float, 3>{1.0F, 0.55F, 0.12F};
-            visual.width = 0.55F;
-            visuals.push_back(visual);
-        }
+        // Fireballs have a directional volume core and wake. Drawing a second
+        // opaque tracer spear here showed a solid polygon through the flames.
         return visuals;
     }
 
@@ -4023,8 +6150,9 @@ class Application::Impl final
         {
             if (!tracer.rocket)
                 continue;
-            visuals.push_back(
-                {tracer.head, tracer.rocket_direction, tracer.rocket_spin, tracer.id});
+            visuals.push_back({presented_projectile(tracer.head, tracer.head_velocity,
+                                                    tracer.flight_time - tracer.time_left),
+                               tracer.rocket_direction, tracer.rocket_spin, tracer.id});
         }
         return visuals;
     }
@@ -4075,8 +6203,8 @@ class Application::Impl final
     void update_enemies(float fixed_delta)
     {
         world_game_time_ += fixed_delta;
-        surface_spawn_timer_ += fixed_delta;
-        cave_spawn_timer_ += fixed_delta;
+        // (The surface and cave spawn clocks are advanced where
+        // EnemyManager.OnUpdate advances them, below.)
         felguard_timer_ += fixed_delta;
         alien_spawn_timer_ += fixed_delta;
         alien_aroused_time_ = std::max(0.0F, alien_aroused_time_ - fixed_delta);
@@ -4095,7 +6223,11 @@ class Application::Impl final
             if (dragon_.active())
                 dragon_.deactivate();
             queued_dragon_fireball_ids_.clear();
-            fireballs_.clear();
+            const char *capture = SDL_getenv("OPENMINERZ_DYNAMIC_RADIANCE_CAPTURE");
+            const bool held_capture = options_.screenshot_path.has_value() && capture != nullptr &&
+                (std::string_view{capture} == "fireball" || std::string_view{capture} == "iceball");
+            if (!held_capture)
+                fireballs_.clear();
         }
         const bool ambient_world = game_mode_ != GameMode::dragon_endurance;
         const bool hard_branch = hard_spawn_branch(game_mode_, difficulty_);
@@ -4106,27 +6238,8 @@ class Application::Impl final
         const float geometric_distance = std::hypot(player.position.x, player.position.z);
         current_distance_ = static_cast<int>(geometric_distance);
         max_distance_ = std::max(max_distance_, current_distance_);
-        // The original's distance-triggered songs: Song1..Song6 fire once each
-        // at 200/900/1600/2300/3000/3400 blocks from the start point — the
-        // "entering the biome" music, since those ARE the band boundaries.
-        // DistanceTrigger's teleport guard: a >10-block jump in one frame
-        // consumes crossed thresholds silently instead of stacking songs.
-        static constexpr std::array<float, 6> song_distances{200.0F,  900.0F,  1600.0F,
-                                                             2300.0F, 3000.0F, 3400.0F};
-        const bool song_teleport_jump = last_song_distance_ >= 0.0F &&
-                                        std::abs(geometric_distance - last_song_distance_) > 10.0F;
-        last_song_distance_ = geometric_distance;
-        while (next_song_index_ < static_cast<int>(song_distances.size()) &&
-               geometric_distance > song_distances[static_cast<std::size_t>(next_song_index_)])
-        {
-            if (!song_teleport_jump)
-            {
-                sound_bank_->play_song(std::format("Song{}", next_song_index_ + 1));
-                ++next_song_index_;
-                break;
-            }
-            ++next_song_index_;
-        }
+        // Music follows the current environment in update_audio_environment;
+        // crossing several boundaries never queues obsolete biome tracks.
         // The single continuous world changes terrain by distance; announce
         // each new band the way the original's music shifts marked them.
         const int biome_band = geometric_distance < 300.0F    ? 0
@@ -4135,20 +6248,24 @@ class Application::Impl final
                                : geometric_distance < 2400.0F ? 3
                                : geometric_distance < 3000.0F ? 4
                                                               : 5;
-        if (biome_band != previous_biome_band_)
+        // (mod-world: a mod world announces its own biomes, app_mod_world.inc.)
+        if (biome_band != previous_biome_band_ && mod_world_terrain_ == nullptr)
         {
-            static constexpr std::array<const char *, 6> band_names{"THE FRONTIER", "THE LAGOONS",
-                                                                    "THE DESERT",   "THE MOUNTAINS",
-                                                                    "THE ARCTIC",   "THE DESCENT"};
+            static constexpr std::array<const char *, 6> band_names{"THE PLAINS", "THE LAGOONS",
+                                                                    "THE DESERT", "THE MOUNTAINS",
+                                                                    "THE ARCTIC", "THE DESCENT"};
             if (previous_biome_band_ >= 0)
                 toast(std::format("ENTERING {}", band_names[static_cast<std::size_t>(biome_band)]),
                       std::format("{} BLOCKS FROM THE START", current_distance_));
             previous_biome_band_ = biome_band;
         }
-        const float distance =
+        // mod-ai: a server mod may remap it (enemies.rules{distance}, a wider
+        // world); exactly this distance without one.
+        const float distance = mod_ai_tier_distance(
             geometric_distance + (game_mode_ == GameMode::endurance
                                       ? std::max(0.0F, (day_night_.day() - 0.41F) * 120.0F)
-                                      : 0.0F);
+                                      : 0.0F),
+            player.position);
         // GameScreen PercentMidnight: a triangle over the day peaking just after
         // midnight and bottoming out near 1 PM — daytime keeps a small trickle
         // of weak spawns, night ramps hard.
@@ -4180,65 +6297,78 @@ class Application::Impl final
             zombie_fest_ = false;
             fest_countdown_ = -1.0F;
         }
-        const float midnight =
-            zombie_fest_ && player.position.y >= -40.0F
-                ? 1.0F
-                : world::enemy_midnight_factor(percent_midnight, distance, player.position.y);
+        const float midnight = world::enemy_midnight_factor(percent_midnight, distance,
+                                                            player.position.y, zombie_fest_);
         const bool felguard_ready = felguard_timer_ >= 300.0F;
         auto &rng = enemy_horde_.rng();
 
+        // EnemyManager keeps _localSurfaceEnemyCount, _localCaveEnemyCount and
+        // _localAlienCount over enemies whose Target is the LOCAL player, and
+        // divides the surface/cave allowances by the number of gamers in the
+        // session (5 + 12/count and 8/count). Counting every peer's horde here
+        // instead starved a host whose guest was already swarmed and inflated a
+        // single player's cave budget from 8 to 12.
+        const int session_gamers = online_gameplay_active()
+                                       ? 1 + static_cast<int>(online_remote_players_.size())
+                                       : 1;
+        const std::uint8_t spawn_owner_gid =
+            online_gameplay_active() ? online_local_player_gid() : 0U;
         int surface_count{};
         int cave_count{};
+        int alien_count{};
         for (const world::Enemy &enemy : enemy_horde_.enemies())
         {
-            if (world::enemy_uses_cave_spawn_budget(world::enemy_stats(enemy.type).habitat))
+            if (enemy.target_gid != spawn_owner_gid || enemy.state == world::EnemyState::despawn)
+                continue;
+            if (world::enemy_stats(enemy.type).enemy_class == world::EnemyClass::alien)
+                ++alien_count;
+            else if (world::enemy_uses_cave_spawn_budget(world::enemy_stats(enemy.type).habitat))
                 ++cave_count;
             else
                 ++surface_count;
         }
+        const int surface_limit = 5 + 12 / session_gamers;
+        const int cave_limit = 8 / session_gamers;
+        // The whole EnemyManager spawn block is gated on `_enemies.Count < 50`,
+        // across every peer's enemies, not just the local player's.
+        const bool below_global_enemy_cap = enemy_horde_.enemies().size() < 50U;
 
-        // SpawnAbovegroundEnemy.
-        if (enemies_enabled && ambient_world && midnight > 0.0001F && surface_count < 17)
+        // ---- EnemyManager.OnUpdate's spawn block, in its own order ----------
+        // (1.6.3.8 and 1.9.9.8; the two stores to each clock are in the IL of
+        // both, and GetMinEnemySpawnTime / CalculateMidnight are executed by
+        // the semantics probe.)
+        //
+        // `if (localPlayer != null && _enemies.Count < 50)`: both clocks
+        // advance once here, and then a SECOND time in the branch that calls
+        // their spawner. So while this player is under its own allowance the
+        // clock runs at twice real time: the thresholds below are reached in
+        // half the seconds they name. One advance per tick, as stood here,
+        // gave an OpenMinerZ player half the zombies and skeletons a Steam
+        // player standing beside them was sent.
+        const bool spawning = enemies_enabled && below_global_enemy_cap;
+        // Modding, gameplay area: a server mod's spawn_rate scales the two
+        // spawn clocks (exactly fixed_delta without one).
+        const float spawn_step = mod_scaled_spawn_step(fixed_delta);
+        if (spawning)
         {
-            const float threshold =
-                std::lerp(60.0F, world::minimum_enemy_spawn_seconds(distance, hard_branch),
-                          std::pow(midnight, 0.25F)) *
-                (1.0F + rng.next01() * 0.5F);
-            if (surface_spawn_timer_ > threshold)
-            {
-                const int type = world::pick_aboveground_enemy(midnight, distance, felguard_ready,
-                                                               felguard_spawned_, rng);
-                const int radius = world::enemy_stats(type).spawn_radius;
-                world::Vec3 spot = player.position;
-                spot.x += player.velocity.x * 5.0F +
-                          static_cast<float>(rng.next_int(-radius, radius + 1));
-                spot.z += player.velocity.z * 5.0F +
-                          static_cast<float>(rng.next_int(-radius, radius + 1));
-                if (try_spawn_enemy_on_ground(type, spot, midnight))
-                {
-                    surface_spawn_timer_ = 0.0F;
-                    if (type == world::enemy_felguard)
-                    {
-                        felguard_timer_ = 0.0F;
-                        felguard_spawned_ = true;
-                    }
-                }
-            }
+            surface_spawn_timer_ += spawn_step;
+            cave_spawn_timer_ += spawn_step;
         }
-        else if (midnight <= 0.0001F)
-        {
-            surface_spawn_timer_ = 0.0F;
-        }
+        // GetSimpleSunlightAtPoint(player position + 1): the stored sunlight of
+        // the cell at the player's chest. -1 inside an opaque block.
+        const float head_sunlight = spawning ? spawn_head_sunlight(player.position) : 1.0F;
 
-        // The "fresh ground" pack spawner (Normal/Hardcore/Endurance): crossing
-        // each new ~40-block distance band queues 2-4 zombies that arrive over
-        // the next seconds — the original's daytime ambush.
-        if (enemies_enabled && fresh_ground_packs(game_mode_, difficulty_))
+        // The "fresh ground" packs (Endurance, HARD, HARDCORE; never Dragon
+        // Endurance): every new ~40-block band of distance queues two to four
+        // zombies that arrive over the next seconds.
+        if (spawning && fresh_ground_packs(game_mode_, difficulty_))
         {
             if (geometric_distance > cleared_distance_)
             {
                 time_to_first_contact_ = -1.0F;
-                if (player.position.y > 0.0F)
+                // `simpleSunlightAtPoint > 0.01f`: under any open sky, however
+                // deep the valley; not "above height zero".
+                if (head_sunlight > 0.01F)
                 {
                     if (distance_enemies_left_ == 0)
                         next_distance_enemy_timer_ = rng.next01() * 2.0F;
@@ -4256,65 +6386,131 @@ class Application::Impl final
                     distance_enemies_left_ += rng.next_int(2, 5);
                 }
             }
-            if (distance_enemies_left_ > 0 && surface_count < 17)
+            if (distance_enemies_left_ > 0)
             {
-                next_distance_enemy_timer_ -= fixed_delta;
-                if (next_distance_enemy_timer_ <= 0.0F)
+                if (player_life_ != PlayerLife::alive)
                 {
-                    // SpawnRandomZombies: distance-tiered zombies (midnight 1
-                    // forces the zombie table past the archer roll).
-                    const int type =
-                        world::pick_aboveground_enemy(1.0F, distance, false, false, rng);
-                    const int radius = world::enemy_stats(type).spawn_radius;
-                    world::Vec3 spot = player.position;
-                    spot.x += static_cast<float>(rng.next_int(-radius, radius + 1));
-                    spot.z += static_cast<float>(rng.next_int(-radius, radius + 1));
-                    if (try_spawn_enemy_on_ground(type, spot, std::max(midnight, 0.3F)))
-                        --distance_enemies_left_;
-                    if (distance_enemies_left_ > 0)
-                        next_distance_enemy_timer_ += 2.0F + rng.next01() * 3.0F;
+                    // `if (LocalPlayer.Dead) _distanceEnemiesLeftToSpawn = 0`.
+                    distance_enemies_left_ = 0;
+                }
+                else
+                {
+                    next_distance_enemy_timer_ -= fixed_delta;
+                    if (next_distance_enemy_timer_ <= 0.0F)
+                    {
+                        // SpawnRandomZombies: EnemyType.GetZombie (the zombie
+                        // tiers by distance, or a Felguard once one has been
+                        // met), led by five seconds of the player's velocity
+                        // like every surface spawn, and sent with the midnight
+                        // of the moment - zero at noon, which is what makes a
+                        // daytime pack the weak one it is. The queue is
+                        // counted down once the spot is in loaded terrain,
+                        // whether or not anything could stand there.
+                        const int type = world::pick_aboveground_enemy(
+                            1.0F, distance, felguard_ready, felguard_spawned_, rng);
+                        if (type == world::enemy_felguard)
+                            felguard_timer_ = 0.0F;
+                        const int radius = world::enemy_stats(type).spawn_radius;
+                        world::Vec3 spot = player.position;
+                        spot.y += 1.0F;
+                        spot.x += player.velocity.x * 5.0F +
+                                  static_cast<float>(rng.next_int(-radius, radius + 1));
+                        spot.z += player.velocity.z * 5.0F +
+                                  static_cast<float>(rng.next_int(-radius, radius + 1));
+                        if (spawn_spot_loaded(spot))
+                        {
+                            --distance_enemies_left_;
+                            static_cast<void>(
+                                try_spawn_enemy_on_ground(type, spot, midnight, false, false));
+                        }
+                        if (distance_enemies_left_ > 0)
+                            next_distance_enemy_timer_ += 2.0F + rng.next01() * 3.0F;
+                    }
                 }
             }
         }
 
-        // SpawnBelowgroundEnemy: depth factor pulsing on the original two-minute wave.
-        const float depth = std::clamp(-(player.position.y - 20.0F), 0.0F, 50.0F);
-        if (enemies_enabled && depth > 0.0F && cave_count < 12)
+        // SpawnAbovegroundEnemy, for a player under its surface allowance.
+        if (spawning && ambient_world && surface_count < surface_limit)
         {
-            float wave = std::sin(std::fmod(world_game_time_ / 60.0F, 2.0F) * 3.1415927F);
-            wave = wave <= 0.0F ? 0.0F : std::sqrt(wave);
-            const float cave_factor = depth / 50.0F * wave;
-            if (cave_factor > 0.0001F)
+            surface_spawn_timer_ += spawn_step;
+            if (midnight <= 0.0001F)
             {
-                const float cave_distance = player.position.y < -40.0F ? 3500.0F : distance;
+                surface_spawn_timer_ = 0.0F;
+            }
+            else
+            {
                 const float threshold =
-                    std::lerp(60.0F, world::minimum_enemy_spawn_seconds(cave_distance, hard_branch),
-                              cave_factor) *
+                    std::lerp(60.0F, world::minimum_enemy_spawn_seconds(distance, hard_branch),
+                              std::pow(midnight, 0.25F)) *
                     (1.0F + rng.next01() * 0.5F);
-                if (cave_spawn_timer_ > threshold)
+                if (surface_spawn_timer_ > threshold)
                 {
-                    const int type = world::pick_belowground_enemy(
-                        depth, cave_distance, felguard_ready, felguard_spawned_, rng);
+                    const int type = world::pick_aboveground_enemy(
+                        midnight, distance, felguard_ready, felguard_spawned_, rng);
+                    if (type == world::enemy_felguard)
+                    {
+                        felguard_timer_ = 0.0F;
+                        felguard_spawned_ = true;
+                    }
                     const int radius = world::enemy_stats(type).spawn_radius;
                     world::Vec3 spot = player.position;
                     spot.y += 1.0F;
-                    int offset = rng.next_int(-radius, radius);
-                    spot.x += static_cast<float>(offset > 0 ? offset + 5 : offset - 5);
-                    offset = rng.next_int(-radius, radius);
-                    spot.z += static_cast<float>(offset > 0 ? offset + 5 : offset - 5);
-                    const bool open_hell = player.position.y < -40.0F ||
-                                           world_preview_->biome() == world::BiomeKind::descent;
-                    if (try_spawn_enemy_at_ceiling(type, spot) ||
-                        (open_hell && try_spawn_enemy_on_local_ground(type, spot, 1.0F)))
-                    {
-                        cave_spawn_timer_ = 0.0F;
-                        if (type == world::enemy_felguard)
-                        {
-                            felguard_timer_ = 0.0F;
-                            felguard_spawned_ = true;
-                        }
-                    }
+                    spot.x += player.velocity.x * 5.0F +
+                              static_cast<float>(rng.next_int(-radius, radius + 1));
+                    spot.z += player.velocity.z * 5.0F +
+                              static_cast<float>(rng.next_int(-radius, radius + 1));
+                    // Above y -40 the enemy stands on the column's topmost
+                    // ground (FindTopmostGroundLocation); below it, in the gap
+                    // nearest the player's own height (FindSafeStartLocation),
+                    // which is how Hell gets its zombies. The clock restarts
+                    // when the spot is dark enough, even over crash-site rock
+                    // where nothing is sent.
+                    if (spawn_spot_loaded(spot) &&
+                        try_spawn_enemy_on_ground(type, spot, midnight,
+                                                  !(player.position.y > -40.0F), true))
+                        surface_spawn_timer_ = 0.0F;
                 }
+            }
+        }
+
+        // SpawnBelowgroundEnemy: for a player whose chest is in the dark
+        // (`sunlight != -1 && sunlight <= 0.4`: a cave, a tunnel, a windowless
+        // room at any height) and under its cave allowance. The depth factor
+        // rides the two-minute wave, but the wait is Lerp(60, min, factor): at
+        // factor zero it is a minute, not forever, so a dark place always
+        // draws a skeleton every 30 to 45 seconds of the doubled clock.
+        if (spawning && head_sunlight != -1.0F && head_sunlight <= 0.4F && cave_count < cave_limit)
+        {
+            cave_spawn_timer_ += spawn_step;
+            const int depth =
+                static_cast<int>(std::clamp(-(player.position.y - 20.0F), 0.0F, 50.0F));
+            float wave = std::sin(std::fmod(world_game_time_ / 60.0F, 2.0F) * 3.1415927F);
+            wave = wave > 0.0F ? std::sqrt(wave) : 0.0F;
+            const float cave_factor = static_cast<float>(depth) / 50.0F * wave;
+            const float cave_distance = player.position.y < -40.0F ? 3500.0F : distance;
+            const float threshold =
+                std::lerp(60.0F, world::minimum_enemy_spawn_seconds(cave_distance, hard_branch),
+                          cave_factor) *
+                (1.0F + rng.next01() * 0.5F);
+            if (cave_spawn_timer_ > threshold)
+            {
+                const int type = world::pick_belowground_enemy(
+                    static_cast<float>(depth), cave_distance, felguard_ready, felguard_spawned_, rng);
+                if (type == world::enemy_felguard)
+                {
+                    felguard_timer_ = 0.0F;
+                    felguard_spawned_ = true;
+                }
+                const int radius = world::enemy_stats(type).spawn_radius;
+                world::Vec3 spot = player.position;
+                spot.y += 1.0F;
+                int offset = rng.next_int(-radius, radius);
+                spot.x += static_cast<float>(offset > 0 ? offset + 5 : offset - 5);
+                offset = rng.next_int(-radius, radius);
+                spot.z += static_cast<float>(offset > 0 ? offset + 5 : offset - 5);
+                if (spawn_spot_loaded(spot) && try_spawn_enemy_at_ceiling(type, spot))
+                    cave_spawn_timer_ = 0.0F;
             }
         }
 
@@ -4352,12 +6548,11 @@ class Application::Impl final
                     }
                 }
         }
-        if (enemies_enabled && space_rock_nearby_ && alien_spawn_timer_ > next_alien_delay_)
+        if (enemies_enabled && below_global_enemy_cap && space_rock_nearby_ &&
+            alien_spawn_timer_ > next_alien_delay_)
         {
-            int alien_count{};
-            for (const world::Enemy &enemy : enemy_horde_.enemies())
-                if (world::enemy_stats(enemy.type).enemy_class == world::EnemyClass::alien)
-                    ++alien_count;
+            // MAX_LOCAL_ALIENS counts this player's own aliens, and unlike the
+            // surface and cave budgets it is not divided by the player count.
             if (alien_count < 10)
             {
                 const bool aroused = alien_aroused_time_ > 0.0F;
@@ -4404,8 +6599,16 @@ class Application::Impl final
             target.grounded = std::abs(target.velocity.y) < 0.01F;
             return target;
         };
+        // EnemyManager.ZombieFestIsOn: ZombieChase asks for every local-target
+        // zombie's speed-up while it is set.
+        enemy_horde_.set_zombie_fest(zombie_fest_);
+        enemy_horde_.set_modern_rules(inventory_.profile() == InventoryProfile::modern);
+        // BaseZombie's RegionIsLoaded test asks the terrain this client really
+        // holds: the original's fixed window, whatever the view distance.
+        enemy_horde_.set_terrain_window(world_preview_->simulation_window());
         const world::EnemyEvents events = enemy_horde_.update(
             world_preview_->region(), player, local_gid, target_lookup, fixed_delta);
+        authority_enemy_events(events); // (Authority) swings seen here and on remote targets
         for (const world::EnemyIdentity identity : events.speed_up_requests)
             publish_local_enemy_target("SpeedUpEnemyMessage", identity);
         for (const world::EnemyIdentity identity : events.give_up_requests)
@@ -4422,16 +6625,19 @@ class Application::Impl final
             caption("[ STRUCK BY ENEMY ]", 0.9F);
             for (std::size_t extra = 1; extra < events.player_damage_sources.size(); ++extra)
                 damage_indicators_.push_back({events.player_damage_sources[extra], 0.0F});
-            apply_player_damage(events.player_damage * 100.0F,
+            // Modding, gameplay area: enemy_damage scaling (none without a mod).
+            apply_player_damage(mod_scaled_enemy_damage(events.player_damage * 100.0F),
                                 events.player_damage_sources.empty()
                                     ? player.position
-                                    : events.player_damage_sources.front());
+                                    : events.player_damage_sources.front(),
+                                modding::gameplay::DamageCause::enemy);
         }
         else if (world_game_time_ - last_player_damage_time_ > 3.0F &&
-                 player_life_ == PlayerLife::alive)
+                 player_life_ == PlayerLife::alive && authority_client_ == nullptr)
         {
             // InGameHUD.HealthRecoverRate: 0.75 of max health per second once
             // the three-second recover timer has expired. The dead don't heal.
+            // (Authority) Where the host decides health it heals the player.
             player_.state().health = std::min(100.0F, player_.state().health + 75.0F * fixed_delta);
         }
         // InGameHUD.timeToShowRespawnText: the prompt (and respawn input)
@@ -4513,9 +6719,28 @@ class Application::Impl final
                 caption("[ ARROW HIT ]", 0.9F);
                 world_preview_->spawn_impact_smoke(impact.position, {1.0F, 1.0F, 1.0F});
                 play_positional("BulletHitHuman", impact.position);
-                apply_player_damage(35.0F, impact.position);
+                authority_cause_hint_ = net::HarmCause::arrow; // (Authority)
+                apply_player_damage(mod_scaled_enemy_damage(35.0F), impact.position,
+                                    modding::gameplay::DamageCause::enemy);
+                authority_cause_hint_.reset();
                 arrow.dead = true;
             }
+            // (Authority) An arrow at a remote player is that player's peer's
+            // to test; an authoritative host checks it too, once, and holds
+            // it against the player's own report. Its flight is untouched.
+            if (authority_host_ != nullptr && arrow.target_gid != local_gid && !arrow.observed &&
+                impact.kind != world::ArrowSweepKind::terrain)
+                if (const auto remote = target_lookup(arrow.target_gid); remote.has_value())
+                {
+                    const world::ArrowSweepHit struck =
+                        world::arrow_sweep(world_preview_->region(), *remote, remote->health > 0.0F,
+                                           arrow.tail, arrow.head);
+                    if (struck.kind == world::ArrowSweepKind::player)
+                    {
+                        arrow.observed = true;
+                        authority_arrow_struck(arrow.target_gid, struck.position);
+                    }
+                }
             else if (!arrow.whizzed)
             {
                 const float dx = arrow.head.x - player.position.x;
@@ -4550,31 +6775,19 @@ class Application::Impl final
                (dragon_owner_gid_.has_value() && *dragon_owner_gid_ == online_local_player_gid());
     }
 
-    [[nodiscard]] static std::uint8_t dragon_animation(const world::Dragon &dragon) noexcept
+    // BaseDragonWaypoint as DragonBaseState.GetBaseWaypoint built it. Every
+    // field is decided by world::DragonFlight (tests/test_dragon_parity.cpp
+    // drives the same values against the original DragonClientEntity).
+    [[nodiscard]] static net::DragonWaypointPayload dragon_waypoint_payload(
+        const world::DragonOwnerMessage &message) noexcept
     {
-        if (dragon.clip == "Idle")
-            return 3U;
-        if (dragon.clip == "attack")
-            return 2U;
-        if (dragon.clip == "fly_forward")
-            return 1U;
-        return 0U;
-    }
-
-    [[nodiscard]] net::DragonWaypointPayload current_dragon_waypoint() noexcept
-    {
-        const world::Dragon &dragon = dragon_.dragon();
-        const world::DragonBasis basis =
-            world::dragon_attitude_basis(dragon.yaw, dragon.pitch, dragon.roll);
         net::DragonWaypointPayload waypoint;
-        waypoint.position = {dragon.position.x, dragon.position.y, dragon.position.z};
-        waypoint.velocity = {basis.forward.x * dragon.velocity, basis.forward.y * dragon.velocity,
-                             basis.forward.z * dragon.velocity};
-        waypoint.host_time = dragon_network_time_;
-        waypoint.target_roll = dragon.roll;
-        waypoint.animation = dragon_animation(dragon);
-        waypoint.sound = dragon_network_sound_;
-        dragon_network_sound_ = 0U;
+        waypoint.position = {message.position.x, message.position.y, message.position.z};
+        waypoint.velocity = {message.velocity.x, message.velocity.y, message.velocity.z};
+        waypoint.host_time = message.host_time;
+        waypoint.target_roll = message.target_roll;
+        waypoint.animation = message.animation;
+        waypoint.sound = message.sound;
         return waypoint;
     }
 
@@ -4633,12 +6846,31 @@ class Application::Impl final
             dragon_.spawn(kind, player_.state().position, enemy_horde_.rng());
             if (message.health >= 0.0F)
                 dragon_.set_health(message.health);
+            // HandleSpawnDragonMessage gives the spawner a hidden DragonEntity
+            // AND the same DragonClientEntity everybody else gets. Presenting
+            // the brain itself put this peer's dragon 8-10 blocks (and its
+            // fireballs half a second) ahead of every stock client's.
+            if (online_gameplay_active())
+                dragon_.begin_network_ownership(online_local_player_gid(),
+                                                next_dragon_fireball_index_);
+            prepare_cavern_dragon();
         }
         else
             dragon_.install_replica(kind, message.health);
         dragon_cry_timer_ = 5.0F;
         dragon_flap_timer_ = 1.0F;
+        // SetCurrentTimedDragonType + RecalculateDragonBox, on every peer.
+        dragon_schedule_.dragon_installed(kind, message.for_biome, player_.state().position,
+                                          enemy_horde_.rng());
         return true;
+    }
+
+    // EnemyManager.RemoveDragonEntity's bookkeeping: eight seconds before the
+    // next dragon may be asked for, and the timed ladder restarts from now.
+    void note_dragon_removed()
+    {
+        if (game_mode_ != GameMode::dragon_endurance)
+            dragon_schedule_.dragon_removed(player_.state().position, enemy_horde_.rng());
     }
 
     [[nodiscard]] bool publish_spawn_dragon(world::DragonKind kind, std::uint8_t spawner_gid,
@@ -4659,16 +6891,50 @@ class Application::Impl final
         return apply_network_dragon_spawn(message);
     }
 
+    void prepare_cavern_dragon()
+    {
+        cavern_dragon_altitude_.reset();
+        const auto &player = player_.state();
+        if (game_mode_ == GameMode::dragon_endurance || player.position.y > -30.0F)
+            return;
+        const auto approach = world::cavern_dragon_approach(world_preview_->region(), player.position, player.yaw);
+        if (!approach.has_value())
+            return;
+        auto &brain = dragon_.brain_state();
+        const world::Vec3 delta{player.position.x - approach->x, 0, player.position.z - approach->z};
+        const float heading = std::atan2(-delta.x, -delta.z);
+        brain.position = *approach;
+        brain.target_altitude = approach->y;
+        brain.yaw = brain.target_yaw = brain.default_heading = heading;
+        brain.forward = {-std::sin(heading), 0, -std::cos(heading)};
+        brain.travel_target = {player.position.x + brain.forward.x * 80,
+                               approach->y, player.position.z + brain.forward.z * 80};
+        brain.time_left_before_next_view_check = 0;
+        cavern_dragon_altitude_ = approach->y;
+        std::cout << "dragon.cavern.approach x=" << approach->x << " y=" << approach->y << " z=" << approach->z << '\n';
+    }
+
     [[nodiscard]] bool request_dragon_spawn(world::DragonKind kind, bool for_biome,
                                             float health = -1.0F)
     {
         if (dragon_pending_ || dragon_.active())
+            return false;
+        if (mod_ai_dragon_refused(player_.state().position)) // mod-ai: dragons switched off
+            return false;
+        if (game_mode_ != GameMode::dragon_endurance && player_.state().position.y <= -30.0F &&
+            !world::cavern_dragon_approach(world_preview_->region(), player_.state().position,
+                                           player_.state().yaw).has_value())
             return false;
         if (!online_gameplay_active())
         {
             dragon_.spawn(kind, player_.state().position, enemy_horde_.rng());
             if (health >= 0.0F)
                 dragon_.set_health(health);
+            // Retail has no separate single-player dragon: the same hidden
+            // DragonEntity feeds the same DragonClientEntity through the local
+            // session's echo. Nothing is published while offline.
+            dragon_.begin_network_ownership(0U, next_dragon_fireball_index_);
+            prepare_cavern_dragon();
             dragon_owner_gid_.reset();
             dragon_for_biome_ = for_biome;
             dragon_kill_announced_ = false;
@@ -4698,14 +6964,14 @@ class Application::Impl final
         return false;
     }
 
-    void publish_dragon_update()
+    void publish_dragon_update(const world::DragonOwnerMessage &update)
     {
         net::PayloadError payload_error{};
         const auto payload =
-            net::encode_update_dragon_payload(current_dragon_waypoint(), payload_error);
+            net::encode_update_dragon_payload(dragon_waypoint_payload(update), payload_error);
         const net::MessageDeliveryPolicy delivery =
-            dragon_updates_sent_ < 2 ? net::MessageDeliveryPolicy::reliable_ordered
-                                     : net::MessageDeliveryPolicy::unreliable;
+            update.reliable ? net::MessageDeliveryPolicy::reliable_ordered
+                            : net::MessageDeliveryPolicy::unreliable;
         std::string error;
         if (!payload.has_value() ||
             !publish_online_broadcast("UpdateDragonMessage", *payload, delivery, error))
@@ -4713,13 +6979,14 @@ class Application::Impl final
         ++dragon_updates_sent_;
     }
 
-    void publish_dragon_attack(world::Vec3 target, std::int32_t fireball_index)
+    void publish_dragon_attack(const world::DragonOwnerMessage &attack)
     {
         net::DragonAttackPayload message;
-        message.waypoint = current_dragon_waypoint();
-        message.target = {target.x, target.y, target.z};
+        message.waypoint = dragon_waypoint_payload(attack);
+        message.target = {attack.target.x, attack.target.y, attack.target.z};
+        // SendRegularUpdate only ever sends the quick shot.
         message.animated_attack = false;
-        message.fireball_index = fireball_index;
+        message.fireball_index = attack.fireball_index;
         net::PayloadError payload_error{};
         const auto payload = net::encode_dragon_attack_payload(message, payload_error);
         std::string error;
@@ -4810,6 +7077,15 @@ class Application::Impl final
                 play_positional("DragonScream", event.position);
                 continue;
             }
+            if (event.kind == world::DragonReplicaEventKind::timeout)
+            {
+                // DragonClientEntity.Update: ten silent seconds and this peer,
+                // owner or not, removes the dragon for the whole session.
+                publish_remove_dragon();
+                dragon_.deactivate();
+                note_dragon_removed();
+                return;
+            }
             queued_dragon_fireball_ids_.erase(event.fireball_id);
             if (event.kind == world::DragonReplicaEventKind::cancel_fireball ||
                 std::ranges::find(applied_fireball_detonations_, event.fireball_id) !=
@@ -4818,22 +7094,23 @@ class Application::Impl final
                     return fireball.id == event.fireball_id;
                 }))
                 continue;
-            world::Vec3 velocity{event.target.x - event.position.x,
-                                 event.target.y - event.position.y,
-                                 event.target.z - event.position.z};
-            const float length = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y +
-                                           velocity.z * velocity.z);
+            const float target_x = event.target.x - event.position.x;
+            const float target_y = event.target.y - event.position.y;
+            const float target_z = event.target.z - event.position.z;
+            const float length =
+                std::sqrt(target_x * target_x + target_y * target_y + target_z * target_z);
             if (length < 0.001F || length > 2'000'000.0F)
                 continue;
             const world::DragonKind kind = dragon_.dragon().kind;
-            const float speed = world::dragon_stats(kind).fireball_velocity;
-            velocity.x = velocity.x / length * speed;
-            velocity.y = velocity.y / length * speed;
-            velocity.z = velocity.z / length * speed;
+            const world::Vec3 velocity =
+                world::dragon_fireball_velocity(kind, event.position, event.target);
             const std::uint8_t owner_gid = static_cast<std::uint8_t>(
                 (static_cast<std::uint32_t>(event.fireball_id) >> 23U) & 0xFFU);
+            // FireballEntity.SpawnedLocally = EnemyManager.DragonControlledLocally:
+            // the owner's copy, fired by its own replica like everyone else's,
+            // is the one that decides the detonation.
             fireballs_.push_back({event.position, velocity, kind, event.fireball_id, false, false,
-                                  owner_gid, false});
+                                  owner_gid, dragon_.network_owner()});
             sound_bank_->sync_fireball_cue(static_cast<std::uint32_t>(event.fireball_id),
                                            kind == world::DragonKind::ice ? "Iceball" : "Fireball",
                                            event.position, velocity);
@@ -4872,39 +7149,36 @@ class Application::Impl final
     void install_dragon_migration(const net::MigrateDragonPayload &message)
     {
         const net::DragonMigrationPayload &migration = message.migration;
-        const float health = dragon_.dragon().health;
-        const auto kind = static_cast<world::DragonKind>(migration.dragon_type);
-        const bool was_local_owner = local_owns_dragon_brain();
-        if (message.target_gid == online_local_player_gid() || was_local_owner)
-            queued_dragon_fireball_ids_.clear();
-        const world::DragonBasis basis =
-            world::dragon_attitude_basis(migration.yaw, migration.pitch, migration.roll);
-        const world::Vec3 position{migration.position.x, migration.position.y,
-                                   migration.position.z};
-        const world::Vec3 velocity{basis.forward.x * migration.velocity,
-                                   basis.forward.y * migration.velocity,
-                                   basis.forward.z * migration.velocity};
+        // HandleMigrateDragonMessage touches exactly one thing: the migration
+        // target gains a DragonEntity (InitAfterHostChange). Every peer's
+        // DragonClientEntity, the old and new owner's included, keeps flying
+        // its buffered waypoints; nobody resets or re-seeds a replica.
+        if (dragon_.network_owner())
+            dragon_.end_network_ownership();
         if (message.target_gid == online_local_player_gid())
         {
-            dragon_.install_replica(kind, health);
-            dragon_.reset_network_replica(position, velocity, migration.next_dragon_time,
-                                          migration.target_roll, migration.animation);
-            dragon_.promote_network_replica_to_brain();
+            world::DragonMigrationState state;
+            state.next_dragon_time = migration.next_dragon_time;
+            state.roll = migration.roll;
+            state.target_roll = migration.target_roll;
+            state.pitch = migration.pitch;
+            state.target_pitch = migration.target_pitch;
+            state.yaw = migration.yaw;
+            state.target_yaw = migration.target_yaw;
+            state.velocity = migration.velocity;
+            state.target_velocity = migration.target_velocity;
+            state.default_heading = migration.default_heading;
+            state.next_update_time = migration.next_update_time;
+            state.next_fireball_index = migration.next_fireball_index;
+            state.position = {migration.position.x, migration.position.y, migration.position.z};
+            state.target = {migration.target.x, migration.target.y, migration.target.z};
+            // InitAfterHostChange: Target = LocalPlayer, TravelTarget = where
+            // the old owner last saw us, straight into the next attack type.
+            DragonSession session{*this, enemy_horde_.rng()};
+            dragon_.adopt_network_ownership(online_local_player_gid(), state, session);
         }
-        else if (was_local_owner)
-        {
-            dragon_.install_replica(kind, health);
-            dragon_.reset_network_replica(position, velocity, migration.next_dragon_time,
-                                          migration.target_roll, migration.animation);
-        }
-        else
-            dragon_.apply_network_waypoint(position, velocity, migration.next_dragon_time,
-                                           migration.target_roll, migration.animation);
         dragon_owner_gid_ = message.target_gid;
         dragon_for_biome_ = migration.for_biome;
-        dragon_network_time_ = migration.next_dragon_time;
-        dragon_update_timer_ =
-            std::max(0.0F, migration.next_update_time - migration.next_dragon_time);
         dragon_last_host_time_ = migration.next_dragon_time;
         dragon_updates_sent_ = 0;
         next_dragon_fireball_index_ =
@@ -4912,34 +7186,37 @@ class Application::Impl final
         dragon_network_sound_ = 0U;
     }
 
-    [[nodiscard]] bool publish_dragon_migration(std::uint8_t target_gid,
-                                                world::Vec3 target_position)
+    [[nodiscard]] bool publish_dragon_migration(std::uint8_t target_gid)
     {
         if (!dragon_.active() || !local_owns_dragon_brain() || !dragon_owner_gid_.has_value() ||
             target_gid == *dragon_owner_gid_)
             return false;
-        const world::Dragon &dragon = dragon_.dragon();
+        if (!dragon_.network_owner())
+            return false;
+        // DragonEntity.DoMigration, field for field (world/dragon_brain.hpp).
+        const world::DragonMigrationState state = dragon_.migration_state();
         net::MigrateDragonPayload message;
         net::DragonMigrationPayload &migration = message.migration;
-        migration.next_dragon_time = dragon_network_time_ + 0.4F;
-        migration.roll = dragon.roll;
-        migration.target_roll = dragon.roll;
-        migration.pitch = dragon.pitch;
-        migration.target_pitch = dragon.pitch;
-        migration.yaw = dragon.yaw;
-        migration.target_yaw = dragon.yaw;
-        migration.velocity = dragon.velocity;
-        migration.target_velocity = dragon.velocity;
-        migration.default_heading = dragon.yaw;
+        migration.next_dragon_time = state.next_dragon_time;
+        migration.roll = state.roll;
+        migration.target_roll = state.target_roll;
+        migration.pitch = state.pitch;
+        migration.target_pitch = state.target_pitch;
+        migration.yaw = state.yaw;
+        migration.target_yaw = state.target_yaw;
+        migration.velocity = state.velocity;
+        migration.target_velocity = state.target_velocity;
+        migration.default_heading = state.default_heading;
+        // DoMigration never assigns FlapDebt or Animation: a stock owner
+        // always sends 0 and SOAR, and so must we.
         migration.flap_debt = 0.0F;
-        migration.next_fireball_index = static_cast<std::int32_t>(next_dragon_fireball_index_);
+        migration.animation = 0U;
+        migration.next_fireball_index = state.next_fireball_index;
         migration.for_biome = dragon_for_biome_;
-        migration.next_update_time =
-            dragon_network_time_ + std::max(0.0F, dragon_update_timer_) + 0.4F;
-        migration.animation = dragon_animation(dragon);
-        migration.dragon_type = static_cast<std::uint8_t>(dragon.kind);
-        migration.position = {dragon.position.x, dragon.position.y, dragon.position.z};
-        migration.target = {target_position.x, target_position.y, target_position.z};
+        migration.next_update_time = state.next_update_time;
+        migration.dragon_type = static_cast<std::uint8_t>(dragon_.dragon().kind);
+        migration.position = {state.position.x, state.position.y, state.position.z};
+        migration.target = {state.target.x, state.target.y, state.target.z};
         message.target_gid = target_gid;
         net::PayloadError payload_error{};
         const auto payload = net::encode_migrate_dragon_payload(message, payload_error);
@@ -4953,51 +7230,6 @@ class Application::Impl final
         }
         install_dragon_migration(message);
         return true;
-    }
-
-    [[nodiscard]] bool consider_dragon_migration(float fixed_delta)
-    {
-        if (!online_gameplay_active() || !local_owns_dragon_brain() || !dragon_.active())
-            return false;
-        dragon_migration_scan_timer_ -= fixed_delta;
-        if (dragon_migration_scan_timer_ > 0.0F)
-            return false;
-        dragon_migration_scan_timer_ = 0.5F;
-        const world::Vec3 local = player_.state().position;
-        const world::Dragon &dragon = dragon_.dragon();
-        const world::DragonBasis basis =
-            world::dragon_attitude_basis(dragon.yaw, dragon.pitch, dragon.roll);
-        const float local_dragon_distance =
-            std::hypot(local.x - dragon.position.x, local.z - dragon.position.z);
-        std::optional<std::pair<std::uint8_t, world::Vec3>> best;
-        float best_distance = local_dragon_distance;
-        for (const auto &[gid, remote] : online_remote_players_)
-        {
-            if (!remote.has_update || remote.state.dead || elapsed_ - remote.last_update > 10.0F)
-                continue;
-            const world::Vec3 target = remote.state.position;
-            if (std::hypot(target.x - local.x, target.z - local.z) <= 150.0F)
-                continue;
-            world::Vec3 toward{target.x - dragon.position.x, target.y + 1.5F - dragon.position.y,
-                               target.z - dragon.position.z};
-            const float distance =
-                std::sqrt(toward.x * toward.x + toward.y * toward.y + toward.z * toward.z);
-            if (distance <= 0.001F || distance >= 300.0F || distance >= best_distance)
-                continue;
-            toward.x /= distance;
-            toward.y /= distance;
-            toward.z /= distance;
-            if (toward.x * basis.forward.x + toward.y * basis.forward.y +
-                    toward.z * basis.forward.z <=
-                0.17F)
-                continue;
-            if (world::PlayerSimulation::raycast_blocking(world_preview_->region(), dragon.position,
-                                                          toward, std::max(0.0F, distance - 0.75F)))
-                continue;
-            best = std::pair{gid, target};
-            best_distance = distance;
-        }
-        return best.has_value() && publish_dragon_migration(best->first, best->second);
     }
 
     void publish_remove_dragon()
@@ -5028,11 +7260,23 @@ class Application::Impl final
                 !net::decode_request_dragon_payload(decoded.payload, request, payload_error) ||
                 request.dragon_type >= static_cast<std::uint8_t>(world::DragonKind::count))
                 return false;
+            // mod-ai: a server mod switched dragons off for the session; a
+            // client that asks anyway is not answered.
+            const auto requester = online_remote_players_.find(sender_gid);
+            if (requester != online_remote_players_.end() && requester->second.has_update &&
+                mod_ai_dragon_refused(requester->second.state.position))
+                return true;
             if (!dragon_pending_ && !dragon_.active())
             {
                 dragon_pending_ = true;
-                if (!publish_spawn_dragon(static_cast<world::DragonKind>(request.dragon_type),
-                                          sender_gid, request.for_biome, -1.0F))
+                auto kind = static_cast<world::DragonKind>(request.dragon_type);
+                if (game_mode_ != GameMode::dragon_endurance)
+                    if (const auto remote = online_remote_players_.find(sender_gid);
+                        remote != online_remote_players_.end() && remote->second.has_update)
+                        kind = world::dragon_for_distance(mod_ai_tier_distance( // mod-ai: tier distance
+                            std::hypot(remote->second.state.position.x, remote->second.state.position.z),
+                            remote->second.state.position));
+                if (!publish_spawn_dragon(kind, sender_gid, request.for_biome, -1.0F))
                 {
                     dragon_pending_ = false;
                     return false;
@@ -5053,21 +7297,27 @@ class Application::Impl final
             if (!net::decode_existing_dragon_payload(decoded.payload, existing, payload_error) ||
                 existing.dragon_type >= static_cast<std::uint8_t>(world::DragonKind::count))
                 return false;
-            if (receiving_as_host)
+            // A copy naming somebody else is only relayed. One naming this
+            // peer is applied whoever we are: retail's handler has no host case.
+            if (receiving_as_host && existing.new_client_gid != online_local_player_gid())
                 return dragon_owner_gid_.has_value() && *dragon_owner_gid_ == sender_gid &&
-                       existing.new_client_gid != 0U &&
                        online_remote_players_.contains(existing.new_client_gid);
             if (existing.new_client_gid != online_local_player_gid())
                 return true;
             if (dragon_owner_gid_.has_value() && *dragon_owner_gid_ != sender_gid)
                 return true; // A stale late-join response from the previous owner.
-            dragon_.install_replica(static_cast<world::DragonKind>(existing.dragon_type),
-                                    existing.current_health);
+            // HandleExistingDragonMessage: a brand-new DragonClientEntity with
+            // the owner's health, whether or not this peer already had one.
+            const auto existing_kind = static_cast<world::DragonKind>(existing.dragon_type);
+            dragon_.install_replica(existing_kind, existing.current_health);
             queued_dragon_fireball_ids_.clear();
             dragon_owner_gid_ = sender_gid;
             dragon_for_biome_ = existing.for_biome;
             dragon_pending_ = false;
             dragon_last_host_time_ = -1.0F;
+            dragon_kill_announced_ = false;
+            dragon_schedule_.dragon_installed(existing_kind, existing.for_biome,
+                                              player_.state().position, enemy_horde_.rng());
             return true;
         }
         if (decoded.message->name == "MigrateDragonMessage")
@@ -5077,8 +7327,11 @@ class Application::Impl final
             net::MigrateDragonPayload migration;
             if (!net::decode_migrate_dragon_payload(decoded.payload, migration, payload_error))
                 return false;
+            // HandleMigrateDragonMessage only acts when this peer still has a
+            // dragon client; with none there is nothing to hand over and the
+            // relay must continue regardless.
             if (!dragon_.active() || !dragon_owner_gid_.has_value())
-                return !receiving_as_host;
+                return true;
             if (*dragon_owner_gid_ != sender_gid)
                 return !receiving_as_host;
             if (!valid_dragon_migration(migration) ||
@@ -5098,19 +7351,29 @@ class Application::Impl final
                 return false;
             if (dragon_kill_announced_)
                 return true;
+            // HandleKillDragonMessage returns quietly when this peer has no
+            // dragon client left. Nothing to apply, nothing to complain about,
+            // and the host still has to pass the kill on.
             if (!dragon_.active())
-                return !receiving_as_host;
+                return true;
             const world::Vec3 location{kill.location.x, kill.location.y, kill.location.z};
             const world::Vec3 dragon_position = dragon_.dragon().position;
             const float dx = location.x - dragon_position.x;
             const float dy = location.y - dragon_position.y;
             const float dz = location.z - dragon_position.z;
-            const bool known_killer = !receiving_as_host || kill.killer_gid == 0U ||
-                                      online_remote_players_.contains(kill.killer_gid);
-            if (!known_killer || dx * dx + dy * dy + dz * dz > 2'500.0F ||
-                (receiving_as_host && dragon_.dragon().health > 0.0F))
+            // DragonClientEntity.Health is per-peer: every peer traces its own
+            // and every remote peer's shots against its own copy of the dragon,
+            // and whichever copy reaches zero first sends the kill. Because a
+            // non-owner presents an extrapolated replica, two peers legitimately
+            // disagree about whether a given bullet connected, so the host's own
+            // health is no evidence at all. Refusing the message on that basis
+            // also suppressed the relay, leaving the dragon dead for its killer
+            // and alive for everyone else.
+            if (!online_gid_is_known(kill.killer_gid) || dx * dx + dy * dy + dz * dz > 2'500.0F)
                 return false;
             dragon_loot_pending_ = kill.killer_gid == online_local_player_gid();
+            progress_.record_dragon_kill(game_mode_, static_cast<std::size_t>(dragon_.dragon().kind),
+                                        kill.killer_gid == online_local_player_gid(), weapon);
             dragon_.damage(std::max(1.0F, dragon_.dragon().health + 1.0F));
             queued_dragon_fireball_ids_.clear();
             dragon_kill_announced_ = true;
@@ -5124,10 +7387,17 @@ class Application::Impl final
                 return true;
             if (!decoded.payload.empty())
                 return false;
-            if (!dragon_.active() || !dragon_owner_gid_.has_value() ||
-                *dragon_owner_gid_ != sender_gid)
-                return !receiving_as_host;
+            // No dragon here to remove: accept and relay, exactly as the
+            // original's no-op handler does.
+            if (!dragon_.active())
+                return true;
+            // HandleRemoveDragonMessage has no sender check, and it cannot have
+            // one: DragonClientEntity's ten-second watchdog makes ANY starved
+            // watcher send this. Refusing a non-owner left that stock peer
+            // without a dragon (it obeys its own echo) while everyone else kept
+            // flying one it would never see again.
             dragon_.deactivate();
+            note_dragon_removed();
             queued_dragon_fireball_ids_.clear();
             dragon_owner_gid_.reset();
             dragon_pending_ = false;
@@ -5142,8 +7412,14 @@ class Application::Impl final
             if (!net::decode_update_dragon_payload(decoded.payload, waypoint, payload_error) ||
                 !valid_network_dragon_waypoint(waypoint))
                 return false;
-            if (!dragon_.active() || !dragon_owner_gid_.has_value() ||
-                *dragon_owner_gid_ != sender_gid)
+            // `_dragonClient != null` is the original's only precondition.
+            if (!dragon_.active())
+                return true;
+            // Our own waypoint coming back through the session: DragonFlight
+            // already fed it to the local replica when it was published.
+            if (dragon_.network_owner() && sender_gid == online_local_player_gid())
+                return true;
+            if (!dragon_owner_gid_.has_value() || *dragon_owner_gid_ != sender_gid)
                 return !receiving_as_host;
             return apply_network_dragon_waypoint(sender_gid, waypoint);
         }
@@ -5155,19 +7431,24 @@ class Application::Impl final
             if (!net::decode_dragon_attack_payload(decoded.payload, attack, payload_error) ||
                 !valid_network_dragon_waypoint(attack.waypoint))
                 return false;
-            if (!dragon_.active() || !dragon_owner_gid_.has_value() ||
-                *dragon_owner_gid_ != sender_gid)
+            if (!dragon_.active())
+                return true;
+            if (dragon_.network_owner() && sender_gid == online_local_player_gid())
+                return true;
+            if (!dragon_owner_gid_.has_value() || *dragon_owner_gid_ != sender_gid)
                 return !receiving_as_host;
-            return apply_network_dragon_attack(sender_gid, attack);
+            // A duplicated attack is idempotent rather than hostile: the queued
+            // fireball index already covers it, so keep relaying.
+            return apply_network_dragon_attack(sender_gid, attack) ||
+                   queued_dragon_fireball_ids_.contains(attack.fireball_index);
         }
         if (decoded.message->name == "DetonateFireballMessage")
             return apply_online_fireball_detonation(sender_gid, decoded.payload, receiving_as_host);
         return true;
     }
 
-    // The original timed-dragon schedule: staying inside a thousand-cell box counts
-    // down to the next escalating dragon (fire, forest, sand, ice, undead); leaving
-    // the box resets the ladder.
+    // Retain the original timed encounter cadence, but select ambient dragons
+    // from the current terrain band. Endurance keeps its escalating wave ladder.
     void update_dragon(float fixed_delta)
     {
         const world::PlayerState &player = player_.state();
@@ -5200,70 +7481,35 @@ class Application::Impl final
             update_fireballs(fixed_delta);
             return;
         }
-        // The original distance ladder: crossing 100/500/1000/2600/4000 blocks
-        // from the start summons that biome's dragon once (fire, forest, sand,
-        // ice, undead). A threshold crossed while another dragon flies is
-        // consumed without a spawn, exactly like AskForDragon's no-op path.
-        static constexpr std::array<float, 5> dragon_distances{100.0F, 500.0F, 1000.0F, 2600.0F,
-                                                               4000.0F};
-        const float geometric_distance = std::hypot(player.position.x, player.position.z);
-        // DistanceTrigger's teleport guard: a >10-block jump in a single frame
-        // consumes any crossed threshold WITHOUT a spawn — this is what kept
-        // the original from summoning the wrong biome's dragon after fast
-        // travel (e.g. an ice dragon over the desert).
-        const bool teleport_jump = last_dragon_distance_ >= 0.0F &&
-                                   std::abs(geometric_distance - last_dragon_distance_) > 10.0F;
+        // Keep a due encounter pending until admission actually succeeds. A busy
+        // dragon, loading frame, teleport or cooldown must not consume the boss.
+        // mod-ai: the tier distance a server mod may remap.
+        const float geometric_distance =
+            mod_ai_tier_distance(std::hypot(player.position.x, player.position.z), player.position);
         last_dragon_distance_ = geometric_distance;
         const bool may_schedule_distance_dragon =
             !online_gameplay_active() || (online_host_ != nullptr && online_host_->running());
-        while (may_schedule_distance_dragon &&
-               dragon_distance_index_ < static_cast<int>(dragon_distances.size()) &&
-               geometric_distance >
-                   dragon_distances[static_cast<std::size_t>(dragon_distance_index_)])
+        dragon_spawn_retry_ = std::max(0.0F, dragon_spawn_retry_ - fixed_delta);
+        const auto encounter = world::pending_distance_dragon(geometric_distance,
+                                                               dragon_distance_index_);
+        if (may_schedule_distance_dragon && encounter.has_value() && dragon_spawn_retry_ <= 0.0F &&
+            !dragon_.active() && dragon_schedule_.allowed() &&
+            request_dragon_spawn(encounter->kind, true))
         {
-            world::DragonKind kind = static_cast<world::DragonKind>(dragon_distance_index_);
-            // Beyond 3600 blocks every dragon is the undead dragon.
-            if (geometric_distance > 3600.0F)
-                kind = world::DragonKind::undead;
-            if (!teleport_jump && !dragon_.active())
-            {
-                if (request_dragon_spawn(kind, true))
-                    toast("DRAGON INBOUND", dragon_kind_name(kind));
-                ++dragon_distance_index_;
-                break;
-            }
-            ++dragon_distance_index_;
-            if (!teleport_jump)
-                break;
+            dragon_distance_index_ = encounter->next_index;
+            toast("DRAGON INBOUND", dragon_kind_name(encounter->kind));
         }
-        const bool outside_box = !dragon_box_valid_ ||
-                                 std::abs(player.position.x - dragon_box_center_x_) > 500.0F ||
-                                 std::abs(player.position.z - dragon_box_center_z_) > 500.0F;
-        if (outside_box)
-        {
-            dragon_box_valid_ = true;
-            dragon_box_center_x_ = player.position.x;
-            dragon_box_center_z_ = player.position.z;
-            next_timed_dragon_ = world::DragonKind::fire;
-            next_dragon_seconds_ = world::dragon_schedule_minutes(next_timed_dragon_) * 60.0F +
-                                   16.0F * 60.0F * (rng.next01() * 0.5F - 0.25F);
-        }
-        else if (!dragon_.active())
-        {
-            next_dragon_seconds_ -= fixed_delta;
-            if (next_dragon_seconds_ <= 0.0F)
-            {
-                const world::DragonKind timed_kind =
-                    geometric_distance > 3600.0F ? world::DragonKind::undead : next_timed_dragon_;
-                if (request_dragon_spawn(timed_kind, false))
-                    toast("DRAGON INBOUND", dragon_kind_name(timed_kind));
-                next_timed_dragon_ = static_cast<world::DragonKind>(
-                    std::min<int>(static_cast<int>(next_timed_dragon_) + 1,
-                                  static_cast<int>(world::DragonKind::undead)));
-                next_dragon_seconds_ = world::dragon_schedule_minutes(next_timed_dragon_) * 60.0F +
-                                       16.0F * 60.0F * (rng.next01() * 0.5F - 0.25F);
-            }
-        }
+        if (encounter.has_value() && dragon_spawn_retry_ <= 0.0F)
+            dragon_spawn_retry_ = 1.0F;
+        // EnemyManager.CheckDragonBox: EVERY peer runs the timed ladder, host
+        // or not (only the distance ladder above is the host's alone). The
+        // host turns the result into SpawnDragonMessage naming itself, any
+        // other peer into RequestDragonMessage, which the host answers with a
+        // SpawnDragonMessage naming the requester.
+        if (const auto timed = dragon_schedule_.check_box(player.position, fixed_delta,
+                                                          dragon_.active(), rng);
+            timed.has_value() && request_dragon_spawn(world::dragon_for_distance(geometric_distance), false))
+            toast("DRAGON INBOUND", dragon_kind_name(world::dragon_for_distance(geometric_distance)));
         update_active_dragon(fixed_delta, rng);
         update_fireballs(fixed_delta);
     }
@@ -5272,7 +7518,7 @@ class Application::Impl final
     {
         if (!dragon_.active())
             return false;
-        const world::Vec3 origin = dragon_.dragon().position;
+        const world::Vec3 origin = dragon_.brain().position;
         const world::PlayerState &player = player_.state();
         const std::array targets{
             world::Vec3{player.position.x, player.position.y + world::PlayerSimulation::eye_height,
@@ -5299,19 +7545,126 @@ class Application::Impl final
         return false;
     }
 
+    // What the retail DragonEntity (world/dragon_brain.hpp) reads from the
+    // session and from BlockTerrain while this peer owns the dragon: every
+    // living player for FindBestTarget, Target.ValidLivingGamer and
+    // WorldPosition, CanSeePosition's terrain trace, RegionIsLoaded and
+    // MathTools.Rnd. The decisions themselves are all in the brain.
+    class DragonSession final : public world::DragonBrainSession
+    {
+      public:
+        DragonSession(Impl &app, world::EnemyRng &rng) noexcept : app_{app}, rng_{rng}
+        {
+        }
+        std::vector<world::DragonTargetCandidate> players(world::Vec3 eye) override
+        {
+            std::vector<world::DragonTargetCandidate> result;
+            const auto consider = [&](std::uint8_t gid) {
+                const auto position = living_position(gid);
+                if (!position.has_value())
+                    return;
+                world::DragonTargetCandidate candidate;
+                candidate.gid = gid;
+                candidate.position = *position;
+                const world::Vec3 head{position->x, position->y + 1.5F, position->z};
+                candidate.region_loaded = region_loaded(head);
+                // BlockTerrain.GetSimpleSunlightAtPoint: the cell's stored
+                // four-bit sunlight / 15, from the same flood the mesher uses.
+                candidate.sunlight = world::simple_sunlight_at(
+                    app_.world_preview_->region(), static_cast<int>(std::floor(head.x)),
+                    static_cast<int>(std::floor(head.y)), static_cast<int>(std::floor(head.z)));
+                if (position->y <= -30.0F && app_.cavern_dragon_altitude_.has_value())
+                    candidate.sunlight = 1.0F;
+                candidate.line_of_sight = candidate.region_loaded && can_see(eye, head);
+                result.push_back(candidate);
+            };
+            consider(local_gid());
+            for (const auto &[gid, remote] : app_.online_remote_players_)
+                consider(gid);
+            return result;
+        }
+        std::optional<world::Vec3> living_position(std::uint8_t gid) override
+        {
+            if (gid == local_gid())
+                return app_.player_life_ == PlayerLife::alive
+                           ? std::optional{app_.player_.state().position}
+                           : std::nullopt;
+            const auto remote = app_.online_remote_players_.find(gid);
+            if (remote == app_.online_remote_players_.end() || !remote->second.has_update ||
+                remote->second.state.dead)
+                return std::nullopt;
+            return remote->second.state.position;
+        }
+        bool can_see(world::Vec3 eye, world::Vec3 point) override
+        {
+            world::Vec3 direction{point.x - eye.x, point.y - eye.y, point.z - eye.z};
+            const float distance = std::sqrt(direction.x * direction.x +
+                                             direction.y * direction.y +
+                                             direction.z * direction.z);
+            if (distance <= 0.001F)
+                return true;
+            direction = {direction.x / distance, direction.y / distance, direction.z / distance};
+            return !world::PlayerSimulation::raycast_blocking(app_.world_preview_->region(), eye,
+                                                              direction, distance);
+        }
+        bool region_loaded(world::Vec3 point) override
+        {
+            return app_.world_preview_->region().contains(
+                static_cast<int>(std::floor(point.x)),
+                std::clamp(static_cast<int>(std::floor(point.y)), -63, 63),
+                static_cast<int>(std::floor(point.z)));
+        }
+        std::uint8_t local_gid() override
+        {
+            return app_.online_local_player_gid();
+        }
+        bool local_valid() override
+        {
+            return true;
+        }
+        world::Vec3 local_position() override
+        {
+            return app_.player_.state().position;
+        }
+        float flight_altitude(world::Vec3, float requested) override
+        {
+            return app_.cavern_dragon_altitude_.value_or(requested);
+        }
+        float random_float() override
+        {
+            return rng_.next01();
+        }
+        int random_int(int minimum, int maximum_exclusive) override
+        {
+            return rng_.next_int(minimum, maximum_exclusive);
+        }
+
+      private:
+        Impl &app_;
+        world::EnemyRng &rng_;
+    };
+
     void update_active_dragon(float fixed_delta, world::EnemyRng &rng)
     {
         if (!dragon_.active())
             return;
         const world::PlayerState &player = player_.state();
+        // 1.6.3.8 and 1.9.9.8 ship dragon clips of different lengths, and the
+        // brain's animation changes and the death sequence both wait on them.
+        dragon_.set_modern_content(inventory_.profile() == InventoryProfile::modern);
+        // What a dead dragon falls onto (DragonClientEntity.UpdateWhileDead).
+        const world::WorldRegion *const terrain =
+            world_preview_ != nullptr ? &world_preview_->region() : nullptr;
         if (online_gameplay_active() && !local_owns_dragon_brain())
         {
             if (dragon_.dragon().state == world::DragonState::dying)
             {
-                const world::DragonEvents death = dragon_.update(player, fixed_delta, rng, false);
+                const world::DragonEvents death =
+                    dragon_.update(player, fixed_delta, rng, false, terrain);
                 if (death.died)
                 {
-                    spawn_pending_dragon_pickups();
+                    spawn_pending_dragon_pickups(death.loot_position);
+                    note_dragon_removed();
                     toast("DRAGON SLAIN", dragon_kind_name(dragon_.dragon().kind));
                     caption("[ DRAGON DESTROYED ]", 2.0F);
                     if (game_mode_ == GameMode::dragon_endurance)
@@ -5329,20 +7682,11 @@ class Application::Impl final
             }
             return;
         }
-        if (consider_dragon_migration(fixed_delta))
-            return;
-        dragon_network_time_ += fixed_delta;
-        // DragonEntity.UpdateSounds: a scream 5 s after spawn, then every
-        // 6-14 s for the dragon's whole life; WingFlap every second while
-        // flapping (never while gliding).
-        dragon_cry_timer_ -= fixed_delta;
-        if (dragon_cry_timer_ <= 0.0F)
-        {
-            play_positional("DragonScream", dragon_.dragon().position);
-            if (online_gameplay_active())
-                dragon_network_sound_ = 1U;
-            dragon_cry_timer_ = 6.0F + rng.next01() * 8.0F;
-        }
+        // An online owner runs the hidden DragonEntity and presents, shoots at
+        // and fires from the same DragonClientEntity replica every other peer
+        // has, fed by its own echoed waypoints (world::DragonFlight).
+        const bool network_owner = dragon_.network_owner();
+        // WingFlap every second while the presented dragon is flapping.
         if (dragon_.dragon().clip == "fly_forward")
         {
             dragon_flap_timer_ -= fixed_delta;
@@ -5352,21 +7696,57 @@ class Application::Impl final
                 dragon_flap_timer_ = 1.0F;
             }
         }
-        const world::DragonEvents events =
-            dragon_.update(player, fixed_delta, rng, dragon_can_see_player());
-        bool sent_attack{};
+        world::DragonEvents events;
+        if (network_owner && dragon_.dragon().state != world::DragonState::dying)
+        {
+            // One DragonEntity.Update: targets among every player in the
+            // session, the cry timer, shots at the last SEEN position, and at
+            // most one UpdateDragonMessage or DragonAttackMessage.
+            DragonSession session{*this, rng};
+            events = dragon_.update_owner(session, fixed_delta);
+            // DoMigration: SearchForNewTarget chose somebody more than 150
+            // units from this peer; the dragon is theirs from here on.
+            if (events.migrate_to.has_value() && publish_dragon_migration(*events.migrate_to))
+                return;
+            for (const world::DragonOwnerMessage &message : dragon_.take_owner_messages())
+            {
+                if (message.attack)
+                    publish_dragon_attack(message);
+                else
+                    publish_dragon_update(message);
+            }
+            next_dragon_fireball_index_ = dragon_.next_fireball_index();
+            // EnemyManager.RemoveDragon(): nobody within 937.5 units, or the
+            // default flight reached the end of its heading.
+            if (events.remove_requested)
+            {
+                publish_remove_dragon();
+                dragon_.deactivate();
+                note_dragon_removed();
+                toast("DRAGON DEPARTS", "");
+                return;
+            }
+            // Fireballs (and the cry) come out of the replica when it reaches
+            // the echoed attack waypoint, exactly as on every stock peer.
+            process_network_dragon_replica_events();
+        }
+        else
+        {
+            // The legacy presented-brain path (a dying dragon, and a dragon
+            // nobody put under network ownership).
+            dragon_cry_timer_ -= fixed_delta;
+            if (dragon_cry_timer_ <= 0.0F && !network_owner)
+            {
+                play_positional("DragonScream", dragon_.dragon().position);
+                dragon_cry_timer_ = 6.0F + rng.next01() * 8.0F;
+            }
+            events = dragon_.update(player, fixed_delta, rng, dragon_can_see_player(), terrain);
+        }
+        // Offline there is no session to echo through: the brain is presented
+        // and fires directly.
         for (std::size_t index = 0; index < events.fireball_origins.size(); ++index)
         {
-            int fireball_id = next_fireball_id_++;
-            if (online_gameplay_active())
-            {
-                const std::uint32_t encoded =
-                    (static_cast<std::uint32_t>(online_local_player_gid()) << 23U) |
-                    (static_cast<std::uint32_t>(next_dragon_fireball_index_++) & 0x7FFFFFU);
-                fireball_id = static_cast<std::int32_t>(encoded);
-                publish_dragon_attack(player.position, fireball_id);
-                sent_attack = true;
-            }
+            const int fireball_id = next_fireball_id_++;
             fireballs_.push_back({events.fireball_origins[index], events.fireball_velocities[index],
                                   dragon_.dragon().kind, fireball_id, false, false,
                                   online_gameplay_active() ? online_local_player_gid() : 0U, true});
@@ -5375,18 +7755,10 @@ class Application::Impl final
                 dragon_.dragon().kind == world::DragonKind::ice ? "Iceball" : "Fireball",
                 events.fireball_origins[index], events.fireball_velocities[index]);
         }
-        if (online_gameplay_active() && dragon_.active())
-        {
-            dragon_update_timer_ -= fixed_delta;
-            if (!sent_attack && dragon_update_timer_ <= 0.0F)
-            {
-                publish_dragon_update();
-                dragon_update_timer_ += 0.2F;
-            }
-        }
         if (events.died)
         {
-            spawn_pending_dragon_pickups();
+            spawn_pending_dragon_pickups(events.loot_position);
+            note_dragon_removed();
             toast("DRAGON SLAIN", dragon_kind_name(dragon_.dragon().kind));
             caption("[ DRAGON DESTROYED ]", 2.0F);
             if (game_mode_ == GameMode::dragon_endurance)
@@ -5401,20 +7773,23 @@ class Application::Impl final
         {
             if (online_gameplay_active())
                 publish_remove_dragon();
-            toast("DRAGON DEPARTS", "It lost interest... for now.");
+            note_dragon_removed();
+            toast("DRAGON DEPARTS", "");
             if (game_mode_ == GameMode::dragon_endurance)
                 endurance_dragon_delay_ = 10.0F + rng.next01() * 20.0F;
         }
     }
 
-    void spawn_pending_dragon_pickups()
+    // EnemyManager.SpawnDragonPickups(location): the killer alone rolls the
+    // loot, where the corpse's body box came to rest (seven units behind it),
+    // not under the point in the sky where the dragon was killed.
+    void spawn_pending_dragon_pickups(world::Vec3 location)
     {
         if (!dragon_loot_pending_ || world_preview_ == nullptr)
             return;
         dragon_loot_pending_ = false;
-        const world::Vec3 body = dragon_.dragon().position;
-        const world::Vec3 pickup_position{body.x, body.y + 1.0F, body.z};
-        for (const world::EnemyLoot loot : world::dragon_loot(body, enemy_horde_.rng()))
+        const world::Vec3 pickup_position{location.x, location.y + 1.0F, location.z};
+        for (const world::EnemyLoot loot : world::dragon_loot(location, enemy_horde_.rng()))
         {
             const InventoryStack stack{static_cast<InventoryItemId>(loot.item_id), loot.item_count};
             world_preview_->spawn_dropped_stack_at(stack, pickup_position, 3.0F);
@@ -5592,42 +7967,39 @@ class Application::Impl final
         net::PayloadError payload_error{};
         if (!net::decode_detonate_fireball_payload(payload, message, payload_error))
             return false;
-        const std::uint8_t encoded_owner = static_cast<std::uint8_t>(
-            (static_cast<std::uint32_t>(message.fireball_index) >> 23U) & 0xFFU);
-        if (encoded_owner != sender_gid || message.location.x < -1'000'000.0F ||
-            message.location.x > 1'000'000.0F || message.location.y < -128.0F ||
-            message.location.y > 128.0F || message.location.z < -1'000'000.0F ||
-            message.location.z > 1'000'000.0F)
-            return false;
         const bool already_applied =
             std::ranges::find(applied_fireball_detonations_, message.fireball_index) !=
             applied_fireball_detonations_.end();
-        if (already_applied)
-            return !receiving_as_host;
-
         const auto fireball = std::ranges::find_if(fireballs_, [&](const Fireball &candidate) {
             return candidate.id == message.fireball_index;
         });
-        if (fireball == fireballs_.end())
-            return !receiving_as_host;
-        else
-        {
-            const world::Vec3 impact{message.location.x, message.location.y, message.location.z};
-            const float dx = impact.x - fireball->position.x;
-            const float dy = impact.y - fireball->position.y;
-            const float dz = impact.z - fireball->position.z;
-            const float maximum_error =
-                world::dragon_stats(fireball->kind).fireball_velocity * 2.0F + 5.0F;
-            if (fireball->owner_gid != sender_gid ||
-                static_cast<std::uint8_t>(fireball->kind) != message.dragon_type ||
-                dx * dx + dy * dy + dz * dz > maximum_error * maximum_error)
-                return false;
-        }
-
         const world::Vec3 impact{message.location.x, message.location.y, message.location.z};
-        const auto kind = static_cast<world::DragonKind>(message.dragon_type);
-        if (message.blocks_to_remove != fireball_blocks_to_remove(impact, kind))
+        std::optional<world::DragonDetonationFireball> local_fireball;
+        if (fireball != fireballs_.end())
+            local_fireball = world::DragonDetonationFireball{fireball->owner_gid, fireball->kind,
+                                                             fireball->position};
+        // HandleDetonateFireballMessage checks nothing. What we keep on top of
+        // it is world::dragon_assess_detonation (tests/test_dragon_parity.cpp):
+        // the index must carry the sender's id, a fireball we have must be the
+        // sender's and near the impact, one we never saw is only believed from
+        // the dragon's current owner, and the block list -- which is the
+        // OWNER's to decide, built from its own loaded terrain -- may not
+        // reach past the blast. Demanding that our streamed region reproduce
+        // that list refused (and, on the host, never relayed) every blast
+        // outside the terrain this peer had loaded.
+        switch (world::dragon_assess_detonation(
+            sender_gid, message.fireball_index, message.dragon_type, impact,
+            message.blocks_to_remove, already_applied,
+            local_fireball.has_value() ? &*local_fireball : nullptr, dragon_owner_gid_))
+        {
+        case world::DragonDetonationVerdict::reject:
             return false;
+        case world::DragonDetonationVerdict::ignore:
+            return !receiving_as_host;
+        case world::DragonDetonationVerdict::apply:
+            break;
+        }
+        const auto kind = static_cast<world::DragonKind>(message.dragon_type);
         if (receiving_as_host && !message.blocks_to_remove.empty())
         {
             const world::BlockType replacement =
@@ -5675,9 +8047,14 @@ class Application::Impl final
             if (damage > 0.0F)
             {
                 caption("[ FIREBALL HIT ]", 1.0F);
-                apply_player_damage(damage, impact_position);
+                authority_cause_hint_ = net::HarmCause::fireball; // (Authority) the host's to decide
+                apply_player_damage(damage, impact_position, modding::gameplay::DamageCause::enemy);
+                authority_cause_hint_.reset();
             }
         }
+        // (Authority) The same blast against every remote player, on a host
+        // that decides their health.
+        authority_fireball(impact_position, kind);
         play_positional(kind == world::DragonKind::ice ? "Freeze" : "Explosion", impact_position);
         std::vector<std::array<int, 3>> changed;
         changed.reserve(message.blocks_to_remove.size());
@@ -5755,7 +8132,8 @@ class Application::Impl final
         // ExplosiveTypes.Rocket contract: kill range 3, player damage range 6,
         // enemy range 12, direct dragon impact 200, and a one-cell block cube.
         play_positional("Explosion", impact_position);
-        world_preview_->spawn_fireball_explosion(impact_position, false, !hit_dragon);
+        world_preview_->spawn_fireball_explosion(impact_position, false, !hit_dragon,
+                                                 ExplosionStyle::rocket);
         if (hit_dragon)
         {
             // TakeExplosiveDamage oddly multiplies a body impact by 2.5, while
@@ -5801,39 +8179,22 @@ class Application::Impl final
         {
             return;
         }
-        const world::BiomeAtmosphere atmosphere = world::biome_atmosphere(world_preview_->biome());
-        const float presence = 0.35F + 0.65F * sky.daylight;
-        const auto blend = [presence](world::SkyColor source, world::SkyColor target, float mix) {
-            const float amount = std::clamp(mix * presence, 0.0F, 1.0F);
-            return world::SkyColor{std::lerp(source.red, target.red, amount),
-                                   std::lerp(source.green, target.green, amount),
-                                   std::lerp(source.blue, target.blue, amount)};
-        };
-        sky.fog = blend(sky.fog, atmosphere.fog_target, atmosphere.fog_mix);
-        sky.horizon = blend(sky.horizon, atmosphere.horizon_target, atmosphere.horizon_mix);
-        sky.zenith = blend(sky.zenith, atmosphere.zenith_target, atmosphere.zenith_mix);
-        // Dense overcast removes hard noon energy, not all visibility. Keep a
-        // broad ambient base while muting the Classic biome's direct sun; low
-        // storminess in later biomes naturally restores the clear-day range.
-        const float storm =
-            std::clamp(atmosphere.storminess * (0.72F + 0.28F * sky.daylight), 0.0F, 1.0F);
-        const float direct_scale = std::lerp(1.0F, 0.68F, storm);
-        const float ambient_scale = std::lerp(1.0F, 0.90F, storm);
-        sky.direct = {sky.direct.red * direct_scale, sky.direct.green * direct_scale,
-                      sky.direct.blue * direct_scale};
-        sky.ambient = {sky.ambient.red * ambient_scale, sky.ambient.green * ambient_scale,
-                       sky.ambient.blue * ambient_scale};
+        const auto &position = player_.state().position;
+        world::apply_biome_atmosphere(sky, world::biome_atmosphere_at(position.x, position.z));
     }
 
     // GameScreen.Day: Classic preserves the shipped fade to black below Y=-24.
-    // Rebirth keeps the same transition depth but turns the deep layer into a
-    // readable volcanic atmosphere. These palette values are display-referred;
-    // the renderer converts them to linear before fogging the HDR world, so the
-    // red channel must carry enough range to survive that conversion. Actual
-    // nearby illumination remains driven by the occlusion-safe lava/emissive
-    // bake rather than this distant-air colour.
+    // Enhanced Hell has its own constant red illumination and lighter distant
+    // haze. The legacy diagnostic below retains the previous fog-only treatment.
     void apply_depth_fog(world::SkyState &sky) const
     {
+        if (settings_.presentation == PresentationProfile::rebirth &&
+            SDL_getenv("OPENMINERZ_LEGACY_HELL_ATMOSPHERE") == nullptr)
+        {
+            world::apply_hell_atmosphere(sky, player_.state().position.y +
+                                                  world::PlayerSimulation::eye_height);
+            return;
+        }
         const float depth_fog = std::clamp((player_.state().position.y + 32.0F) / 8.0F, 0.0F, 1.0F);
         if (settings_.presentation == PresentationProfile::rebirth)
         {
@@ -5843,22 +8204,9 @@ class Application::Impl final
                                        std::lerp(source.green, target.green, hell),
                                        std::lerp(source.blue, target.blue, hell)};
             };
-            const bool legacy_hell = SDL_getenv("OPENMINERZ_LEGACY_HELL_ATMOSPHERE") != nullptr;
-            sky.fog = blend(sky.fog, legacy_hell ? world::SkyColor{0.110F, 0.025F, 0.015F}
-                                                 : world::SkyColor{0.340F, 0.082F, 0.030F});
-            sky.horizon = blend(sky.horizon, legacy_hell ? world::SkyColor{0.080F, 0.018F, 0.012F}
-                                                         : world::SkyColor{0.275F, 0.058F, 0.022F});
-            sky.zenith = blend(sky.zenith, legacy_hell ? world::SkyColor{0.010F, 0.004F, 0.006F}
-                                                       : world::SkyColor{0.025F, 0.006F, 0.008F});
-            if (!legacy_hell)
-            {
-                // AmbientSun is already a linear irradiance value. Keep it low:
-                // it colours exposed cracks and the baked bounce source without
-                // filling sealed rock with an unshadowed global light.
-                sky.ambient = blend(sky.ambient, {0.045F, 0.010F, 0.004F});
-                sky.direct = blend(sky.direct, {0.012F, 0.003F, 0.001F});
-                sky.specular = blend(sky.specular, {0.030F, 0.006F, 0.002F});
-            }
+            sky.fog = blend(sky.fog, {0.110F, 0.025F, 0.015F});
+            sky.horizon = blend(sky.horizon, {0.080F, 0.018F, 0.012F});
+            sky.zenith = blend(sky.zenith, {0.010F, 0.004F, 0.006F});
         }
         else
         {
@@ -5880,6 +8228,29 @@ class Application::Impl final
     void play_positional(std::string_view cue, world::Vec3 position)
     {
         sound_bank_->play_cue_at(cue, position);
+    }
+
+    // Player.InContact of another player's avatar. The original gets it from
+    // the collision pass it runs on every Player between that player's
+    // updates; this client does not simulate remote bodies, so it asks the
+    // same question of the last reported position: is the 0.7-wide box
+    // standing on a block that stops players?
+    [[nodiscard]] bool remote_player_in_contact(world::Vec3 feet) const
+    {
+        if (world_preview_ == nullptr)
+            return false;
+        const auto &region = world_preview_->region();
+        const int y = static_cast<int>(std::floor(feet.y - 0.1F));
+        for (const float dx : {-0.3F, 0.3F})
+            for (const float dz : {-0.3F, 0.3F})
+            {
+                const int x = static_cast<int>(std::floor(feet.x + dx));
+                const int z = static_cast<int>(std::floor(feet.z + dz));
+                // (mod-liquid) A swimmer treads no ground.
+                if (region.contains(x, y, z) && world::cell_blocks_player(region, x, y, z))
+                    return true;
+            }
+        return false;
     }
 
     [[nodiscard]] bool player_inside_dry_crater() const noexcept
@@ -5933,13 +8304,100 @@ class Application::Impl final
         return crater_probe_dry_;
     }
 
+    // The session half of the retail-parity gate (retail_parity.hpp). A host
+    // or a joining/joined client is online from the moment its transport
+    // exists, even alone: a stock player may arrive at any time. The offline
+    // multiplayer-rendering diagnostic stays offline; nobody else simulates it.
+    [[nodiscard]] ParitySession parity_session() const noexcept
+    {
+        // The host flow counts from the moment the player commits to it: the
+        // world is loaded and simulated while the server is still starting.
+        if (online_host_ != nullptr || online_host_start_.valid() || hosting_flow_)
+            return ParitySession::hosting(online_host_ != nullptr &&
+                                          online_host_->all_peers_extension_capable());
+        // online_client_ alone proves nothing: the same Steam client serves
+        // lobby discovery in the frontend from launch, including while the
+        // player is in an offline world. A join is under way or complete when
+        // a stage is set, the bootstrap is running, or the session is joined.
+        if (online_join_stage_ != OnlineJoinStage::idle || online_bootstrap_client_ != nullptr ||
+            online_client_joined_)
+            return ParitySession::joined(online_client_ != nullptr &&
+                                         online_client_->host_extension_capable());
+        return ParitySession::offline();
+    }
+
+    // "Is this non-retail gameplay feature in effect right now?" Every use of
+    // such a feature asks here, every tick; nothing reads the stored setting.
+    [[nodiscard]] bool enhancement_now(Enhancement enhancement) const noexcept
+    {
+        if (enhancement == Enhancement::lagoon_water && diagnostic_lagoon_water_)
+            return session_permits_enhancements(parity_session());
+        return enhancement_active(settings_, enhancement, parity_session());
+    }
+
+    // Pushes the gate's answer into the two places that cannot ask it for
+    // themselves: the block collision table and the renderer's water pass.
+    void apply_enhancement_state()
+    {
+        world::set_surface_lava_passable(enhancement_now(Enhancement::sinking_lava));
+        if (world_preview_ != nullptr)
+            world_preview_->set_water_enabled(enhancement_now(Enhancement::lagoon_water));
+    }
+
+    // Flight, retail first (world::retail_fly_key_toggles): 1.9.9.8 flies in
+    // Creative only and 1.6.3.8 never does. The Free flight extra -- default
+    // off and never in effect online -- is this project's former flight, in
+    // any world with unrestricted resources. The frame-pacing glide bench is a
+    // diagnostic that flies level by that same model.
+    [[nodiscard]] bool free_flight_active() const noexcept
+    {
+        return pacing_overrides_.bench_glide ||
+               (enhancement_now(Enhancement::free_flight) &&
+                has_unrestricted_resources(game_mode_, infinite_resources_));
+    }
+
+    // In Creative F flies in both generations, offline and online: a
+    // deliberate difference from 1.6.3.8, which cannot fly at all (see
+    // world::fly_key_toggles and docs/retail-parity.md).
+    // "Creative" for flight means what it meant before the original's rule was
+    // matched: the Creative game mode OR any world with infinite resources
+    // (the owner's worlds are the latter, and F did nothing in them).
+    [[nodiscard]] bool flight_world() const noexcept
+    {
+        return game_mode_ == GameMode::creative ||
+               has_unrestricted_resources(game_mode_, infinite_resources_);
+    }
+
+    [[nodiscard]] bool flight_available() const noexcept
+    {
+        return world::fly_key_toggles(flight_world(), free_flight_active());
+    }
+
+    // True when flight is this project's free flight rather than 1.9.9.8's.
+    // Only the real 1.9.9.8 Creative mode flies by retail's model; an
+    // infinite-resources world in another mode has no retail flight to copy.
+    [[nodiscard]] bool flight_is_free() const noexcept
+    {
+        const bool creative_mode = game_mode_ == GameMode::creative;
+        return world::flight_is_free_model(inventory_.profile() == InventoryProfile::modern,
+                                           creative_mode,
+                                           free_flight_active() ||
+                                               (flight_world() && !creative_mode));
+    }
+
     [[nodiscard]] bool player_water_world() const noexcept
     {
-        // Water is the Lagoon's continuous sea plane, not a global volume.
-        // A raw Y < water_level test incorrectly submerged every dry cave and
-        // the whole hell layer, muting exactly those ambience beds. Authored
-        // crash sites cut a dry hole through that plane as well.
-        return world_preview_ != nullptr &&
+        // Retail has no water at all: BlockTerrain.IsWaterWorld is only ever
+        // assigned false in the shipped 1.6.3.8 and 1.9.9.8 assemblies, so
+        // Player.InWater/Underwater are constant false and a stock player walks
+        // the dry lagoon floor. Our sea exists only as the default-off Lagoon
+        // water enhancement, which is never in effect in an online session.
+        //
+        // With it on, water is the Lagoon's continuous sea plane, not a global
+        // volume. A raw Y < water_level test incorrectly submerged every dry
+        // cave and the whole hell layer, muting exactly those ambience beds.
+        // Authored crash sites cut a dry hole through that plane as well.
+        return world_preview_ != nullptr && enhancement_now(Enhancement::lagoon_water) &&
                settings_.presentation == PresentationProfile::rebirth &&
                world_preview_->biome_name() == "LAGOON" && !player_inside_dry_crater();
     }
@@ -5973,9 +8431,19 @@ class Application::Impl final
     void update_weather(float delta)
     {
         const world::PlayerState &player = player_.state();
-        const world::LightningUpdate event =
-            lightning_cycle_.update(delta, player_depth_under_ground(player), player.position.y);
+        const bool enhanced = settings_.presentation == PresentationProfile::rebirth;
+        const float cloud_cover =
+            enhanced ? world::biome_atmosphere_at(player.position.x, player.position.z).storminess
+                     : 1.0F;
+        const int depth = player_depth_under_ground(player);
+        const world::LightningUpdate event = lightning_cycle_.update(
+            delta * (0.15F + 0.85F * cloud_cover), depth, player.position.y);
         lightning_visible_ = event.visible;
+        lightning_strength_ =
+            world::lightning_envelope(lightning_strength_, event.visible, delta, cloud_cover,
+                                      depth <= 2 && player.position.y > -24.0F);
+        if (enhanced && cloud_cover < 0.25F)
+            return;
         if (event.thunder_low)
             sound_bank_->play_cue("thunderLow");
         else if (event.thunder_high)
@@ -6001,7 +8469,8 @@ class Application::Impl final
             {
                 world::Vec3 source = player.position;
                 source.y -= 10.0F;
-                apply_player_damage(world::lava_damage_health, source);
+                apply_player_damage(world::lava_damage_health, source,
+                                    modding::gameplay::DamageCause::lava);
                 lava_damage_time_ = world::lava_damage_period_seconds;
                 lava_sound_played_ = false;
             }
@@ -6086,10 +8555,6 @@ class Application::Impl final
         // current Y through the world top, not just contiguous ceiling.
         const int overburden = player_depth_under_ground(player);
         const float cave_weight = std::min(1.0F, static_cast<float>(overburden) / 15.0F);
-        // CraterFoundTransitionMusicTrigger: SpaceTheme is a one-shot when at
-        // least one crash-site block exists above the player's feet. The audio
-        // bridge queues transition tracks while another song is active, matching
-        // the original MediaPlayer-idle gate without interrupting it.
         int space_rock_depth = 0;
         for (int y = feet_y; y < world::world_min_y + world::chunk_height; ++y)
         {
@@ -6100,30 +8565,37 @@ class Application::Impl final
                 block == world::BlockType::space_rock_inventory)
                 ++space_rock_depth;
         }
-        if (!crater_music_triggered_ && space_rock_depth >= 1)
-        {
-            sound_bank_->play_song("SpaceTheme");
-            crater_music_triggered_ = true;
-            crater_music_reset_timer_ = 0.0F;
-        }
-        else if (crater_music_triggered_)
-        {
-            // InGameHUD keeps the crater trigger latched for one minute, then
-            // resets it as soon as the player is no longer under space rock.
-            crater_music_reset_timer_ += 0.25F;
-            if (crater_music_reset_timer_ >= 60.0F && space_rock_depth == 0)
-            {
-                crater_music_triggered_ = false;
-                crater_music_reset_timer_ = 0.0F;
-            }
-        }
         const float hell_weight = player.position.y <= -37.0F
                                       ? std::min(1.0F, (-37.0F - player.position.y) / 10.0F)
                                       : 0.0F;
-        const bool underwater = player_underwater(player);
+        const float music_distance = std::hypot(player.position.x, player.position.z);
+        static constexpr std::array<float, 6> music_bands{200, 900, 1600, 2300, 3000, 3400};
+        int song = 0;
+        while (song < 6 && music_distance >= music_bands[static_cast<std::size_t>(song)])
+            ++song;
+        if (hell_weight > 0.5F)
+            song = 6;
+        const std::string wanted_song = space_rock_depth > 0 ? "SpaceTheme" :
+                                        song > 0 ? std::format("Song{}", song) : "";
+        if (wanted_song != environment_song_candidate_)
+        {
+            environment_song_candidate_ = wanted_song;
+            environment_song_hold_ = 0;
+        }
+        environment_song_hold_ += 0.25F;
+        if (wanted_song != environment_song_ && environment_song_hold_ >= 2.0F)
+        {
+            sound_bank_->stop_music();
+            if (!wanted_song.empty())
+                sound_bank_->play_song(wanted_song);
+            environment_song_ = wanted_song;
+        }
+        // (mod-liquid) Under a mod liquid's surface the beds fall silent too.
+        const bool underwater = player_underwater(player) ||
+                                (world_preview_ != nullptr && world_preview_->eye_liquid(player) != nullptr);
         const float mute = underwater ? 0.0F : 1.0F;
-        sound_bank_->set_ambience(day_weight * (1.0F - cave_weight) * mute,
-                                  night_weight * (1.0F - cave_weight) * mute,
+        sound_bank_->set_ambience(day_weight * (1.0F - cave_weight) * (1.0F - hell_weight) * mute,
+                                  night_weight * (1.0F - cave_weight) * (1.0F - hell_weight) * mute,
                                   cave_weight * (1.0F - hell_weight) * mute, hell_weight * mute,
                                   1.0F - std::max(cave_weight, hell_weight));
         // ZombieChase and ArcherSkeletonChase own a persistent SoundCue3D per
@@ -6145,6 +8617,7 @@ class Application::Impl final
                 voice = "Felguard";
             sound_bank_->sync_enemy_voice(enemy.id, voice, enemy.position);
         }
+        mod_ai_retail_voices(); // mod-ai: creatures wearing a retail look chase with its voice
         sound_bank_->end_enemy_voice_frame();
     }
 
@@ -6153,6 +8626,7 @@ class Application::Impl final
     void apply_difficulty_loadout()
     {
         inventory_ = PlayerInventory{};
+        inventory_.set_profile(gameplay_profile_);
         if (difficulty_ == GameDifficulty::hardcore)
         {
             for (auto &slot : inventory_.storage())
@@ -6177,6 +8651,7 @@ class Application::Impl final
         for (std::size_t offset = 0; offset < input.size() && characters < 10U;)
         {
             const unsigned char lead = static_cast<unsigned char>(input[offset]);
+            if (lead < 32 || lead == 127) { ++offset; continue; }
             std::size_t bytes = 1U;
             if ((lead & 0xE0U) == 0xC0U)
                 bytes = 2U;
@@ -6236,7 +8711,25 @@ class Application::Impl final
     {
         if (!locator_name_editing_)
             return;
-        if (accept && locator_name_slot_ < PlayerInventory::tray_size)
+        if (pending_station_placement_)
+        {
+            const auto target = *pending_station_placement_;
+            pending_station_placement_.reset();
+            const auto &position = player_.state().position;
+            const float distance = std::hypot(position.x - float(target.place_x), position.z - float(target.place_z));
+            if (accept && player_life_ == PlayerLife::alive && locator_name_slot_ == inventory_.selected_index() &&
+                inventory_.selected_item() == InventoryItemId::modern_teleport_station && distance <= 8 &&
+                std::abs(position.y - float(target.place_y)) <= 8 &&
+                world::can_build_on(world_preview_->region().block(target.x, target.y, target.z)))
+            {
+                player_.state().target = target;
+                station_placement_confirmed_ = true;
+                primary_action_pressed();
+                station_placement_confirmed_ = false;
+                player_.refresh_target(world_preview_->region());
+            }
+        }
+        else if (accept && locator_name_slot_ < PlayerInventory::tray_size)
         {
             auto &slot = inventory_.tray()[locator_name_slot_];
             if (slot.has_value() &&
@@ -6306,18 +8799,20 @@ class Application::Impl final
         const bool online = (online_host_ != nullptr && online_host_->running()) ||
                             (online_client_ != nullptr && online_client_joined_ &&
                              online_client_->connected() && online_bootstrap_client_ == nullptr);
-        if (!online)
-        {
-            toast("NETWORK CHAT UNAVAILABLE", "JOIN OR HOST AN ONLINE SESSION FIRST");
+        // InGameHUD: `IsOnlineGame && !IsChatting && TextChat.Released` pushes
+        // the chat entry. Offline the key does nothing at all, and the entry is
+        // a plain control screen, not a dialog: it opens without a cue (only
+        // PCDialogScreen has an OpenSound).
+        // Mod runtime area: offline, the entry opens only as the /mods console
+        // of a running mod session (app_mod_runtime.inc).
+        if (!online && !mod_console_available())
             return;
-        }
         chat_draft_.clear();
         chat_key_fallback_.clear();
         chat_editing_ = true;
-        cancel_world_action();
+        cancel_world_action(true);
         SDL_SetWindowRelativeMouseMode(window_, false);
         (void)SDL_StartTextInput(window_);
-        sound_bank_->play_cue("Popup");
     }
 
     void push_online_chat(std::string message)
@@ -6333,7 +8828,9 @@ class Application::Impl final
             elapsed_ - online_chat_lines_.back().received_at < 0.75F)
             return;
         online_chat_lines_.push_back({std::move(message), elapsed_});
-        if (online_chat_lines_.size() > 12U)
+        // ConsoleElement.LinesSupported; how many show depends on the screen
+        // height (a quarter of it, one ConsoleFont line each).
+        if (online_chat_lines_.size() > 100U)
             online_chat_lines_.erase(online_chat_lines_.begin());
     }
 
@@ -6351,7 +8848,21 @@ class Application::Impl final
             while (end > begin &&
                    std::isspace(static_cast<unsigned char>(chat_draft_[end - 1U])) != 0)
                 --end;
-            if (begin < end)
+            // Mod runtime area: with a mod session, "/mods" lines (and offline
+            // every line) go to the mod console and never to the session.
+            const bool online = (online_host_ != nullptr && online_host_->running()) ||
+                                (online_client_ != nullptr && online_client_joined_);
+            // Modding, gameplay area: mod commands and chat.message come first
+            // (Integration: after the local "/mods" console, which never
+            // leaves this machine).
+            const bool mod_gameplay_line =
+                begin < end &&
+                !is_mod_console_line(std::string_view{chat_draft_}.substr(begin, end - begin)) &&
+                mod_gameplay_chat(std::string_view{chat_draft_}.substr(begin, end - begin));
+            const bool mod_console =
+                begin < end && !mod_gameplay_line && mod_session_ != ModSessionKind::none &&
+                run_mod_command(std::string_view{chat_draft_}.substr(begin, end - begin), online);
+            if (begin < end && !mod_console && !mod_gameplay_line)
             {
                 std::string message =
                     online_persona_name_.empty() ? "OpenMinerZ" : online_persona_name_;
@@ -6363,7 +8874,7 @@ class Application::Impl final
                 if (!payload.has_value() ||
                     !publish_online_broadcast("BroadcastTextMessage", *payload,
                                               net::MessageDeliveryPolicy::reliable_ordered, error))
-                    toast("CHAT SEND FAILED", uppercase(error));
+                    alert("CHAT SEND FAILED", uppercase(error));
                 else
                     push_online_chat(std::move(message));
             }
@@ -6476,11 +8987,16 @@ class Application::Impl final
                 {
                     direct_address_ = host_text_draft_;
                     direct_endpoint_ = std::move(endpoint);
-                    toast("DIRECT TARGET SAVED",
-                          "A TRANSPORT PROBE WILL VERIFY ITS SESSION CONTRACT");
+                    toast("DIRECT TARGET SAVED", "Choose Connect to join.");
                 }
                 else
                     toast("INVALID DIRECT ADDRESS", uppercase(std::move(error)));
+            }
+            else if (online_host_ != nullptr && online_host_->running())
+            {
+                // HostOptions > Set Password / Server Message, while hosting:
+                // the lobby is rewritten now, by the original's own rules.
+                apply_live_host_text(host_text_field_, host_text_draft_);
             }
             else
             {
@@ -6516,9 +9032,10 @@ class Application::Impl final
         auto &slot = inventory_.tray()[inventory_.selected_index()];
         if (!slot.has_value())
             return false;
-        if (item_self_damage_per_use(slot->item) <= 0.0F)
+        if (item_self_damage_per_use(slot->item, inventory_.profile()) <= 0.0F)
             return false;
-        if (!inflict_item_damage(*slot, infinite_resources_))
+        progress_.items[static_cast<std::size_t>(slot->item)].used += 1;
+        if (!inflict_item_damage(*slot, infinite_resources_, inventory_.profile()))
             return false;
         slot.reset();
         sync_selected_item();
@@ -6549,40 +9066,62 @@ class Application::Impl final
         return true;
     }
 
-    [[nodiscard]] std::optional<world::Vec3> safe_position_near(
-        const std::array<float, 3> &waypoint) const
+    void open_station_menu(std::array<float, 3> source)
     {
+        travel_names_.clear();
+        travel_points_.clear();
+        for (const auto &station : inventory_.teleport_stations())
+            if (station.waypoint != source)
+            {
+                travel_names_.push_back(station.waypoint_name);
+                travel_points_.push_back(station.waypoint);
+            }
+        if (travel_points_.empty())
+        {
+            toast("NO DESTINATIONS", "Place another teleport station to travel between them.");
+            return;
+        }
+        std::vector<ui::MenuEntry> entries;
+        for (const auto &name : travel_names_)
+            entries.push_back({name, "Travel to this station.", ui::MenuCommand::use_teleport_station, true, {}});
+        entries.push_back({"Back", "Return to the game.", ui::MenuCommand::back, true, {}});
+        menu_.set_travel_entries(std::move(entries));
+        cancel_world_action();
+        menu_.open(ui::MenuScreen::travel);
+        SDL_SetWindowRelativeMouseMode(window_, false);
+    }
+
+    [[nodiscard]] bool travel_to_block(std::array<float, 3> point, world::BlockType expected)
+    {
+        // A teleport must cut, never sweep the camera across the world.
+        snap_render_interpolation();
+        const auto previous = player_.state();
+        const world::Vec3 velocity = previous.velocity;
+        const world::Vec3 target{point[0], point[1], point[2]};
+        player_.state().position = target;
+        world_preview_->recenter_on(player_.state());
         const auto &region = world_preview_->region();
-        const int origin_x = static_cast<int>(std::floor(waypoint[0]));
-        const int origin_y = static_cast<int>(std::floor(waypoint[1]));
-        const int origin_z = static_cast<int>(std::floor(waypoint[2]));
-        for (int radius = 0; radius <= 16; ++radius)
-            for (int dz = -radius; dz <= radius; ++dz)
-                for (int dx = -radius; dx <= radius; ++dx)
-                {
-                    if (radius > 0 && std::abs(dx) != radius && std::abs(dz) != radius)
-                        continue;
-                    const int x = origin_x + dx;
-                    const int z = origin_z + dz;
-                    for (int offset = 0; offset < world::chunk_height; ++offset)
-                    {
-                        const std::array<int, 2> candidates{origin_y + offset, origin_y - offset};
-                        for (const int y : candidates)
-                        {
-                            if (!region.contains(x, y - 1, z) || !region.contains(x, y + 1, z) ||
-                                !world::blocks_player(region.block(x, y - 1, z)) ||
-                                world::blocks_player(region.block(x, y, z)) ||
-                                world::blocks_player(region.block(x, y + 1, z)))
-                                continue;
-                            const world::Vec3 position{static_cast<float>(x) + 0.5F,
-                                                       static_cast<float>(y) + 0.1F,
-                                                       static_cast<float>(z) + 0.5F};
-                            if (!world::PlayerSimulation::touches_solid(region, position))
-                                return position;
-                        }
-                    }
-                }
-        return std::nullopt;
+        const auto destination = region.block(int(std::floor(point[0])), int(std::floor(point[1])), int(std::floor(point[2])));
+        if (destination != expected)
+        {
+            player_.state() = previous;
+            world_preview_->recenter_on(player_.state());
+            inventory_.remove_travel_destination(point);
+            toast("DESTINATION UNAVAILABLE", "The destination has been removed.");
+            return false;
+        }
+        // 1.9.9.8 PlayerInventory.ShowTeleportStationMenu and the respawn at a
+        // spawn block: "Teleport", then GameScreen.TeleportToLocation(
+        // PointToLocation, spawnOnTop: false) - the block's own coordinates,
+        // ResetFarthestDistance, and MakeAboveGround(false), which is
+        // FindSafeStartLocation in that one column with the velocity kept
+        // (world::stock_safe_start_location). The ring search that stood here
+        // could arrive a column away and refused to arrive at all beside lava.
+        authority_announce_teleport(net::TeleportKind::station, target); // (Authority)
+        reset_farthest_distance();
+        land_relocated_player(world::stock_safe_start_location(region, target), velocity);
+        online_player_update_timer_ = 0;
+        return true;
     }
 
     [[nodiscard]] bool teleport_to_selected_waypoint()
@@ -6597,23 +9136,40 @@ class Application::Impl final
             return true;
         }
 
-        auto &state = player_.state();
-        state.position = {slot->waypoint[0] + 0.5F, slot->waypoint[1] + 1.1F,
-                          slot->waypoint[2] + 0.5F};
-        state.velocity = {};
-        world_preview_->recenter_on(state);
-        if (const auto safe = safe_position_near(slot->waypoint); safe.has_value())
-            state.position = *safe;
-        else
-            player_.spawn(world_preview_->region(), static_cast<int>(slot->waypoint[0]),
-                          static_cast<int>(slot->waypoint[2]));
-        state.velocity = {};
-        state.grounded = true;
-        player_.refresh_target(world_preview_->region());
-        sound_bank_->play_cue("Teleport");
-        reset_farthest_distance();
-        caption("[ TELEPORTED ]", 1.0F);
+        // GPSItem.ProcessInput, TeleportGPS on Shoulder.Pressed (both exes):
+        //   "Teleport" cue;
+        //   BroadcastTextMessage "<gamertag> Teleported To <locator name>";
+        //   GameScreen.TeleportToLocation(_pointToLocation, spawnOnTop: false):
+        //       LocalPosition = the locator point itself (the marked block's
+        //       integer coordinates), ResetFarthestDistance, CenterOn, and once
+        //       the terrain is in MakeAboveGround(false), which is
+        //       FindSafeStartLocation in that one column;
+        //   InflictDamage.
+        // It is the same landing as the menu's teleport to a player
+        // (world::stock_safe_start_location, executed against the original by
+        // the semantics probe's `landing` scenario): the target's own column,
+        // lava not avoided, the velocity untouched. A ring search that could
+        // arrive a column away, refused lava and zeroed the velocity stood
+        // here, and the session was never told.
         const std::string waypoint_name = slot->waypoint_name;
+        const world::Vec3 target{slot->waypoint[0], slot->waypoint[1], slot->waypoint[2]};
+        const world::Vec3 velocity = player_.state().velocity;
+        authority_announce_teleport(net::TeleportKind::locator, target); // (Authority)
+        sound_bank_->play_cue("Teleport");
+        // PRESENTATION ONLY (Enhanced; nothing in the Original): the air
+        // closing where the player left and opening where they arrive.
+        world_preview_->spawn_arrival(player_.state().position);
+        world_preview_->spawn_arrival(target);
+        announce_local_player_state(std::format("Teleported To {}", waypoint_name));
+        // A teleport cuts; it never sweeps the camera across the world.
+        snap_render_interpolation();
+        player_.state().position = target;
+        reset_farthest_distance();
+        world_preview_->recenter_on(player_.state());
+        land_relocated_player(world::stock_safe_start_location(world_preview_->region(), target),
+                              velocity);
+        online_player_update_timer_ = 0.0F;
+        caption("[ TELEPORTED ]", 1.0F);
         toast("TELEPORTED", waypoint_name);
         (void)damage_selected_item();
         return true;
@@ -6634,59 +9190,359 @@ class Application::Impl final
             --dragon_distance_index_;
     }
 
-    // TeleportToLocation(DefaultStartLocation, true): center terrain on the
-    // exact original coordinate and then put the player on the topmost safe
-    // cell. RefreshPlayer changes health only, so view and stamina survive.
-    void place_player_at_world_start(bool refresh_health)
+    // What MakeAboveGround does to the player after a relocation, and nothing
+    // more (world/stock_landing.hpp): the landing cell is in the target's own
+    // column, chosen by BlockPlayer alone, and the player's velocity, view,
+    // health and stamina are untouched. PlayerSimulation::spawn is still run
+    // first for its bookkeeping (mining progress, jump latch); its ring search
+    // for a "nice" cell and its zeroed velocity are then replaced.
+    void land_relocated_player(world::Vec3 landing, world::Vec3 velocity)
     {
         const float yaw = player_.state().yaw;
         const float pitch = player_.state().pitch;
         const float health = player_.state().health;
         const float stamina = player_.state().stamina;
-        player_.state().position = world::default_start_location;
-        player_.state().velocity = {};
-        world_preview_->recenter_on(player_.state());
-        player_.spawn(world_preview_->region(), static_cast<int>(world::default_start_location.x),
-                      static_cast<int>(world::default_start_location.z));
-        player_.state().yaw = yaw;
-        player_.state().pitch = pitch;
-        player_.state().health = refresh_health ? 100.0F : health;
-        player_.state().stamina = stamina;
+        player_.spawn(world_preview_->region(), static_cast<int>(std::floor(landing.x)),
+                      static_cast<int>(std::floor(landing.z)));
+        auto &state = player_.state();
+        state.position = landing;
+        state.velocity = velocity;
+        // Contact is re-established by the next tick's collision pass.
+        state.grounded = false;
+        state.yaw = yaw;
+        state.pitch = pitch;
+        state.health = health;
+        state.stamina = stamina;
         player_.refresh_target(world_preview_->region());
+    }
+
+    // TeleportToLocation(DefaultStartLocation, spawnOnTop: true): centre the
+    // terrain on the exact original coordinate, then FindTopmostGroundLocation
+    // in that one column. RefreshPlayer changes health only.
+    void place_player_at_world_start(bool refresh_health)
+    {
+        const world::Vec3 velocity = player_.state().velocity;
+        snap_render_interpolation();
+        player_.state().position = world::default_start_location;
+        world_preview_->recenter_on(player_.state());
+        land_relocated_player(world::stock_topmost_ground_location(world_preview_->region(),
+                                                                   world::default_start_location),
+                              velocity);
+        if (refresh_health)
+            player_.state().health = 100.0F;
         reset_farthest_distance();
     }
 
+    // GameScreen._teleportMenu_MenuItemSelected (1.6.3.8 and 1.9.9.8 agree).
+    // None of the three choices plays a cue, prints a line or sends a message
+    // of its own: the move reaches the session in the player's next
+    // PlayerUpdateMessage, on its ordinary turn.
     void teleport_player(bool to_start)
     {
+        // (Authority) A host that checks moves is told first.
+        authority_announce_teleport(to_start ? net::TeleportKind::start : net::TeleportKind::surface,
+                                    to_start ? world::default_start_location : player_.state().position);
         if (to_start)
         {
+            // Origin: TeleportToLocation(DefaultStartLocation, spawnOnTop: true).
             place_player_at_world_start(false);
-            toast("TELEPORTED TO START", "Back at the origin tower.");
         }
         else
         {
-            const float yaw = player_.state().yaw;
-            const float pitch = player_.state().pitch;
-            const float health = player_.state().health;
-            const float stamina = player_.state().stamina;
-            const auto &region = world_preview_->region();
-            player_.spawn(region, static_cast<int>(std::floor(player_.state().position.x)),
-                          static_cast<int>(std::floor(player_.state().position.z)));
-            player_.state().yaw = yaw;
-            player_.state().pitch = pitch;
-            player_.state().health = health;
-            player_.state().stamina = stamina;
-            toast("TELEPORTED TO SURFACE", "Daylight again.");
-            player_.refresh_target(region);
-            reset_farthest_distance();
+            // Surface: MakeAboveGround(true), FindTopmostGroundLocation in the
+            // player's own column: the cell above its highest solid block,
+            // never a neighbouring column, velocity kept. It is not a
+            // TeleportToLocation, so ResetFarthestDistance is not called.
+            const world::Vec3 velocity = player_.state().velocity;
+            snap_render_interpolation();
+            land_relocated_player(world::stock_topmost_ground_location(world_preview_->region(),
+                                                                       player_.state().position),
+                                  velocity);
         }
-        sound_bank_->play_cue("Teleport");
+        online_player_update_timer_ = 0.0F;
+    }
+
+    // TeleportMenuItems.Player: LocalPosition = player.LocalPosition, the
+    // terrain is centred there, and once it is in MakeAboveGround(false) runs
+    // FindSafeStartLocation, which settles in the target's own column on the
+    // ground under them. The original does not call ResetFarthestDistance on
+    // this path. `gid` is the session GID picked in the player list.
+    [[nodiscard]] bool teleport_to_online_player(std::uint8_t gid)
+    {
+        const auto found = online_remote_players_.find(gid);
+        if (world_preview_ == nullptr || found == online_remote_players_.end() ||
+            !found->second.presence_announced || !found->second.has_update)
+            return false;
+        // Player.LocalPosition is the last replicated position, not the
+        // smoothed body the renderer draws.
+        const world::Vec3 target = found->second.state.position;
+        if (!std::isfinite(target.x) || !std::isfinite(target.y) || !std::isfinite(target.z))
+            return false;
+        authority_announce_teleport(net::TeleportKind::player, target); // (Authority)
+        const world::Vec3 velocity = player_.state().velocity;
+        // A teleport cuts; it never sweeps the camera across the world.
+        snap_render_interpolation();
+        auto &state = player_.state();
+        state.position = target;
+        // Synchronous, like every other relocation here: the generated terrain
+        // and every edit held for the destination are installed before physics
+        // runs again. A guest holds the host's whole delta list from its join,
+        // kept current by AlterBlock, so there is nothing left to wait for.
+        world_preview_->recenter_on(state);
+        // FindSafeStartLocation: the nearest two-high gap in the TARGET'S OWN
+        // column. It does not step sideways, does not avoid lava and leaves
+        // the velocity alone. The ring search that stood here could land a
+        // column away from where every stock peer sees this player arrive.
+        land_relocated_player(world::stock_safe_start_location(world_preview_->region(), target),
+                              velocity);
+        online_player_update_timer_ = 0.0F;
+        std::cout << "teleport.player gid=" << static_cast<int>(gid) << " target=" << target.x
+                  << ',' << target.y << ',' << target.z << " landed=" << state.position.x << ','
+                  << state.position.y << ',' << state.position.z << '\n';
+        return true;
+    }
+
+    // InGameMenu, TeleportMenu and HostOptions decide their rows from these
+    // facts every frame, so nothing shown can outlive its condition.
+    [[nodiscard]] ui::InGameMenuFacts in_game_menu_facts() const
+    {
+        const bool hosting = online_host_ != nullptr && online_host_->running();
+        ui::InGameMenuFacts facts;
+        facts.modern = gameplay_profile_ == InventoryProfile::modern;
+        facts.endurance = game_mode_ == GameMode::endurance;
+        facts.hardcore = difficulty_ == GameDifficulty::hardcore;
+        // IsOnlineGame; the offline roster diagnostic stands in for a session
+        // so its screens can be captured.
+        facts.online = in_online_session() || options_.diagnostic_multiplayer;
+        // hostOptions.Visible also asks that the world belongs to this gamer,
+        // which is always true of the world a host here is serving.
+        facts.host = hosting || (options_.diagnostic_multiplayer &&
+                                 options_.diagnostic_menu == "host-options");
+        facts.pvp = static_cast<int>(hosting ? host_settings_.player_versus_player
+                                             : online_client_pvp_);
+        facts.ban_list_empty = host_ban_list_.empty();
+        // CastleMinerZGame.JoinGamePolicy: what the lobby is advertised with.
+        if (hosting)
+            if (const auto lobby = online_host_->advertised_lobby(); lobby.has_value())
+                facts.join_policy = static_cast<int>(lobby->join_policy);
+        return facts;
+    }
+
+    // SelectPlayerScreen lists every gamer that has announced itself, except
+    // the local one, in roster order. Rows are tied to session GIDs here and
+    // the cursor follows its GID when somebody joins or leaves.
+    void refresh_player_pick_entries()
+    {
+        const std::optional<std::uint8_t> selected =
+            menu_.screen() == ui::MenuScreen::select_player &&
+                    menu_.selection() < player_pick_gids_.size()
+                ? std::optional{player_pick_gids_[menu_.selection()]}
+                : std::nullopt;
+        std::vector<std::uint8_t> gids;
+        for (const auto &[gid, remote] : online_remote_players_)
+            if (remote.presence_announced)
+                gids.push_back(gid);
+        std::sort(gids.begin(), gids.end());
+        std::vector<std::string> names;
+        names.reserve(gids.size());
+        for (const std::uint8_t gid : gids)
+            names.push_back(online_gamer_tag(gid, std::format("PLAYER {}", static_cast<int>(gid))));
+        if (gids == player_pick_gids_ && names == player_pick_names_)
+            return;
+        player_pick_gids_ = std::move(gids);
+        player_pick_names_ = std::move(names);
+        std::vector<ui::MenuEntry> entries;
+        entries.reserve(player_pick_names_.size());
+        for (const std::string &name : player_pick_names_)
+            entries.push_back({name, {}, ui::MenuCommand::choose_player, true, {}});
+        menu_.set_player_entries(std::move(entries));
+        if (selected.has_value())
+            if (const auto kept = std::find(player_pick_gids_.begin(), player_pick_gids_.end(),
+                                            *selected);
+                kept != player_pick_gids_.end())
+                menu_.set_selection(static_cast<std::size_t>(kept - player_pick_gids_.begin()),
+                                    settings_);
+    }
+
+    void refresh_in_game_menus()
+    {
+        menu_.set_in_game_facts(in_game_menu_facts());
+        if (menu_.screen() == ui::MenuScreen::select_player)
+            refresh_player_pick_entries();
+        sync_mod_menu_entries(); // UI area (app_mod_ui.inc): rows mods added
+    }
+
+    void broadcast_host_notice(const std::string &text)
+    {
+        push_online_chat(text);
+        net::PayloadError payload_error{};
+        const auto payload = net::encode_chat_payload(text, payload_error);
+        std::string error;
+        if (!payload.has_value() ||
+            !publish_online_broadcast("BroadcastTextMessage", *payload,
+                                      net::MessageDeliveryPolicy::reliable_ordered, error))
+            std::cerr << "network.host.notice.failure=" << error << '\n';
+    }
+
+    // HostOptionItems.KickPlayer / BanPlayer: the notice, then KickMessage to
+    // the whole session naming the player; the named client leaves by itself.
+    // A ban also records the player's Steam identity (PlayerStats.BanList, keyed
+    // by AlternateAddress), which OnGamerJoined answers with another
+    // KickMessage(banned) whenever that player comes back.
+    void host_remove_player(std::uint8_t gid, bool banned)
+    {
+        if (online_host_ == nullptr || !online_host_->running() || gid == 0U)
+            return;
+        const std::optional<net::PeerId> peer = online_host_->peer_for_gid(gid);
+        if (!peer.has_value())
+            return;
+        broadcast_host_notice(online_gamer_tag(gid, std::format("PLAYER {}", static_cast<int>(gid))) +
+                              (banned ? " has been banned by the host"
+                                      : " has been kicked by the host"));
+        send_host_kick(gid, banned);
+        // BanList[AlternateAddress] = DateTime.UtcNow, then SaveData(): the
+        // ban is on disk before the menu is drawn again.
+        if (banned && !host_ban_list_.ban(*peer))
+            std::cerr << "network.host.ban.failure=the ban list could not be saved\n";
+    }
+
+    void send_host_kick(std::uint8_t gid, bool banned)
+    {
+        net::PayloadError payload_error{};
+        net::KickPayload kick;
+        kick.banned = banned;
+        kick.player_id = gid;
+        const auto payload = net::encode_kick_payload(kick, payload_error);
+        std::string error;
+        if (!payload.has_value() ||
+            !publish_online_broadcast("KickMessage", *payload,
+                                      net::MessageDeliveryPolicy::reliable_ordered, error))
+            std::cerr << "network.host.kick.failure=" << error << '\n';
+        else
+            std::cout << "network.host.kick gid=" << static_cast<int>(gid)
+                      << " banned=" << (banned ? 1 : 0) << '\n';
+    }
+
+    // The row the player picker was confirmed on, resolved to the GID it was
+    // built from and checked against the roster as it is now.
+    void choose_picked_player()
+    {
+        const std::size_t row = menu_.selection();
+        const std::optional<std::uint8_t> gid =
+            row < player_pick_gids_.size() ? std::optional{player_pick_gids_[row]} : std::nullopt;
+        const bool present = gid.has_value() && online_remote_players_.contains(*gid);
+        switch (player_pick_purpose_)
+        {
+        case PlayerPickPurpose::teleport:
+            // The callback pops TeleportMenu and InGameMenu whether or not a
+            // player was chosen.
+            menu_.open(ui::MenuScreen::world_preview);
+            cancel_world_action(true);
+            SDL_SetWindowRelativeMouseMode(window_, true);
+            if (present)
+                static_cast<void>(teleport_to_online_player(*gid));
+            break;
+        case PlayerPickPurpose::kick:
+        case PlayerPickPurpose::ban:
+            // SelectPlayerScreen pops itself; HostOptions is underneath.
+            menu_.open(ui::MenuScreen::host_options);
+            if (present)
+                host_remove_player(*gid, player_pick_purpose_ == PlayerPickPurpose::ban);
+            break;
+        }
+    }
+
+    // HostOptionItems.PVP: PVPState = (PVPState + 1) % 3 and the new state is
+    // broadcast as text.
+    void host_cycle_pvp()
+    {
+        if (online_host_ == nullptr || !online_host_->running())
+            return;
+        const int next = (static_cast<int>(host_settings_.player_versus_player) + 1) % 3;
+        host_settings_.player_versus_player = static_cast<net::PlayerVersusPlayer>(next);
+        std::string error;
+        if (!online_host_->update_session_property(5U, next, error))
+            std::cerr << "network.host.pvp.failure=" << error << '\n';
+        broadcast_host_notice(std::string{ui::pvp_state_text(next)});
+    }
+
+    // HostOptionItems.ChangeJoinPolicy: JoinGamePolicy = (JoinGamePolicy + 1) % 3,
+    // whose setter calls UpdateHostSessionJoinPolicy. The lobby's `JoinPolicy`
+    // key and its Steam lobby type change; nobody in the session is told.
+    void host_cycle_join_policy()
+    {
+        if (online_host_ == nullptr || !online_host_->running())
+            return;
+        const auto lobby = online_host_->advertised_lobby();
+        if (!lobby.has_value())
+            return;
+        const auto next = static_cast<net::SteamBridgeJoinPolicy>(
+            (static_cast<int>(lobby->join_policy) + 1) % 3);
+        std::string error;
+        if (!online_host_->update_join_policy(next, error))
+            std::cerr << "network.host.join_policy.failure=" << error << '\n';
+        else
+            std::cout << "network.host.join_policy=" << static_cast<int>(next) << '\n';
+    }
+
+    // HostOptionItems.Password and ServerMessage, once their PCKeyboardInputScreen
+    // is confirmed. Neither sends the session anything.
+    //   Password:       blank clears it (lobby `Protected` False, session
+    //                   password null); anything else is stored as typed
+    //                   (`Protected` True) and required of every later join.
+    //   Server Message: a blank entry changes nothing; otherwise the trimmed
+    //                   text becomes the lobby `Name`.
+    void apply_live_host_text(HostTextField field, std::string text)
+    {
+        if (online_host_ == nullptr || !online_host_->running())
+            return;
+        const auto blank = [](std::string_view value) {
+            return std::all_of(value.begin(), value.end(), [](unsigned char character) {
+                return character == ' ' || (character >= '\t' && character <= '\r');
+            });
+        };
+        std::string error;
+        if (field == HostTextField::password)
+        {
+            if (blank(text))
+                text.clear();
+            if (!online_host_->update_password(text, error))
+            {
+                toast("PASSWORD NOT CHANGED", uppercase(std::move(error)));
+                return;
+            }
+            host_settings_.password = std::move(text);
+            std::cout << "network.host.password protected="
+                      << (host_settings_.password.empty() ? 0 : 1) << '\n';
+            return;
+        }
+        if (blank(text))
+            return;
+        const auto first = text.find_first_not_of(" \t\r\n\v\f");
+        const auto last = text.find_last_not_of(" \t\r\n\v\f");
+        text = text.substr(first, last - first + 1U);
+        if (text == host_settings_.server_name)
+            return;
+        if (!online_host_->update_server_message(text, error))
+        {
+            toast("SERVER MESSAGE NOT CHANGED", uppercase(std::move(error)));
+            return;
+        }
+        host_settings_.server_name = std::move(text);
+        std::cout << "network.host.server_message updated\n";
     }
 
     // PlayerInventory.DropAll: death spills the backpack; Hardcore also spills
     // the hotbar tray and respawns with the empty hardcore loadout.
     void drop_inventory_on_death()
     {
+        // The cursor is carried inventory too. Closing the overlay after spilling
+        // the backpack must not return this item to the newly emptied inventory.
+        if (held_stack_)
+        {
+            world_preview_->spawn_dropped_stack(*held_stack_, player_.state());
+            held_stack_.reset();
+        }
         for (auto &slot : inventory_.storage())
         {
             if (slot.has_value())
@@ -6714,15 +9570,34 @@ class Application::Impl final
 
     // InGameHUD.ApplyDamage: directional indicator, hit cue, recover-timer
     // reset, then the death check.
-    void apply_player_damage(float health_points, world::Vec3 source)
+    void apply_player_damage(
+        float health_points, world::Vec3 source,
+        modding::gameplay::DamageCause cause = modding::gameplay::DamageCause::unknown)
     {
         if (health_points <= 0.0F)
             return;
         if (player_life_ != PlayerLife::alive)
             return;
-        // InfiniteResourceMode (creative) skips damage entirely.
-        if (infinite_resources_)
+        // InfiniteResourceMode skips damage, but Classic compares its guard
+        // against SessionProperties[0] == 3, which is its own network version:
+        // creative is only immune OFFLINE there. See creative_damage_immunity.
+        if (creative_damage_immunity(game_mode_, infinite_resources_, in_online_session(),
+                                     online_gameplay_protocol() == net::ProtocolVersion::classic_v3))
             return;
+        // Modding, gameplay area: player.damaged may cancel or change it.
+        if (mod_gameplay_live())
+        {
+            health_points = mod_gameplay_damage(health_points, source, cause);
+            if (health_points <= 0.0F || player_life_ != PlayerLife::alive)
+                return;
+        }
+        // (Authority) The host decides this player's health: show the hit,
+        // report what only this client saw, and wait for the host's word.
+        if (authority_client_ != nullptr)
+        {
+            authority_local_hit(health_points, source, cause);
+            return;
+        }
         damage_indicators_.push_back({source, 0.0F});
         if (damage_indicators_.size() > 12U)
             damage_indicators_.erase(damage_indicators_.begin());
@@ -6730,23 +9605,148 @@ class Application::Impl final
         last_player_damage_time_ = world_game_time_;
         player_.state().health -= health_points;
         if (player_.state().health <= 0.0F && player_life_ == PlayerLife::alive)
+            kill_local_player(cause);
+    }
+
+    // InGameHUD.KillPlayer: the body faints in the world scene, the inventory
+    // spills where you fell, and the world keeps running until you press a
+    // button to respawn. (Authority) Also the host's word in a session it
+    // decides.
+    void kill_local_player(modding::gameplay::DamageCause cause)
+    {
+        player_.state().health = 0.0F;
+        player_life_ = PlayerLife::dying;
+        progress_.add(ProgressMetric::deaths);
+        if (!active_world_path_.empty() && world_history_.deaths < 1'000'000'000U)
+            ++world_history_.deaths;
+        death_timer_ = 0.0F;
+        online_player_update_timer_ = 0.0F;
+        sound_bank_->play_cue("Fall");
+        drop_inventory_on_death();
+        cancel_world_action();
+        close_inventory();
+        inventory_open_ = false;
+        // KillPlayer clears the crate focus on the wire and tells the session
+        // who fell; without the first, every other peer keeps a slot of the
+        // crate this player died in front of locked forever.
+        send_local_crate_focus({});
+        announce_local_player_state("Has Fallen");
+        mod_gameplay_died(cause); // Modding, gameplay area: player.died
+    }
+
+    // InGameHUD's two online notices. The original's receiver only logs
+    // BroadcastTextMessage, so the stock peers in a session see these in their
+    // server log; ours also surfaces them in the chat panel.
+    // InGameHUD.UpdateAcheivements broadcasts the award as a chat line. The
+    // wording is the SESSION's build, not the presentation's: 1.6.3.8 really
+    // sends "<tag>Has earned '<name>'" with no space.
+    void announce_local_achievement(std::string_view achievement_name)
+    {
+        if (!online_gameplay_active())
+            return;
+        const std::string text = retail_message::achievement_earned(
+            local_online_gamer_tag(), achievement_name,
+            inventory_.profile() == InventoryProfile::modern ? RetailGeneration::modern
+                                                             : RetailGeneration::classic);
+        push_online_chat(text);
+        net::PayloadError payload_error{};
+        const auto payload = net::encode_chat_payload(text, payload_error);
+        std::string error;
+        if (!payload.has_value() ||
+            !publish_online_broadcast("BroadcastTextMessage", *payload,
+                                      net::MessageDeliveryPolicy::reliable_ordered, error))
+            std::cerr << "network.local.achievement-notice.failure=" << error << '\n';
+    }
+
+    void announce_local_player_state(std::string_view suffix)
+    {
+        if (!online_gameplay_active())
+            return;
+        std::string text = local_online_gamer_tag();
+        text += ' ';
+        text.append(suffix);
+        net::PayloadError payload_error{};
+        const auto payload = net::encode_chat_payload(text, payload_error);
+        std::string error;
+        if (!payload.has_value() ||
+            !publish_online_broadcast("BroadcastTextMessage", *payload,
+                                      net::MessageDeliveryPolicy::reliable_ordered, error))
+            std::cerr << "network.local.player-state-notice.failure=" << error << '\n';
+    }
+
+    // RestartLevelMessage as the session host: GameScreen's host menu and
+    // InGameHUD's "everyone is dead" restart both send it, followed by the
+    // notice. Echo is true, so the host returns to the start with everyone.
+    void restart_online_level()
+    {
+        std::string error;
+        if (!publish_online_broadcast("RestartLevelMessage", {},
+                                      net::MessageDeliveryPolicy::reliable_ordered, error))
+            std::cerr << "network.local.restart-level.failure=" << error << '\n';
+        authority_level_restart(); // (Authority) everyone is moved and brought back
+        static_cast<void>(apply_online_restart_level());
+        announce_local_player_state("Has Restarted The Game");
+    }
+
+    // InGameHUD's online Endurance contract (net::stock_respawn_action). A
+    // dead player waits twenty seconds and then rejoins the living player
+    // nearest the origin; when nobody is left alive only the host can act, and
+    // what it does is restart the level for the session. Respawning alone at
+    // the start instead kept the run from ever restarting: one living
+    // OpenMinerZ player was enough for every stock player's AllPlayersDead()
+    // to stay false.
+    [[nodiscard]] net::StockRespawnAction local_respawn_action(
+        std::optional<world::Vec3> *teammate = nullptr) const
+    {
+        bool any_remote_alive{};
+        float nearest_origin = std::numeric_limits<float>::max();
+        for (const auto &[gid, remote] : online_remote_players_)
         {
-            // KillPlayer: the camera collapses with the body, the inventory
-            // spills where you fell, and the world keeps running until you
-            // press a button to respawn.
-            player_.state().health = 0.0F;
-            player_life_ = PlayerLife::dying;
-            death_timer_ = 0.0F;
-            online_player_update_timer_ = 0.0F;
-            sound_bank_->play_cue("Fall");
-            drop_inventory_on_death();
-            cancel_world_action();
-            close_inventory();
-            inventory_open_ = false;
+            if (remote.state.dead)
+                continue;
+            any_remote_alive = true;
+            const world::Vec3 position = remote.state.position;
+            const float distance =
+                position.x * position.x + position.y * position.y + position.z * position.z;
+            if (teammate != nullptr && remote.has_update && distance < nearest_origin)
+            {
+                nearest_origin = distance;
+                *teammate = position;
+            }
         }
+        return net::stock_respawn_action(game_mode_, in_online_session(),
+                                         online_host_ != nullptr && online_host_->running(),
+                                         any_remote_alive, death_timer_ - 3.0F);
     }
 
     void respawn_player()
+    {
+        std::optional<world::Vec3> teammate;
+        const net::StockRespawnAction action = local_respawn_action(&teammate);
+        if (action == net::StockRespawnAction::wait)
+            return;
+        if (action == net::StockRespawnAction::restart_level)
+        {
+            restart_online_level();
+            return;
+        }
+        // (Authority) The host brings this player back (complete_local_respawn).
+        if (authority_requests_respawn())
+            return;
+        perform_local_respawn(action, teammate);
+    }
+
+    // (Authority) The host granted the respawn this client asked for.
+    void complete_local_respawn()
+    {
+        std::optional<world::Vec3> teammate;
+        net::StockRespawnAction action = local_respawn_action(&teammate);
+        if (action != net::StockRespawnAction::respawn_at_teammate)
+            action = net::StockRespawnAction::respawn_at_start;
+        perform_local_respawn(action, teammate);
+    }
+
+    void perform_local_respawn(net::StockRespawnAction action, std::optional<world::Vec3> teammate)
     {
         player_life_ = PlayerLife::alive;
         death_timer_ = 0.0F;
@@ -6754,21 +9754,45 @@ class Application::Impl final
         lava_damage_time_ = world::lava_damage_period_seconds;
         lava_sound_played_ = false;
         online_player_update_timer_ = 0.0F;
-        place_player_at_world_start(true);
-        if (game_mode_ == GameMode::endurance)
+        const auto spawn = inventory_.spawn_point();
+        if (action == net::StockRespawnAction::respawn_at_teammate && teammate.has_value())
         {
-            // Offline Endurance sends RestartLevelMessage. Its receiver keeps
-            // the terrain and pickups, but restarts the clock/music/HUD record.
+            // RefreshPlayer, then TeleportToLocation(player.LocalPosition,
+            // spawnOnTop: false): FindSafeStartLocation in the teammate's own
+            // column, velocity untouched, health refreshed.
+            const world::Vec3 velocity = player_.state().velocity;
+            snap_render_interpolation();
+            player_.state().position = *teammate;
+            world_preview_->recenter_on(player_.state());
+            land_relocated_player(
+                world::stock_safe_start_location(world_preview_->region(), *teammate), velocity);
+            player_.state().health = 100;
+            reset_farthest_distance();
+        }
+        else if (!spawn || !travel_to_block(spawn->waypoint, world::BlockType::spawn_point_basic))
+            place_player_at_world_start(true);
+        else
+            player_.state().health = 100;
+        // InGameHUD.RespawnPlayer only reaches RestartLevelMessage through
+        // `IsHost && !IsOnlineGame`, so the clock, music and distance record
+        // are never restarted inside a session. Doing it online rewound this
+        // peer's day to 0.4 until the host's next five-second TimeOfDay, and a
+        // hosting player's respawn rewound the night for everybody.
+        if (respawn_restarts_level(game_mode_, in_online_session()))
+        {
             sound_bank_->stop_music();
             day_night_ = world::DayNightCycle{0.4F};
             last_day_number_ = 0;
+            hud_last_time_of_day_ = -1.0F; // InGameHUD.Reset()
             max_distance_ = 0;
         }
         damage_indicators_.clear();
         SDL_SetWindowRelativeMouseMode(window_, true);
+        announce_local_player_state("Has Respawned");
         toast("RESPAWNED", difficulty_ == GameDifficulty::hardcore
                                ? "Everything you carried is gone."
                                : "Your gear is lying where you fell.");
+        mod_gameplay_respawned(); // Modding, gameplay area: player.respawned
     }
 
     [[nodiscard]] bool spawn_local_enemy(int type, world::Vec3 position, float midnight)
@@ -6780,19 +9804,29 @@ class Application::Impl final
         const std::uint8_t target_gid = online ? online_local_player_gid() : 0U;
         if (!enemy_horde_.spawn(type, position, midnight, enemy_id, target_gid))
             return false;
+        // Modding, gameplay area: difficulty scaling and enemy.spawned.
+        mod_gameplay_enemy_appeared(enemy_horde_.enemies().back(), std::nullopt);
+        if (type == world::enemy_alien && game_mode_ == GameMode::endurance)
+            progress_.add(ProgressMetric::alien);
         if (!online)
             return true;
 
         world::Enemy &enemy = enemy_horde_.enemies().back();
+        // EnemyHorde::spawn already quantized these to the wire's millisecond
+        // integers and built the enemy from them, as the original builds its
+        // own copy from the echoed message. Rounding recovers that integer
+        // exactly; truncating a float such as 0.899 would send 898 and leave
+        // this peer's copy a millisecond faster than everyone else's.
         const auto milliseconds = [](float seconds) {
             const double value =
                 std::clamp(static_cast<double>(seconds) * 1'000.0, 0.0,
                            static_cast<double>(std::numeric_limits<std::int32_t>::max()));
-            return static_cast<std::int32_t>(value);
+            return static_cast<std::int32_t>(std::llround(value));
         };
         net::SpawnEnemyPayload message;
         message.spawn_position = {position.x, position.y, position.z};
-        message.enemy_type = static_cast<std::uint8_t>(type);
+        message.enemy_type = world::enemy_type_to_wire(
+            type, online_gameplay_protocol() == net::ProtocolVersion::modern_v4);
         message.enemy_id = static_cast<std::int32_t>(enemy_id);
         message.random_seed = enemy.random_seed;
         message.initialization = {milliseconds(enemy.slow_speed), milliseconds(enemy.fast_speed),
@@ -6801,11 +9835,15 @@ class Application::Impl final
                                   milliseconds(enemy.normal_activation_time)};
         if (online_gameplay_protocol() == net::ProtocolVersion::modern_v4)
         {
-            const world::Vec3 spawner = player_.state().position;
-            message.spawner_position = {spawner.x, spawner.y, spawner.z};
+            // 1.9.9.8 EnemyManager sends every ordinary spawn (surface, cave,
+            // distance wave, alien) with Vector3.Zero, spawn value 0 and an
+            // EMPTY player name; only spawner blocks fill those in. A stock
+            // receiver takes a non-zero position as "look for a spawner
+            // there" and a non-empty name as "retarget by roster name"
+            // (two players may share a tag), so neither may be invented here.
+            message.spawner_position = {};
             message.spawn_value = 0;
-            message.player_name =
-                online_persona_name_.empty() ? "OpenMinerZ" : online_persona_name_;
+            message.player_name.clear();
         }
 
         // The stock sender serializes millisecond integers and consumes its
@@ -6881,6 +9919,9 @@ class Application::Impl final
             const world::Vec3 spawn_spot{static_cast<float>(cell_x) + 0.5F,
                                          static_cast<float>(y + 1),
                                          static_cast<float>(cell_z) + 0.5F};
+            // Modding, gameplay area: enemy.spawning may refuse it (the attempt is spent).
+            if (mod_gameplay_enemy_vetoed(world::enemy_alien, spawn_spot))
+                return true;
             if (!spawn_local_enemy(world::enemy_alien, spawn_spot, 0.5F))
                 return false;
             play_positional("CreatureUnearth", spawn_spot);
@@ -6906,15 +9947,70 @@ class Application::Impl final
             ++y;
         if (y >= top || y - pocket_floor < 2)
             return false; // Open to the sky, or a pocket too small to stand in.
-        if (!spawn_point_dark(cell_x, y - 1, cell_z))
+        // SpawnBelowgroundEnemy: GetSimpleLightAtPoint one cell under the
+        // ceiling must be at most 0.4 in BOTH channels. A torch (or lava)
+        // within about eight cells therefore keeps cave enemies from
+        // appearing there; a lantern has no say here. This used the surface
+        // spawner's lantern test, so torches protected nothing underground.
+        const world::SimpleLight light = world::simple_light_at(region, cell_x, y - 1, cell_z);
+        if (!(light.sun <= 0.4F && light.torch <= 0.4F))
             return false;
-        return spawn_local_enemy(type,
-                                 {static_cast<float>(cell_x) + 0.5F, static_cast<float>(y - 2),
-                                  static_cast<float>(cell_z) + 0.5F},
-                                 0.0F);
+        // The clock restarts either way; nothing is sent from crash-site rock.
+        const world::BlockType ceiling = region.block(cell_x, y, cell_z);
+        // Modding, gameplay area: enemy.spawning may refuse it (the attempt is spent).
+        if (ceiling != world::BlockType::space_rock &&
+            ceiling != world::BlockType::space_rock_inventory &&
+            !mod_gameplay_enemy_vetoed(type, {static_cast<float>(cell_x) + 0.5F, static_cast<float>(y - 2),
+                                              static_cast<float>(cell_z) + 0.5F}))
+            static_cast<void>(spawn_local_enemy(
+                type,
+                {static_cast<float>(cell_x) + 0.5F, static_cast<float>(y - 2),
+                 static_cast<float>(cell_z) + 0.5F},
+                0.0F));
+        return true;
     }
 
-    [[nodiscard]] bool try_spawn_enemy_on_ground(int type, world::Vec3 spot, float midnight)
+    // BlockTerrain.RegionIsLoaded for a spawn spot.
+    [[nodiscard]] bool spawn_spot_loaded(world::Vec3 spot) const
+    {
+        const auto &region = world_preview_->region();
+        const int cell_x = static_cast<int>(std::floor(spot.x));
+        const int cell_z = static_cast<int>(std::floor(spot.z));
+        return cell_x >= region.minimum_x() + 2 && cell_x <= region.maximum_x() - 2 &&
+               cell_z >= region.minimum_z() + 2 && cell_z <= region.maximum_z() - 2 &&
+               world_preview_->region_loaded(spot.x, spot.z);
+    }
+
+    // BlockTerrain.GetSimpleSunlightAtPoint(player position + (0, 1, 0)), which
+    // EnemyManager.OnUpdate reads every frame. The stored level only changes
+    // when the cell or the blocks around it do, so it is looked up again when
+    // the player enters another cell and twice a second otherwise.
+    [[nodiscard]] float spawn_head_sunlight(world::Vec3 position)
+    {
+        const std::array<int, 3> cell{static_cast<int>(std::floor(position.x)),
+                                      static_cast<int>(std::floor(position.y + 1.0F)),
+                                      static_cast<int>(std::floor(position.z))};
+        if (cell != spawn_sunlight_cell_ || --spawn_sunlight_ticks_ <= 0)
+        {
+            spawn_sunlight_cell_ = cell;
+            spawn_sunlight_ticks_ = 30;
+            spawn_sunlight_ =
+                world::local_sunlight_at(world_preview_->region(), cell[0], cell[1], cell[2]);
+        }
+        return spawn_sunlight_;
+    }
+
+    // What SpawnAbovegroundEnemy and SpawnRandomZombies do with a spot in
+    // loaded terrain. The enemy stands where the original's own landing
+    // function puts it (world/stock_landing.hpp): the column's topmost ground,
+    // or - `safe_start`, for a player below y -40 - the gap nearest the spot's
+    // own height. `light_gate` is SpawnAbovegroundEnemy's test, `torchlight <
+    // 0.4 || !NearLantern(spot, 7.2)`: only a lantern protects the surface, and
+    // only where its own light still reaches 0.4. The packs have no such test.
+    // Returns whether the spot passed (the caller restarts its clock); over
+    // crash-site rock it passes and nothing is spawned.
+    [[nodiscard]] bool try_spawn_enemy_on_ground(int type, world::Vec3 spot, float midnight,
+                                                 bool safe_start = false, bool light_gate = true)
     {
         const auto &region = world_preview_->region();
         const int cell_x = static_cast<int>(std::floor(spot.x));
@@ -6922,67 +10018,41 @@ class Application::Impl final
         if (cell_x < region.minimum_x() + 2 || cell_x > region.maximum_x() - 2 ||
             cell_z < region.minimum_z() + 2 || cell_z > region.maximum_z() - 2)
             return false;
-        // Find the topmost stand position near the requested height.
-        int ground_y = world::world_min_y;
-        for (int y = world::world_min_y + world::chunk_height - 2; y > world::world_min_y; --y)
-        {
-            if (region.contains(cell_x, y, cell_z) &&
-                world::blocks_player(region.block(cell_x, y, cell_z)))
-            {
-                ground_y = y + 1;
-                break;
-            }
-        }
-        if (ground_y <= world::world_min_y)
+        const world::Vec3 landing = safe_start ? world::stock_safe_start_location(region, spot)
+                                               : world::stock_topmost_ground_location(region, spot);
+        const int ground_y = static_cast<int>(std::floor(landing.y));
+        if (ground_y <= world::world_min_y || !region.contains(cell_x, ground_y, cell_z))
             return false;
-        if (!spawn_point_dark(cell_x, ground_y, cell_z))
+        // (fix, wave 5) mod-liquid: never on the surface of a lake (its cells
+        // hold their fallback, which the landing counts as ground, and a liquid
+        // holds nothing up): the spot fails like one with no ground. Without a
+        // liquid table this is false at its first test.
+        if (world::liquid_at(region, cell_x, ground_y - 1, cell_z))
             return false;
-        const world::Vec3 spawn_spot{static_cast<float>(cell_x) + 0.5F,
-                                     static_cast<float>(ground_y),
-                                     static_cast<float>(cell_z) + 0.5F};
-        if (!spawn_local_enemy(type, spawn_spot, midnight))
+        if (light_gate && !spawn_point_dark(cell_x, ground_y, cell_z) &&
+            !(world::simple_light_at(region, cell_x,
+                                     static_cast<int>(std::floor(landing.y + 0.5F)), cell_z)
+                  .torch < 0.4F))
+            return false;
+        const world::BlockType stand = region.block(cell_x, ground_y - 1, cell_z);
+        if (type != world::enemy_alien &&
+            (stand == world::BlockType::space_rock || stand == world::BlockType::space_rock_inventory))
+            return true;
+        // Modding, gameplay area: enemy.spawning may refuse it (the attempt is spent).
+        if (mod_gameplay_enemy_vetoed(type, landing))
+            return true;
+        if (!spawn_local_enemy(type, landing, midnight))
             return false;
         // ZombieEmerge.Enter: aboveground families claw out of the ground with
         // the unearth scrape and their first cry.
         if (world::enemy_stats(type).habitat == world::EnemyHabitat::aboveground)
         {
-            play_positional("CreatureUnearth", spawn_spot);
-            play_positional("ZombieCry", spawn_spot);
+            play_positional("CreatureUnearth", landing);
+            play_positional("ZombieCry", landing);
         }
         return true;
     }
 
-    [[nodiscard]] bool try_spawn_enemy_on_local_ground(int type, world::Vec3 spot, float midnight)
-    {
-        const auto &region = world_preview_->region();
-        const int cell_x = static_cast<int>(std::floor(spot.x));
-        const int cell_z = static_cast<int>(std::floor(spot.z));
-        if (cell_x < region.minimum_x() + 2 || cell_x > region.maximum_x() - 2 ||
-            cell_z < region.minimum_z() + 2 || cell_z > region.maximum_z() - 2)
-            return false;
-
-        const int top = world::world_min_y + world::chunk_height - 3;
-        const int start_y =
-            std::clamp(static_cast<int>(std::floor(spot.y)), world::world_min_y + 1, top);
-        // Open descent terrain has no ceiling, so FindClosestCeiling correctly
-        // fails there. Search only downward from the requested Hell-level spot;
-        // unlike the surface helper this cannot jump the enemy to a remote
-        // mountaintop above the player.
-        for (int y = start_y; y > world::world_min_y; --y)
-        {
-            if (!world::blocks_player(region.block(cell_x, y, cell_z)) ||
-                world::blocks_player(region.block(cell_x, y + 1, cell_z)) ||
-                world::blocks_player(region.block(cell_x, y + 2, cell_z)))
-                continue;
-            if (!spawn_point_dark(cell_x, y + 1, cell_z))
-                return false;
-            const world::Vec3 spawn_spot{static_cast<float>(cell_x) + 0.5F,
-                                         static_cast<float>(y + 1),
-                                         static_cast<float>(cell_z) + 0.5F};
-            return spawn_local_enemy(type, spawn_spot, midnight);
-        }
-        return false;
-    }
 
     void place_preview_environment()
     {
@@ -6993,6 +10063,165 @@ class Application::Impl final
         const std::string &environment = *options_.preview_environment;
         const int center_x = world_preview_->center_x();
         const int center_z = world_preview_->center_z();
+        if (environment == "ores")
+        {
+            constexpr int floor_y = -9;
+            for (int z = center_z - 5; z <= center_z + 7; ++z)
+                for (int x = center_x - 8; x <= center_x + 8; ++x)
+                    for (int y = floor_y; y <= floor_y + 6; ++y)
+                    {
+                        const bool shell = x == center_x - 8 || x == center_x + 8 ||
+                                           z == center_z - 5 || z == center_z + 7 ||
+                                           y == floor_y || y == floor_y + 6;
+                        region.set_block(x, y, z, shell ? world::BlockType::rock : world::BlockType::empty);
+                    }
+            constexpr std::array ores{world::BlockType::gold_ore, world::BlockType::iron_ore,
+                world::BlockType::copper_ore, world::BlockType::coal_ore, world::BlockType::diamond_ore};
+            for (std::size_t i = 0; i < ores.size(); ++i)
+                for (int y = floor_y + 1; y <= floor_y + 3; ++y)
+                    for (int dx = 0; dx < 2; ++dx)
+                        region.set_block(center_x - 7 + int(i) * 3 + dx, y, center_z - 2, ores[i]);
+            player_.state().position = {float(center_x), float(floor_y + 1) + 0.001F, float(center_z + 6)};
+            player_.state().velocity = {};
+            player_.state().grounded = true;
+            world_preview_->rebuild_mesh();
+            return;
+        }
+        if (environment == "lava-light")
+        {
+            // A sealed room above Hell proves lava illuminates its surroundings
+            // independently of the synthetic deep-world ambient floor.
+            constexpr int floor_y = -9;
+            for (int z = center_z - 7; z <= center_z + 7; ++z)
+                for (int x = center_x - 5; x <= center_x + 5; ++x)
+                    for (int y = floor_y; y <= floor_y + 6; ++y)
+                    {
+                        const bool shell = x == center_x - 5 || x == center_x + 5 ||
+                                           z == center_z - 7 || z == center_z + 7 || y == floor_y ||
+                                           y == floor_y + 6;
+                        region.set_block(x, y, z,
+                                         shell ? world::BlockType::rock : world::BlockType::empty);
+                    }
+            if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_LAVA_OFF") == nullptr)
+                for (int z = center_z - 3; z <= center_z - 1; ++z)
+                    for (int x = center_x - 1; x <= center_x + 1; ++x)
+                        region.set_block(x, floor_y, z, world::BlockType::deep_lava);
+            for (int y = floor_y + 1; y <= floor_y + 4; ++y)
+                region.set_block(center_x + 3, y, center_z - 2, world::BlockType::rock);
+            player_.state().position = {static_cast<float>(center_x) + 0.5F,
+                                        static_cast<float>(floor_y + 1) + 0.001F,
+                                        static_cast<float>(center_z + 4) + 0.5F};
+            player_.state().velocity = {};
+            player_.state().grounded = true;
+            world_preview_->rebuild_mesh();
+            return;
+        }
+        if (environment == "hell-tunnel")
+        {
+            // A narrow passage of blood stone inside Hell's own depth, closed
+            // behind the camera and open to the cavern ahead, with one lava
+            // block let into its floor: what the deep underground looks like
+            // where no lake is in view. Capture only; no generated world
+            // contains it.
+            constexpr int floor_y = -52;
+            constexpr int length = 34;
+            // (Clear of the bedrock tower at the world's origin.)
+            const int tunnel_x = center_x + 40;
+            const int tunnel_z = center_z + 40;
+            for (int z = tunnel_z - length; z <= tunnel_z + 2; ++z)
+                for (int x = tunnel_x - 4; x <= tunnel_x + 4; ++x)
+                    for (int y = floor_y - 2; y <= floor_y + 6; ++y)
+                    {
+                        const bool passage = std::abs(x - tunnel_x) <= 1 && y > floor_y &&
+                                             y <= floor_y + 3 && z < tunnel_z + 2;
+                        region.set_block(x, y, z,
+                                         passage ? world::BlockType::empty
+                                                 : world::BlockType::blood_stone);
+                    }
+            if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_LAVA_OFF") == nullptr)
+                region.set_block(tunnel_x + 1, floor_y, tunnel_z - 13, world::BlockType::deep_lava);
+            player_.state().position = {static_cast<float>(tunnel_x) + 0.5F,
+                                        static_cast<float>(floor_y + 1) + 0.001F,
+                                        static_cast<float>(tunnel_z) + 0.5F};
+            player_.state().velocity = {};
+            player_.state().grounded = true;
+            world_preview_->rebuild_mesh();
+            std::cout << "Environment: hell-tunnel at " << player_.state().position.x << ' '
+                      << player_.state().position.y << ' ' << player_.state().position.z
+                      << " (runs toward -Z)\n";
+            return;
+        }
+        if (environment == "hell-shaft")
+        {
+            // A dry room in ordinary rock with a shaft in its floor that runs
+            // straight down into Hell: the descent from cave to Hell, and Hell
+            // seen from above. --camera moves the eye along the shaft.
+            constexpr int room_floor = -17;
+            const int shaft_x = center_x + 24;
+            const int shaft_z = center_z + 24;
+            for (int z = shaft_z - 5; z <= shaft_z + 5; ++z)
+                for (int x = shaft_x - 5; x <= shaft_x + 5; ++x)
+                    for (int y = room_floor; y <= room_floor + 5; ++y)
+                    {
+                        const bool shell = std::abs(x - shaft_x) == 5 ||
+                                           std::abs(z - shaft_z) == 5 || y == room_floor ||
+                                           y == room_floor + 5;
+                        region.set_block(x, y, z,
+                                         shell ? world::BlockType::rock : world::BlockType::empty);
+                    }
+            for (int z = shaft_z - 2; z <= shaft_z + 2; ++z)
+                for (int x = shaft_x - 2; x <= shaft_x + 2; ++x)
+                    for (int y = -58; y <= room_floor; ++y)
+                        if (region.block(x, y, z) != world::BlockType::deep_lava)
+                            region.set_block(x, y, z, world::BlockType::empty);
+            player_.state().position = {static_cast<float>(shaft_x) + 3.5F,
+                                        static_cast<float>(room_floor + 1) + 0.001F,
+                                        static_cast<float>(shaft_z) + 0.5F};
+            // OPENMINERZ_DIAGNOSTIC_SHAFT_Y=<feet height> stands the player on a
+            // one-block ledge part-way down instead (the depth fog, the
+            // exposure and the ambience all follow the player, not --camera).
+            if (const char *value = SDL_getenv("OPENMINERZ_DIAGNOSTIC_SHAFT_Y"))
+            {
+                const int feet_y = std::clamp(std::atoi(value), -57, room_floor + 1);
+                region.set_block(shaft_x + 2, feet_y - 1, shaft_z, world::BlockType::rock);
+                player_.state().position = {static_cast<float>(shaft_x) + 2.5F,
+                                            static_cast<float>(feet_y) + 0.001F,
+                                            static_cast<float>(shaft_z) + 0.5F};
+            }
+            player_.state().velocity = {};
+            player_.state().grounded = true;
+            world_preview_->rebuild_mesh();
+            std::cout << "Environment: hell-shaft at " << player_.state().position.x << ' '
+                      << player_.state().position.y << ' ' << player_.state().position.z
+                      << " (shaft centre " << static_cast<float>(shaft_x) + 0.5F << ' '
+                      << static_cast<float>(shaft_z) + 0.5F << ", Y " << room_floor
+                      << " down to -58)\n";
+            return;
+        }
+        if (environment == "lava-pool")
+        {
+            // Lava met at the surface, under the open sky: a small pool let
+            // into the ground a few blocks in front of the spawn point.
+            const int feet_y = static_cast<int>(std::floor(player_.state().position.y));
+            const int pool_x = static_cast<int>(std::floor(player_.state().position.x));
+            const int pool_z = static_cast<int>(std::floor(player_.state().position.z)) - 7;
+            for (int z = pool_z - 5; z <= pool_z + 9; ++z)
+                for (int x = pool_x - 6; x <= pool_x + 6; ++x)
+                {
+                    const bool pool = std::abs(x - pool_x) <= 3 && std::abs(z - pool_z) <= 2 &&
+                                      std::abs(x - pool_x) + std::abs(z - pool_z) < 5;
+                    region.set_block(x, feet_y - 2, z, world::BlockType::rock);
+                    region.set_block(x, feet_y - 1, z,
+                                     pool ? world::BlockType::surface_lava
+                                          : world::BlockType::rock);
+                    for (int y = feet_y; y <= feet_y + 6; ++y)
+                        region.set_block(x, y, z, world::BlockType::empty);
+                }
+            world_preview_->rebuild_mesh();
+            std::cout << "Environment: lava-pool at " << pool_x << ' ' << feet_y - 1 << ' '
+                      << pool_z << " (toward -Z from the spawn point)\n";
+            return;
+        }
         if (environment == "foliage")
         {
             // A stable close-range foliage/shadow probe. The ordinary world
@@ -7207,6 +10436,7 @@ class Application::Impl final
 
     void spawn_player()
     {
+        snap_render_interpolation();
         int spawn_x = static_cast<int>(world::default_start_location.x);
         int spawn_z = static_cast<int>(world::default_start_location.z);
         if (pending_load_position_.has_value())
@@ -7240,6 +10470,7 @@ class Application::Impl final
             spawn_x = world_preview_->center_x() + 8;
             spawn_z = world_preview_->center_z() + 8;
         }
+        mod_world_spawn_point(spawn_x, spawn_z); // mod-world: a mod world's spawn, --teleport
         player_.spawn(world_preview_->region(), spawn_x, spawn_z);
         place_preview_environment();
         // Establish the deterministic capture camera before placing any
@@ -7277,6 +10508,7 @@ class Application::Impl final
         }
         zombie_fest_ = false;
         fest_countdown_ = -1.0F;
+        mod_gameplay_spawned(); // Modding, gameplay area: player.spawned (once a session)
         if (options_.spawn_enemy >= 0 && !diagnostic_enemy_spawned_)
         {
             diagnostic_enemy_spawned_ = true;
@@ -7394,12 +10626,39 @@ class Application::Impl final
         {
             diagnostic_dynamic_radiance_spawned_ = true;
             const std::string_view mode{radiance_capture};
+            if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_EFFECT_SCENE") != nullptr)
+            {
+                // A controlled outdoor stage for actual impact/trail recipes.
+                // This lives only in explicitly requested diagnostic worlds.
+                auto &region = world_preview_->region();
+                for (int z = -16; z <= 36; ++z)
+                    for (int x = -12; x <= 36; ++x)
+                        for (int y = 30; y <= 55; ++y)
+                            if (region.contains(x,y,z))
+                            {
+                                region.set_block(x,y,z, y == 30 ? world::BlockType::rock : world::BlockType::empty);
+                                world_preview_->remember_edit(x,y,z, y == 30 ? world::BlockType::rock : world::BlockType::empty);
+                            }
+                player_.state().position = {12.5F,31.001F,12.5F};
+                player_.state().yaw = 0;
+                player_.state().pitch = -0.05F;
+                snap_render_interpolation();
+                if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_HAND_SHADOW") != nullptr)
+                    for (int z = -5; z <= 25; ++z)
+                        for (int x = 12; x <= 22; ++x)
+                        {
+                            region.set_block(x,35,z,world::BlockType::rock);
+                            world_preview_->remember_edit(x,35,z,world::BlockType::rock);
+                        }
+                world_preview_->rebuild_mesh();
+            }
             const bool ice = mode == "iceball" || mode == "ice-blast";
             const world::Vec3 view = player_.view_direction();
             const float horizontal = std::max(0.001F, std::hypot(view.x, view.z));
             const bool projectile_capture =
                 mode == "fireball" || mode == "iceball" || mode == "rocket";
-            const float forward_distance = projectile_capture ? 4.5F : 3.25F;
+            const float forward_distance = SDL_getenv("OPENMINERZ_DIAGNOSTIC_EFFECT_SCENE") != nullptr
+                ? (projectile_capture ? 7.0F : 11.0F) : projectile_capture ? 4.5F : 3.25F;
             const float side_distance = projectile_capture ? 1.6F : 0.0F;
             const world::Vec3 source{
                 player_.state().position.x + view.x / horizontal * forward_distance -
@@ -7423,14 +10682,20 @@ class Application::Impl final
                     // particle. Prime exactly 0.18 s only in this diagnostic so
                     // the capture audits the projectile's real blend recipes.
                     world_preview_->set_fireball_visuals({{source, drift, 0.0F, fireball_id, ice}});
-                    (void)world_preview_->update_effects(0.18F, player_.state().position);
+                    for (int frame = 0; frame < 30; ++frame)
+                    {
+                        const float behind = 8.0F*(1.0F-static_cast<float>(frame)/29.0F);
+                        const world::Vec3 trail{source.x + view.x*behind, source.y, source.z + view.z*behind};
+                        world_preview_->set_fireball_visuals({{trail, drift, 0.0F, fireball_id, ice}});
+                        (void)world_preview_->update_effects(1.0F/60.0F, player_.state().position);
+                    }
                 }
             }
             else if (mode == "fire-blast" || mode == "ice-blast")
             {
                 world_preview_->spawn_fireball_explosion(source, ice, false);
             }
-            else if (mode == "mining-impact")
+            else if (mode == "mining-impact" || mode == "laser-impact")
             {
                 world::BlockBreakUpdate impact;
                 impact.intersection = source;
@@ -7439,14 +10704,18 @@ class Application::Impl final
                     impact.normal_x = view.x >= 0.0F ? -1 : 1;
                 else
                     impact.normal_z = view.z >= 0.0F ? -1 : 1;
-                world_preview_->spawn_mining_impact(impact);
+                if (mode == "laser-impact")
+                    world_preview_->spawn_blaster_impact(impact, {0.05F,0.3F,1.0F});
+                else
+                    world_preview_->spawn_mining_impact(impact);
                 if (options_.screenshot_path.has_value())
                 {
                     // A two-frame still otherwise catches expanding smoke at
                     // its centimetre-scale birth size. Prime only the diagnostic
                     // capture to the readable middle of the real live recipe.
-                    for (int step = 0; step < 3; ++step)
-                        (void)world_preview_->update_effects(0.1F, player_.state().position);
+                    if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_EFFECT_SECONDS") == nullptr)
+                        for (int step = 0; step < 3; ++step)
+                            (void)world_preview_->update_effects(0.1F, player_.state().position);
                 }
             }
             else if (mode == "enemy-impact")
@@ -7476,6 +10745,13 @@ class Application::Impl final
                 rocket.rocket = true;
                 tracers_.push_back(rocket);
             }
+            if (options_.screenshot_path.has_value())
+                if (const char *seconds = SDL_getenv("OPENMINERZ_DIAGNOSTIC_EFFECT_SECONDS"))
+                {
+                    const int frames = std::clamp(static_cast<int>(std::atof(seconds)*60.0),0,600);
+                    for (int frame = 0; frame < frames; ++frame)
+                        (void)world_preview_->update_effects(1.0F/60.0F, player_.state().position);
+                }
         }
         // A loaded save (or this Steam player's per-world join record) restores
         // exactly where the player left off, unless later world edits made that
@@ -7509,6 +10785,14 @@ class Application::Impl final
 
     void shift_world_time(int hours)
     {
+        // The host owns the clock: TimeOfDayMessage overwrites a guest's day
+        // every five seconds, so shifting it here only makes the sky fight the
+        // session for those five seconds.
+        if (online_client_ != nullptr && online_client_joined_ && online_host_ == nullptr)
+        {
+            toast("THE HOST OWNS THE CLOCK", "TIME OF DAY IS SET BY THE SESSION HOST");
+            return;
+        }
         day_night_.set_time(day_night_.time_of_day() + static_cast<float>(hours) / 24.0F);
         toast(hours > 0 ? "TIME ADVANCED" : "TIME REWOUND",
               std::format("SKY AND LIGHTING UPDATED  /  {}", day_night_.clock_text()));
@@ -7579,44 +10863,62 @@ class Application::Impl final
                 }
                 return;
             }
+            if (player_life_ != PlayerLife::alive)
+            {
+                // Same contract as the keyboard: Start still opens the menu,
+                // Jump (A) respawns once the prompt is up, and nothing else
+                // reaches a dead player.
+                if (button == SDL_GAMEPAD_BUTTON_START)
+                {
+                    cancel_world_action();
+                    SDL_SetWindowRelativeMouseMode(window_, false);
+                    menu_.open(ui::MenuScreen::pause);
+                }
+                else if (player_life_ == PlayerLife::dead && button == SDL_GAMEPAD_BUTTON_SOUTH)
+                    respawn_player();
+                return;
+            }
+            if (inventory_open_ && screens_style() == UiStyle::remastered)
+            {
+                // The Remastered screens' own pad layout (app_remastered.inc):
+                // every button ends in an operation the retail screens have.
+                sync_screens();
+                (void)remastered_screens_button(static_cast<SDL_GamepadButton>(button));
+                return;
+            }
             if (inventory_open_)
             {
+                // BlockPickerScreen / CrateScreen / CraftingUIScreen: the pad
+                // moves the selector, A picks and places, X drops, B backs
+                // out, Y opens crafting (or, at a crate, sends a stack across).
                 switch (button)
                 {
                 case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
-                    move_inventory_focus(-1, 0);
+                    screens_key(screens::Key::left);
                     break;
                 case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
-                    move_inventory_focus(1, 0);
+                    screens_key(screens::Key::right);
                     break;
                 case SDL_GAMEPAD_BUTTON_DPAD_UP:
-                    move_inventory_focus(0, -1);
+                    screens_key(screens::Key::up);
                     break;
                 case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
-                    move_inventory_focus(0, 1);
+                    screens_key(screens::Key::down);
                     break;
-                case SDL_GAMEPAD_BUTTON_SOUTH: {
-                    const Rect rect = inventory_slot_rect(inventory_focus_);
-                    inventory_pointer(rect.x + rect.width * 0.5F, rect.y + rect.height * 0.5F,
-                                      SDL_BUTTON_LEFT);
+                case SDL_GAMEPAD_BUTTON_SOUTH:
+                    screens_key(screens::Key::enter);
                     break;
-                }
                 case SDL_GAMEPAD_BUTTON_WEST:
-                    // BlockPickerScreen/CrateScreen bind X to the same whole-stack
-                    // drop action as keyboard Q while an inventory screen is open.
-                    drop_inventory_selection();
+                    screens_key(screens::Key::drop);
                     break;
                 case SDL_GAMEPAD_BUTTON_EAST:
-                    close_inventory();
+                    screens_key(screens::Key::escape);
                     break;
                 case SDL_GAMEPAD_BUTTON_NORTH:
                     if (active_crate_.has_value())
-                    {
-                        if (quick_move_inventory_slot(inventory_focus_))
-                            sound_bank_->play_click();
-                    }
+                        with_screens([&](ScreenHost &host) { screens_.quick_transfer(host); });
                     else
-                        close_inventory();
+                        screens_key(screens::Key::inventory);
                     break;
                 default:
                     break;
@@ -7626,7 +10928,7 @@ class Application::Impl final
             switch (button)
             {
             case SDL_GAMEPAD_BUTTON_START:
-                cancel_world_action();
+                cancel_world_action(true);
                 SDL_SetWindowRelativeMouseMode(window_, false);
                 menu_.open(ui::MenuScreen::pause);
                 break;
@@ -7651,8 +10953,9 @@ class Application::Impl final
             case SDL_GAMEPAD_BUTTON_NORTH:
                 inventory_open_ = true;
                 inventory_focus_ = PlayerInventory::storage_size + inventory_.selected_index();
-                cancel_world_action();
+                cancel_world_action(true);
                 SDL_SetWindowRelativeMouseMode(window_, false);
+                sound_bank_->play_click();
                 break;
             case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
                 drop_one_selected_item();
@@ -7662,6 +10965,9 @@ class Application::Impl final
             }
             return;
         }
+        if (menu_.screen() == ui::MenuScreen::settings &&
+            settings_screen_button(static_cast<Uint8>(button)))
+            return;
         switch (button)
         {
         case SDL_GAMEPAD_BUTTON_DPAD_UP:
@@ -7754,8 +11060,12 @@ class Application::Impl final
             std::clamp(input.forward - stick(SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_LEFTY)),
                        -1.0F, 1.0F);
         const bool accept_gamepad_actions = !mouse_suppresses_gamepad_actions();
-        input.jump = input.jump || (accept_gamepad_actions &&
-                                    SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_SOUTH));
+        // A is also "select" in every menu: the press that picked Resume must be
+        // released before it can jump (the original's Jump is an edge).
+        input.jump =
+            gamepad_jump_latch_.filter(accept_gamepad_actions &&
+                                       SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_SOUTH)) ||
+            input.jump;
         const bool left_stick =
             accept_gamepad_actions && SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_LEFT_STICK);
         if (player_.state().fly_mode)
@@ -7767,9 +11077,12 @@ class Application::Impl final
         const float aim_x = stick(SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_RIGHTX));
         const float aim_y = stick(SDL_GetGamepadAxis(gamepad_, SDL_GAMEPAD_AXIS_RIGHTY));
         constexpr float radians_per_second = 2.65F;
-        player_.look(aim_x * settings_.controller_sensitivity * radians_per_second * delta,
-                     -aim_y * settings_.controller_sensitivity * radians_per_second * delta *
-                         (settings_.invert_y ? -1.0F : 1.0F));
+        // The stick turns at an angular rate; look_scale_ is the same
+        // Player.ControlSensitivity the mouse look is multiplied by.
+        const float stick_look =
+            settings_.controller_sensitivity * radians_per_second * delta * look_scale_;
+        player_.look(aim_x * stick_look,
+                     -aim_y * stick_look * (settings_.invert_y ? -1.0F : 1.0F));
 
         constexpr Sint16 trigger_threshold = 12000;
         const bool use =
@@ -7780,7 +11093,7 @@ class Application::Impl final
         if (!use && gamepad_use_down_)
         {
             if (grenade_cooking_)
-                throw_grenade();
+                release_grenade();
             mine_button_down_ = false;
         }
         gamepad_use_down_ = use;
@@ -7836,7 +11149,7 @@ class Application::Impl final
     [[nodiscard]] std::vector<net::DiscoveredSession> diagnostic_join_sessions() const
     {
         net::HostSessionSettings classic;
-        classic.server_name = "THE DEEP FRONTIER";
+        classic.server_name = "Deep Caverns";
         classic.server_message = "DAY 12  •  FRIENDS WELCOME";
         classic.maximum_players = 8;
         classic.visibility = net::HostVisibility::friends_only;
@@ -7847,7 +11160,7 @@ class Application::Impl final
         friend_session.host_name = "RUSTY PICKAXE";
         friend_session.server_message = classic.server_message;
         friend_session.source = net::DiscoverySource::friend_session;
-        friend_session.properties = net::make_session_properties(classic, true, 1, 2, false);
+        friend_session.properties = net::make_session_properties(classic, false, 1, 2, false);
         friend_session.current_players = 3U;
         friend_session.maximum_players = 8U;
         friend_session.favorite = true;
@@ -7897,56 +11210,86 @@ class Application::Impl final
                 std::move(full_session)};
     }
 
+    // The mod profile this client presents for one wire protocol.
+    [[nodiscard]] net::ModManifest join_manifest_for(net::ProtocolVersion protocol) const
+    {
+        net::ModManifest manifest;
+        std::string manifest_error;
+        if (!mod_catalog_valid_ ||
+            !net::make_mod_manifest(mod_catalog_, protocol, manifest, manifest_error))
+        {
+            manifest = {};
+            manifest.protocol = protocol;
+        }
+        return manifest;
+    }
+
+    // Assesses a row against the profile of its own protocol and the local Steam
+    // id, so Classic and Modern servers are both judged on their own terms.
+    [[nodiscard]] net::JoinAssessment assess_join_session(
+        const net::DiscoveredSession &session) const
+    {
+        if (!session.properties[0].has_value() ||
+            (*session.properties[0] !=
+                 static_cast<std::int32_t>(net::ProtocolVersion::classic_v3) &&
+             *session.properties[0] != static_cast<std::int32_t>(net::ProtocolVersion::modern_v4)))
+            return net::assess_join(session, join_client_manifest_, true,
+                                    join_browser_.local_peer());
+        const auto protocol = static_cast<net::ProtocolVersion>(*session.properties[0]);
+        // (Network) A server mod this client lacks is downloaded on join.
+        return net::assess_join(session, mod_net_assessment_manifest(session, protocol), true,
+                                join_browser_.local_peer());
+    }
+
     [[nodiscard]] net::JoinAssessment browser_join_assessment(std::size_t session_index) const
     {
         const auto &sessions = join_browser_.sessions();
         if (session_index >= sessions.size())
             return join_browser_.assessment(session_index);
+        return assess_join_session(sessions[session_index]);
+    }
 
-        const net::DiscoveredSession &session = sessions[session_index];
-        if (!session.properties[0].has_value() ||
-            (*session.properties[0] !=
-                 static_cast<std::int32_t>(net::ProtocolVersion::classic_v3) &&
-             *session.properties[0] != static_cast<std::int32_t>(net::ProtocolVersion::modern_v4)))
-            return join_browser_.assessment(session_index);
-
-        const auto protocol = static_cast<net::ProtocolVersion>(*session.properties[0]);
-        net::ModManifest protocol_manifest;
-        std::string manifest_error;
-        if (!mod_catalog_valid_ ||
-            !net::make_mod_manifest(mod_catalog_, protocol, protocol_manifest, manifest_error))
-        {
-            protocol_manifest.protocol = protocol;
-        }
-        return net::assess_join(session, protocol_manifest, true);
+    // The Version column names the protocol a lobby advertises. A lobby whose
+    // protocol slot is neither stock value is not a Classic server.
+    [[nodiscard]] static const char *join_protocol_label(
+        const net::DiscoveredSession &session, const net::JoinAssessment &assessment) noexcept
+    {
+        const bool advertised =
+            session.properties[0] == static_cast<std::int32_t>(net::ProtocolVersion::classic_v3) ||
+            session.properties[0] == static_cast<std::int32_t>(net::ProtocolVersion::modern_v4);
+        return advertised ? net::protocol_label(assessment.protocol) : "Unknown";
     }
 
     void rebuild_join_menu_entries()
     {
         const auto &visible = join_browser_.visible_indices();
         const auto &sessions = join_browser_.sessions();
+        const std::vector<std::uint64_t> previous_rows = std::move(join_row_ids_);
+        const std::size_t highlighted = menu_.selection();
         join_labels_.clear();
         join_descriptions_.clear();
         join_badges_.clear();
         join_row_sessions_.clear();
+        join_row_ids_.clear();
         join_labels_.reserve(visible.size());
         join_descriptions_.reserve(visible.size());
         join_badges_.reserve(visible.size());
         join_row_sessions_.reserve(visible.size());
+        join_row_ids_.reserve(visible.size());
         for (const std::size_t session_index : visible)
         {
             const net::DiscoveredSession &session = sessions[session_index];
             const net::JoinAssessment assessment = browser_join_assessment(session_index);
             join_labels_.push_back(session.server_name);
             join_descriptions_.push_back(
-                std::format("HOST {}  •  {}", session.host_name, session.server_message));
-            join_badges_.push_back(
-                std::format("{}  {}/{}  {}", net::join_compatibility_label(assessment.status),
-                            session.current_players, session.maximum_players,
+                std::format("{}  ·  {}/{} players{}", session.host_name, session.current_players,
+                            session.maximum_players,
                             session.ping_milliseconds.has_value()
-                                ? std::format("{} MS", *session.ping_milliseconds)
-                                : std::string{"-- MS"}));
+                                ? std::format("  ·  {} ms", *session.ping_milliseconds)
+                                : std::string{}));
+            join_badges_.push_back(join_protocol_label(session, assessment));
             join_row_sessions_.push_back(session_index);
+            join_row_ids_.push_back(session.session_id);
         }
 
         std::vector<ui::MenuEntry> entries;
@@ -7956,18 +11299,27 @@ class Application::Impl final
             entries.push_back({join_labels_[index], join_descriptions_[index],
                                ui::MenuCommand::select_join_session, true, join_badges_[index]});
         }
-        entries.push_back({"REFRESH", "Refresh friend, public, LAN, and direct session sources.",
+        entries.push_back({"REFRESH", "Refresh the server list.",
                            ui::MenuCommand::refresh_join_sessions, true, "F5"});
-        entries.push_back({"FILTER", "Cycle the active discovery source tab.",
+        entries.push_back({"FILTER", "Choose which servers to show.",
                            ui::MenuCommand::cycle_join_filter, true,
                            join_filter_label(join_browser_.options().filter)});
         entries.push_back({"DIRECT CONNECT",
-                           "Enter a bounded host or IP endpoint manually.",
+                           "Enter a server address.",
                            ui::MenuCommand::direct_connect,
                            true,
                            {}});
         entries.push_back({"BACK", "Return to the main menu.", ui::MenuCommand::back, true, {}});
         menu_.set_join_entries(std::move(entries));
+        // Rows are matched by lobby id: the highlight stays on the same server
+        // (or the same action button) however the refreshed list is ordered. The
+        // first rows to appear take the highlight from the Refresh button.
+        if (menu_.screen() == ui::MenuScreen::join_browser)
+            menu_.set_selection(previous_rows.empty() && highlighted == 0U
+                                    ? 0U
+                                    : net::remap_browser_selection(highlighted, previous_rows,
+                                                                   join_row_ids_),
+                                settings_);
     }
 
     void refresh_join_sessions(bool diagnostic = false, bool quiet = false)
@@ -7976,20 +11328,151 @@ class Application::Impl final
         {
             join_browser_.replace(diagnostic_join_sessions());
             join_browser_state_ = JoinBrowserState::diagnostic;
-            join_browser_status_ = "DETERMINISTIC UI FIXTURES  /  NOT LIVE STEAM SERVERS";
-            selected_join_session_.reset();
+            join_browser_status_ = "Preview servers";
+            join_browser_.select(0U);
             join_password_.clear();
             rebuild_join_menu_entries();
             return;
         }
-        join_browser_state_ = JoinBrowserState::searching;
-        join_browser_status_ = join_browser_.sessions().empty()
-                                   ? "AUTHENTICATING WITH STEAM AND REQUESTING LIVE LOBBIES"
-                                   : "REFRESHING LIVE STEAM LOBBIES  /  CURRENT RESULTS PRESERVED";
-        selected_join_session_.reset();
-        join_password_.clear();
-        rebuild_join_menu_entries();
+        // The rows, the selection and a typed password stay in place while the
+        // refresh runs; its result is matched to them by lobby id.
+        if (online_client_operation_.valid())
+        {
+            // The helper runs one operation at a time. Latch the request: the
+            // discovery in flight satisfies it, or it starts when the helper frees.
+            if (quiet)
+                join_flow_.browser_opened();
+            else
+                join_flow_.request_refresh();
+            if (online_client_pending_ == OnlineClientOperation::discovery)
+            {
+                if (!quiet)
+                    online_discovery_quiet_ = false;
+                join_browser_state_ = JoinBrowserState::searching;
+                join_browser_status_ = "Refreshing servers...";
+            }
+            return;
+        }
         begin_online_discovery(quiet);
+    }
+
+    [[nodiscard]] net::JoinTransportView join_transport_view() const noexcept
+    {
+        net::JoinTransportView view;
+        view.busy = online_client_operation_.valid();
+        view.in_session = online_client_ != nullptr && online_client_joined_;
+        view.ready = !view.busy && !view.in_session && online_client_ != nullptr &&
+                     online_client_->running();
+        return view;
+    }
+
+    // Ends the loading panel and keeps the reason on screen.
+    void show_join_failure(const net::JoinFailureNotice &notice)
+    {
+        online_join_stage_ = OnlineJoinStage::idle;
+        join_failure_lobby_ = online_join_lobby_id_;
+        join_failure_text_ = std::format("{}: {}", notice.title, notice.detail);
+        if (notice.retry_password)
+            join_password_.clear();
+        toast(notice.title, uppercase(notice.detail));
+        std::cerr << "network.client.join.failure=" << notice.title << " / " << notice.detail
+                  << '\n';
+    }
+
+    // A join ended before the world was installed. The helper it used is gone;
+    // the flow restores discovery by itself so the browser never needs a manual
+    // refresh before the next attempt.
+    void fail_online_join(std::string_view reason)
+    {
+        show_join_failure(join_flow_.join_failed(reason));
+    }
+
+    void apply_join_action(net::JoinBrowserAction action)
+    {
+        if (action.failure.has_value())
+            show_join_failure(*action.failure);
+        if (action.kind == net::JoinBrowserAction::Kind::start_discovery)
+            begin_online_discovery(action.quiet);
+        else if (action.kind == net::JoinBrowserAction::Kind::start_join)
+            start_online_join(action.session_id, action.protocol, std::move(action.password));
+    }
+
+    // True from the Join press until the world is installed (or the join ends).
+    [[nodiscard]] bool online_join_in_progress() const noexcept
+    {
+        return online_join_stage_ != OnlineJoinStage::idle &&
+               online_join_stage_ != OnlineJoinStage::preparing_world;
+    }
+
+    // Ends a join that has not reached the world: the player cancelled, or the
+    // host stopped answering. Nothing of the session is kept.
+    void abandon_online_join(std::string_view reason)
+    {
+        if (!online_join_in_progress())
+            return;
+        if (online_client_operation_.valid())
+        {
+            // A queued join only has to be forgotten. A lobby entry in flight
+            // cannot be interrupted; its result is discarded when it lands.
+            if (online_client_pending_ == OnlineClientOperation::join)
+                online_join_cancelled_ = true;
+        }
+        else if (online_client_ != nullptr && online_client_joined_)
+        {
+            std::string ignored;
+            static_cast<void>(online_client_->stop(ignored));
+            online_client_.reset();
+            online_client_joined_ = false;
+            online_lobby_host_is_friend_ = false;
+            online_bootstrap_client_.reset();
+            clear_online_remote_players();
+            online_remote_visuals_.clear();
+            online_world_key_.clear();
+            pending_chunk_reconciliations_.clear();
+            requested_chunk_reconciliations_.clear();
+            chunk_reconcile_overlay_.clear();
+        }
+        fail_online_join(reason);
+    }
+
+    // A silent host must never hold the loading panel: admission and each
+    // bootstrap step are bounded, measured from the host's last traffic.
+    void watch_online_join(float delta)
+    {
+        if (online_client_ == nullptr || !online_client_joined_ ||
+            online_client_operation_.valid() || !online_join_in_progress())
+            return;
+        // Steam may need several seconds to open a relayed P2P session, so the
+        // admission bound is generous; Escape leaves earlier.
+        const bool awaiting_host = online_join_stage_ == OnlineJoinStage::awaiting_admission;
+        if (join_watchdog_.stalled(delta, awaiting_host ? 30.0F : 60.0F))
+            abandon_online_join(awaiting_host ? "HostDidNotAnswer" : "HostStoppedResponding");
+    }
+
+    // A discovery could not run or returned an error. Rows expire after repeated
+    // failures and the flow retries on its own with a growing delay.
+    void note_discovery_failure(std::string_view detail)
+    {
+        join_browser_state_ = JoinBrowserState::failed;
+        join_browser_status_ = uppercase(std::string{detail});
+        net::JoinBrowserAction action = join_flow_.discovery_failed(join_browser_, detail);
+        rebuild_join_menu_entries();
+        apply_join_action(std::move(action));
+        leave_join_details_if_expired();
+    }
+
+    // The details screen describes one lobby. When that lobby leaves the list
+    // there is nothing left to show, so return to the list and say why.
+    void leave_join_details_if_expired()
+    {
+        if (menu_.screen() != ui::MenuScreen::join_details ||
+            join_browser_.selected_index().has_value() ||
+            online_join_stage_ != OnlineJoinStage::idle || text_editing())
+            return;
+        menu_.open(ui::MenuScreen::join_browser);
+        // A join that just failed for this lobby has already said why.
+        if (join_failure_text_.empty() || join_failure_lobby_ != join_browser_.selected_id())
+            toast("SERVER NO LONGER LISTED", "IT WENT OFFLINE OR STOPPED ACCEPTING PLAYERS");
     }
 
     void cycle_join_filter(int direction)
@@ -8004,12 +11487,11 @@ class Application::Impl final
         sound_bank_->play_click();
     }
 
+    // The selection is a lobby id inside the browser model, resolved on every use.
     [[nodiscard]] const net::DiscoveredSession *selected_join_session() const noexcept
     {
-        if (!selected_join_session_.has_value() ||
-            *selected_join_session_ >= join_browser_.sessions().size())
-            return nullptr;
-        return &join_browser_.sessions()[*selected_join_session_];
+        const std::optional<std::size_t> index = join_browser_.selected_index();
+        return index.has_value() ? &join_browser_.sessions()[*index] : nullptr;
     }
 
     [[nodiscard]] std::string host_setting_value(ui::MenuCommand command) const
@@ -8028,12 +11510,16 @@ class Application::Impl final
             return host_settings_.password.empty() ? "NOT SET" : "SET";
         case ui::MenuCommand::select_host_join_policy:
             return net::join_policy_label(host_settings_.join_policy);
+        case ui::MenuCommand::toggle_host_openminerz_only: // (Authority) server mods imply it
+            return !net::requires_extension(host_settings_.mod_manifest) ? "ANYONE"
+                   : host_settings_.mod_manifest.openminerz_only         ? "OPENMINERZ ONLY"
+                                                                         : "OPENMINERZ (MODS)";
         case ui::MenuCommand::select_host_pvp:
             return net::pvp_label(host_settings_.player_versus_player);
         case ui::MenuCommand::toggle_host_anticheat:
             return host_settings_.anti_cheat ? "STRICT" : "OFF";
         case ui::MenuCommand::toggle_host_join_safety:
-            return host_settings_.dedicated_join_safety ? "ON" : "SOURCE EXACT";
+            return host_settings_.dedicated_join_safety ? "ON" : "OFF";
         case ui::MenuCommand::select_host_spawn_protection:
             return host_settings_.spawn_protection_radius == 0
                        ? "OFF"
@@ -8094,6 +11580,9 @@ class Application::Impl final
                 static_cast<net::HostJoinPolicy>((current + step + count) % count);
             break;
         }
+        case ui::MenuCommand::toggle_host_openminerz_only: // (Authority)
+            host_settings_.mod_manifest.openminerz_only = !host_settings_.mod_manifest.openminerz_only;
+            break;
         case ui::MenuCommand::select_host_pvp: {
             constexpr int count = 3;
             const int current = static_cast<int>(host_settings_.player_versus_player);
@@ -8119,91 +11608,33 @@ class Application::Impl final
 
     void navigate_menu(int horizontal, int vertical)
     {
+        // A focus the player moved makes the menu cue; one the list moved by
+        // itself (a refreshed server list) does not.
+        menu_focus_moved_by_input_ = true;
         const ui::MenuScreen screen = menu_.screen();
         std::size_t selection = menu_.selection();
-        if (screen == ui::MenuScreen::main)
+        // The title screen, the multiplayer hub and the host overview are one
+        // column of rows, as every menu of the originals is: Up and Down move
+        // through it (wrapping) and Left and Right do nothing.
+        if (screen == ui::MenuScreen::main || screen == ui::MenuScreen::multiplayer ||
+            screen == ui::MenuScreen::host_setup)
         {
-            if (horizontal != 0)
-            {
-                if (selection < 2U)
-                    selection = selection == 0U ? 1U : 0U;
-                else
-                    selection = 2U + (selection - 2U + (horizontal < 0 ? 3U : 1U)) % 4U;
-            }
-            else if (vertical != 0)
-            {
-                selection =
-                    selection < 2U ? (selection == 0U ? 2U : 4U) : (selection < 4U ? 0U : 1U);
-            }
-            menu_.set_selection(selection, settings_);
-            return;
-        }
-        if (screen == ui::MenuScreen::multiplayer)
-        {
-            if (horizontal != 0 && selection < 2U)
-                selection = selection == 0U ? 1U : 0U;
-            else if (vertical != 0)
-                selection = selection < 2U ? 2U : 0U;
-            menu_.set_selection(selection, settings_);
-            return;
-        }
-        if (screen == ui::MenuScreen::host_setup)
-        {
-            if (horizontal != 0)
-            {
-                if (selection < 4U)
-                    selection = selection % 2U == 0U ? selection + 1U : selection - 1U;
-                else
-                    selection = selection == 4U ? 5U : 4U;
-            }
-            else if (vertical < 0)
-            {
-                if (selection >= 4U)
-                    selection = selection == 4U ? 2U : 3U;
-                else if (selection >= 2U)
-                    selection -= 2U;
-            }
-            else if (vertical > 0)
-            {
-                if (selection < 2U)
-                    selection += 2U;
-                else if (selection < 4U)
-                    selection = selection == 2U ? 4U : 5U;
-            }
-            menu_.set_selection(selection, settings_);
+            if (vertical != 0)
+                menu_.select_next(vertical, settings_);
             return;
         }
         if (screen == ui::MenuScreen::world_select && !menu_.entries().empty())
         {
             const std::size_t back = menu_.entries().size() - 1U;
-            const std::size_t content = back;
-            if (content == 0U)
-                return;
             if (horizontal != 0)
             {
-                if (selection == back)
-                    selection = horizontal < 0 ? content - 1U : 0U;
-                else
-                {
-                    const std::size_t row_start = selection / 3U * 3U;
-                    const std::size_t row_end = std::min(row_start + 3U, content);
-                    const std::size_t row_size = row_end - row_start;
-                    selection =
-                        row_start +
-                        (selection - row_start + (horizontal < 0 ? row_size - 1U : 1U)) % row_size;
-                }
+                selection = horizontal < 0 ? (selection > 5U ? selection - 5U : 0U)
+                                           : std::min(back, selection + 5U);
             }
             else if (vertical < 0)
-            {
-                if (selection == back)
-                    selection = content - 1U;
-                else if (selection >= 3U)
-                    selection -= 3U;
-            }
+                selection = selection == 0U ? back : selection - 1U;
             else if (vertical > 0)
-            {
-                selection = selection != back && selection + 3U < content ? selection + 3U : back;
-            }
+                selection = selection == back ? 0U : selection + 1U;
             menu_.set_selection(selection, settings_);
             return;
         }
@@ -8236,6 +11667,9 @@ class Application::Impl final
 
     void adjust(int direction)
     {
+        // (Add-Ons) Left and Right on an installed mod's row: off and on.
+        if (adjust_selected_addon(direction))
+            return;
         if (menu_.screen() == ui::MenuScreen::join_browser && !menu_.entries().empty() &&
             menu_.entries()[menu_.selection()].command == ui::MenuCommand::cycle_join_filter)
         {
@@ -8251,53 +11685,120 @@ class Application::Impl final
         }
         if (menu_.screen() == ui::MenuScreen::settings)
         {
+            // The keep/revert prompt owns the input until it is answered.
+            if (display_prompt_active())
+                return;
             const auto &rows = ui::rows_for_tab(menu_.settings_tab());
+            if (menu_.selection() >= rows.size())
+                return;
             const ui::SettingId id = rows[menu_.selection()].id;
-            handle(menu_.adjust_selected(settings_, direction));
-            dirty_ = true;
-            dirty_timer_ = 0.45F;
-            SDL_SetRenderVSync(renderer_, settings_.vsync ? 1 : 0);
-            if (id == ui::SettingId::view_distance)
+            // The row says why it is inactive; pressing a key must not quietly
+            // change a value the player cannot see taking effect.
+            if (!ui::setting_unavailable_reason(settings_, id).empty())
+                return;
+            const Settings before = settings_;
+            if (id == ui::SettingId::resolution)
             {
-                world_preview_->set_view_distance(settings_.view_distance);
+                // Only sizes this monitor reports, instead of a fixed list.
+                const auto choices = resolution_choices();
+                ui::adjust_resolution(settings_, direction, choices);
             }
-            if (id == ui::SettingId::particle_quality)
-            {
-                world_preview_->set_particle_density(particle_density(settings_.particle_quality));
-            }
-            if (id == ui::SettingId::tone_mapping || id == ui::SettingId::auto_exposure ||
-                id == ui::SettingId::exposure_compensation || id == ui::SettingId::color_grading)
-            {
-                apply_grading_settings();
-            }
-            if (id == ui::SettingId::master_volume || id == ui::SettingId::music_volume ||
-                id == ui::SettingId::effects_volume || id == ui::SettingId::ambience_volume ||
-                id == ui::SettingId::mute_unfocused)
-            {
-                apply_audio_settings();
-            }
-            if (id == ui::SettingId::raw_mouse_input)
-            {
-                SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE,
-                            settings_.raw_mouse_input ? "0" : "1");
-            }
-            if (id == ui::SettingId::window_mode || id == ui::SettingId::resolution)
-            {
-                apply_window_settings();
-            }
-            if (id == ui::SettingId::texture_style)
-            {
-                toast("RESTART REQUIRED",
-                      std::format("{} ASSET PACK WILL LOAD ON NEXT START",
-                                  ui::setting_value(settings_, ui::SettingId::texture_style)));
-            }
-            if (id == ui::SettingId::audio_output)
-            {
+            else if (id == ui::SettingId::audio_output)
                 cycle_audio_output(direction);
-                toast("RESTART REQUIRED",
-                      std::format("AUDIO WILL USE {} ON NEXT START", settings_.audio_output_name));
-            }
+            else
+                handle(menu_.adjust_selected(settings_, direction));
+            apply_settings_change(before);
+            SDL_SetRenderVSync(renderer_, settings_.vsync ? 1 : 0);
+            restart_notice_for(before);
         }
+    }
+
+    void populate_world_encounters()
+    {
+        if (inventory_.profile() != InventoryProfile::modern || online_client_joined_ ||
+            waiting_for_world_ || inspector_view_)
+            return;
+        auto &region = world_preview_->region();
+        std::vector<std::array<int, 3>> changed;
+        std::size_t budget = pending_encounter_edits_.size() > 1024 ? 0 : 4;
+        for (const auto &chunk : region.chunks())
+        {
+            if (budget == 0) break;
+            if (encounter_state_.populated_chunks.contains({chunk.chunk_x(), chunk.chunk_z()})) continue;
+            for (const auto &edit : world::populate_chunk_encounters(chunk, region, world_seed_, game_mode_, encounter_state_))
+            {
+                const auto block = static_cast<world::BlockType>(edit[3]);
+                region.set_block(edit[0], edit[1], edit[2], block);
+                world_preview_->remember_edit(edit[0], edit[1], edit[2], block);
+                changed.push_back({edit[0], edit[1], edit[2]});
+                pending_encounter_edits_.push_back(edit);
+            }
+            if (--budget == 0) break;
+        }
+        if (!changed.empty()) world_preview_->rebuild_block_edits(changed);
+        std::size_t sent = 0;
+        while (!pending_encounter_edits_.empty() && sent++ < 64)
+        {
+            const auto edit = pending_encounter_edits_.front();
+            const auto block = static_cast<world::BlockType>(edit[3]);
+            // A later edit supersedes a delayed publication; never resurrect it.
+            if (world_preview_->remembered_block(edit[0], edit[1], edit[2]) == block &&
+                !publish_local_block_edit(edit[0], edit[1], edit[2], block)) break;
+            pending_encounter_edits_.erase(pending_encounter_edits_.begin());
+        }
+        if (online_host_ && online_host_->running())
+            (void)online_host_->update_hell_boss_progress(encounter_state_.hell_bosses_spawned,
+                                                        encounter_state_.max_hell_boss_spawns);
+    }
+
+    // The atomic replace flushes to disk, which cost 13-20 ms on the frame
+    // thread every 15 s. Periodic saves write a snapshot on a worker instead;
+    // `wait` is for shutdown, where the final state must reach the disk.
+    void persist_progress(bool wait = false)
+    {
+        if (progress_path_.empty()) return;
+        progress_save_timer_ = 15.0F;
+        if (progress_save_.valid())
+        {
+            if (!wait &&
+                progress_save_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
+            {
+                // An earlier write is still in flight; never queue a second
+                // one behind it, just come back shortly with newer state.
+                progress_save_timer_ = 1.0F;
+                return;
+            }
+            if (!progress_save_.get())
+                std::cerr << "player progress save failed\n";
+        }
+        if (wait)
+        {
+            if (!save_player_progress(progress_path_, progress_))
+                std::cerr << "player progress save failed\n";
+            return;
+        }
+        progress_save_ = std::async(std::launch::async,
+                                    [path = progress_path_, snapshot = progress_] {
+                                        return save_player_progress(path, snapshot);
+                                    });
+    }
+
+    void update_progress(float delta, float previous_day)
+    {
+        if (inspector_view_ || options_.screenshot_path.has_value()) return;
+        const auto &position = player_.state().position;
+        progress_.observe(game_mode_, std::min(double(delta), 1.0), position.x, position.y, position.z,
+                          previous_day, day_night_.day(), inventory_.selected_item());
+        const auto earned = progress_.unlock_earned(unix_now());
+        for (auto index : earned) achievement_notifications_.push_back(index);
+        if (!earned.empty())
+        {
+            menu_.set_gameplay_profile(gameplay_profile_ == InventoryProfile::modern,
+                                      progress_.value(ProgressMetric::undead_dragon) > 0);
+            persist_progress();
+        }
+        progress_save_timer_ -= delta;
+        if (progress_save_timer_ <= 0) persist_progress();
     }
 
     void begin_offline_world()
@@ -8312,56 +11813,44 @@ class Application::Impl final
         {
             cancel_world_action();
             SDL_SetWindowRelativeMouseMode(window_, false);
-            toast("PREPARING FRONTIER", "GENERATING AND MESHING THE ACTIVE PLAY WINDOW");
         }
         else
         {
             spawn_player();
             SDL_SetWindowRelativeMouseMode(window_, true);
-            toast(std::format("{} / {}", game_mode_label(game_mode_),
-                              game_difficulty_label(difficulty_)),
-                  std::format("SEED {}  /  {} CHUNKS  /  {:L} EXPOSED FACES", world_seed_,
-                              world_preview_->stats().chunk_count,
-                              world_preview_->stats().visible_face_count));
         }
     }
 
     void begin_online_discovery(bool quiet = false)
     {
+        // One helper operation at a time. refresh_join_sessions latches a request
+        // made while another is in flight, so nothing is lost by returning here.
         if (online_client_operation_.valid())
-        {
-            if (!quiet && online_client_pending_ == OnlineClientOperation::discovery)
-                online_discovery_quiet_ = false;
-            join_browser_state_ = JoinBrowserState::searching;
-            join_browser_status_ = "WAITING FOR THE ACTIVE LIVE STEAM LOBBY QUERY";
-            if (!quiet)
-                toast("STEAM DISCOVERY BUSY", "WAITING FOR THE CURRENT LOBBY QUERY");
             return;
-        }
         if (online_client_ != nullptr && online_client_joined_)
         {
             join_browser_state_ = JoinBrowserState::failed;
-            join_browser_status_ = "LEAVE THE CURRENT SESSION BEFORE REFRESHING";
+            join_browser_status_ = "LEAVE THE SERVER BEFORE REFRESHING";
             if (!quiet)
-                toast("ALREADY IN SESSION", "LEAVE THE CURRENT SESSION BEFORE REFRESHING");
+                toast("ALREADY IN SESSION", "LEAVE THE SERVER BEFORE REFRESHING");
             return;
         }
         const std::filesystem::path steam_api = installed_steam_api_path();
         if (steam_api.empty())
         {
-            join_browser_state_ = JoinBrowserState::failed;
-            join_browser_status_ = "OWNED X86 STEAM_API.DLL WAS NOT FOUND";
             if (!quiet)
                 toast("STEAM RUNTIME NOT FOUND",
                       "SET OPENMINERZ_STEAM_API TO THE OWNED X86 STEAM_API.DLL");
+            note_discovery_failure("Steam support files are missing.");
             return;
         }
         online_client_pending_ = OnlineClientOperation::discovery;
         online_discovery_quiet_ = quiet;
         join_browser_state_ = JoinBrowserState::searching;
-        join_browser_status_ = "AUTHENTICATING WITH STEAM  /  WORLDWIDE PUBLIC  /  MAX 50";
+        join_browser_status_ = join_browser_.sessions().empty() ? "Searching for servers..."
+                                                                 : "Refreshing servers...";
         if (!quiet)
-            toast("SEARCHING STEAM LOBBIES", "FRIENDS FIRST  /  WORLDWIDE PUBLIC  /  MAX 50");
+            toast("SEARCHING STEAM LOBBIES", "Looking for friends and public servers.");
         if (online_client_ != nullptr)
         {
             std::unique_ptr<net::LegacySteamRuntimeClient> client = std::move(online_client_);
@@ -8397,15 +11886,14 @@ class Application::Impl final
             });
     }
 
+    // The player asked to join a preflighted lobby. The loading panel opens at
+    // once; the flow starts the join now, or queues it behind the helper's current
+    // work and re-resolves the lobby by id. No manual refresh is ever required.
     void begin_online_join(std::uint64_t lobby_id, net::ProtocolVersion protocol,
                            std::string password)
     {
-        if (online_client_operation_.valid() || online_client_ == nullptr || online_client_joined_)
-        {
-            toast("JOIN TRANSPORT UNAVAILABLE", "REFRESH DISCOVERY BEFORE JOINING");
+        if (online_join_stage_ != OnlineJoinStage::idle)
             return;
-        }
-        online_client_pending_ = OnlineClientOperation::join;
         online_join_stage_ = OnlineJoinStage::joining_lobby;
         online_client_protocol_ = protocol;
         online_join_elapsed_ = 0.0F;
@@ -8414,25 +11902,59 @@ class Application::Impl final
         online_join_detail_ = "CONTACTING STEAM MATCHMAKING";
         online_sync_chunks_received_ = 0U;
         online_sync_chunks_total_ = 0U;
-        if (const net::DiscoveredSession *session = selected_join_session(); session != nullptr)
+        join_failure_text_.clear();
+        join_failure_lobby_ = 0U;
+        const std::optional<std::size_t> index = join_browser_.index_of(lobby_id);
+        if (index.has_value())
         {
-            online_join_server_name_ = uppercase(session->server_name);
-            online_join_host_name_ = uppercase(session->host_name);
+            const net::DiscoveredSession &session = join_browser_.sessions()[*index];
+            online_join_server_name_ = uppercase(session.server_name);
+            online_join_host_name_ = uppercase(session.host_name);
         }
         else
         {
             online_join_server_name_ = std::format("STEAM LOBBY {}", lobby_id);
         }
+        // A re-resolved row is judged like any browser row: against this client's
+        // mod profile for the row's own protocol, and against the local Steam id.
+        join_flow_.set_assessor(
+            [this](const net::DiscoveredSession &session) { return assess_join_session(session); });
+        apply_join_action(join_flow_.request_join(lobby_id, std::move(password),
+                                                  join_transport_view(), join_browser_));
+    }
+
+    // Hands the lobby to the idle browsing helper. Only the join flow calls this,
+    // after it has resolved the lobby against the helper's current list.
+    void start_online_join(std::uint64_t lobby_id, net::ProtocolVersion protocol,
+                           std::string password)
+    {
+        if (online_client_operation_.valid() || online_client_ == nullptr || online_client_joined_)
+        {
+            fail_online_join("The Steam helper was busy. Join again.");
+            return;
+        }
+        online_client_pending_ = OnlineClientOperation::join;
+        online_join_stage_ = OnlineJoinStage::joining_lobby;
+        online_join_cancelled_ = false;
+        online_client_protocol_ = protocol;
+        online_join_lobby_id_ = lobby_id;
         toast("JOINING STEAM LOBBY", std::format("LOBBY {}  /  NEGOTIATING ADMISSION", lobby_id));
         std::unique_ptr<net::LegacySteamRuntimeClient> client = std::move(online_client_);
+        if (join_client_manifest_.protocol != protocol)
+        {
+            join_client_manifest_ = join_manifest_for(protocol);
+            join_browser_.set_client(join_client_manifest_, true);
+        }
         const net::ModManifest client_manifest = join_client_manifest_;
+        // (Network) Per-session mod selection and mod download on join.
+        std::shared_ptr<net::ModJoinDownloadContext> downloads = mod_join_download_context();
         online_client_operation_ = std::async(
             std::launch::async, [client = std::move(client), lobby_id, protocol, client_manifest,
-                                 password = std::move(password)]() mutable {
+                                 password = std::move(password), downloads]() mutable {
                 OnlineClientOperationResult result;
                 result.client = std::move(client);
                 if (!result.client->join(lobby_id, protocol, client_manifest, std::move(password),
-                                         result.ready, result.error))
+                                         result.ready, result.error, downloads.get()))
                 {
                     std::string ignored;
                     static_cast<void>(result.client->stop(ignored));
@@ -8516,6 +12038,15 @@ class Application::Impl final
         return online_host_->send_authoritative(outbound, error);
     }
 
+    // IsOnlineGame: a real session, never the offline multiplayer-rendering
+    // diagnostic, because this decides damage and the clock.
+    [[nodiscard]] bool in_online_session() const noexcept
+    {
+        return (online_host_ != nullptr && online_host_->running()) ||
+               (online_client_ != nullptr && online_client_joined_ &&
+                online_client_->connected() && online_bootstrap_client_ == nullptr);
+    }
+
     [[nodiscard]] bool online_gameplay_active() const noexcept
     {
         return options_.diagnostic_multiplayer ||
@@ -8591,7 +12122,10 @@ class Application::Impl final
         const float dz = dig.location.z - remote->second.state.position.z;
         if (!net::valid_network_surface_normal(dig.direction))
             return false;
-        if (dx * dx + dy * dy + dz * dz > 49.0F)
+        // The construction probe reaches five units from the camera and this is
+        // measured from a replicated position that trails the sender by a few
+        // updates; seven left no room for a moving player.
+        if (dx * dx + dy * dy + dz * dz > 100.0F)
             return !enforce_spatial_authority;
         world::BlockBreakUpdate impact;
         impact.block = static_cast<world::BlockType>(dig.block_type);
@@ -8602,7 +12136,10 @@ class Application::Impl final
         const world::Vec3 sound_position = remote->second.state.position;
         play_positional(dig.placing ? std::string_view{"Place"} : dig_sound_cue(impact.block),
                         sound_position);
-        world_preview_->spawn_mining_impact(impact);
+        if (dig.placing)
+            world_preview_->spawn_block_placed(impact);
+        else
+            world_preview_->spawn_mining_impact(impact);
         return true;
     }
 
@@ -8619,16 +12156,25 @@ class Application::Impl final
         sound_bank_->stop_music();
         day_night_ = world::DayNightCycle{0.4F};
         last_day_number_ = 0;
+        hud_last_time_of_day_ = -1.0F; // InGameHUD.Reset()
         max_distance_ = 0;
         damage_indicators_.clear();
         cancel_world_action();
-        toast("LEVEL RESTARTED", "THE HOST RETURNED EVERYONE TO THE START");
+        toast("LEVEL RESTARTED", "EVERYONE WAS RETURNED TO THE START");
         return true;
     }
 
     [[nodiscard]] std::uint8_t online_local_player_gid() const noexcept
     {
         return online_host_ != nullptr && online_host_->running() ? 0U : online_local_gid_;
+    }
+
+    // Is this GID somebody in the session: the host, ourselves, or a peer whose
+    // presence we have already announced? Credit fields name a damage owner
+    // rather than the sender, so this is the right validation for them.
+    [[nodiscard]] bool online_gid_is_known(std::uint8_t gid) const noexcept
+    {
+        return gid == 0U || gid == online_local_player_gid() || online_remote_players_.contains(gid);
     }
 
     void sync_network_pickup_mode()
@@ -8678,7 +12224,8 @@ class Application::Impl final
         sound_bank_->play_pickup();
         caption("[ ITEM PICKED UP ]", 1.2F);
         toast(remainder == 0U ? "ITEM PICKED UP" : "INVENTORY FULL",
-              std::format("{} ×{}", item_name(stack.item), stack.count - remainder));
+              std::format("{} ×{}", mod_item_label(stack, item_name(stack.item)), // Modding, visuals area
+                          stack.count - remainder));
         sync_selected_item();
     }
 
@@ -8695,7 +12242,14 @@ class Application::Impl final
             net::InventoryItemPayload item;
             net::PayloadError payload_error{};
             net::CreatePickupPayload message;
-            message.spawn_position = {spawned.position.x, spawned.position.y, spawned.position.z};
+            // 1.9.9.8 PickupManager.HandleCreatePickupMessage places every
+            // pickup at SpawnPosition + (0.5, 0.5, 0.5); 1.6.3.8 at
+            // SpawnPosition. The local entity already stands where it should,
+            // so a Modern session is told half a block less on each axis.
+            const float wire_offset = protocol == net::ProtocolVersion::modern_v4 ? 0.5F : 0.0F;
+            message.spawn_position = {spawned.position.x - wire_offset,
+                                      spawned.position.y - wire_offset,
+                                      spawned.position.z - wire_offset};
             message.spawn_vector = {spawned.velocity.x, spawned.velocity.y, spawned.velocity.z};
             message.pickup_id = spawned.pickup_id;
             message.dropped = spawned.dropped;
@@ -8719,7 +12273,10 @@ class Application::Impl final
                     world_preview_->consume_network_pickup(spawned.pickup_id, local_gid));
                 std::cerr << "network.local.create-pickup.failure=" << error << '\n';
                 success = false;
+                continue;
             }
+            // Modding (Integration): a mod item's identity rides the mod channel.
+            mod_gameplay_pickup_published(local_gid, spawned.pickup_id, spawned.stack);
         }
         return success;
     }
@@ -8757,7 +12314,13 @@ class Application::Impl final
         if (!consumed.has_value())
             return false;
         if (picker_gid == 0U)
-            award_local_pickup(consumed->stack);
+        {
+            InventoryStack stack = consumed->stack;
+            mod_gameplay_pickup_identity(stack, spawner_id, pickup_id); // Modding (Integration)
+            award_local_pickup(stack);
+        }
+        else
+            authority_pickup_given(picker_gid, spawner_id, pickup_id, consumed->stack); // (Authority)
         return true;
     }
 
@@ -8792,12 +12355,17 @@ class Application::Impl final
         net::CreatePickupPayload message;
         net::PayloadError payload_error{};
         InventoryStack stack;
+        // 1.9.9.8 HandleCreatePickupMessage: LocalPosition = SpawnPosition +
+        // (0.5, 0.5, 0.5). 1.6.3.8 uses SpawnPosition as it is.
+        const float entity_offset = protocol == net::ProtocolVersion::modern_v4 ? 0.5F : 0.0F;
         return world_preview_ != nullptr &&
                net::decode_create_pickup_payload(payload, protocol, message, payload_error) &&
                pickup_item_to_stack(message.item, protocol, stack) &&
                world_preview_->spawn_network_pickup(
                    stack,
-                   {message.spawn_position.x, message.spawn_position.y, message.spawn_position.z},
+                   {message.spawn_position.x + entity_offset,
+                    message.spawn_position.y + entity_offset,
+                    message.spawn_position.z + entity_offset},
                    {message.spawn_vector.x, message.spawn_vector.y, message.spawn_vector.z},
                    message.pickup_id, spawner_gid, message.dropped, message.display_on_pickup);
     }
@@ -8817,9 +12385,35 @@ class Application::Impl final
         if (message.picker_upper != online_local_gid_)
             return true;
         InventoryStack stack;
-        if (!consumed.has_value() || !pickup_item_to_stack(message.item, protocol, stack))
+        if (!pickup_item_to_stack(message.item, protocol, stack))
             return false;
+        // PickupManager.HandleConsumePickupMessage credits the named picker-upper
+        // from the host's copy of the item whether or not this peer still holds
+        // the entity. Requiring a local entity destroyed the item whenever the
+        // local copy had already timed out, had been refused by the 1000-entity
+        // cap, or lost its CreatePickupMessage. The key set only guards against a
+        // replayed frame, which the stock reliable transport never produces.
+        static_cast<void>(consumed);
+        if (!remember_consumed_pickup(message.pickup_id, message.spawner_id))
+            return true;
+        // Modding (Integration): a mod item's identity, from the mod channel.
+        mod_gameplay_pickup_identity(stack, message.spawner_id, message.pickup_id);
         award_local_pickup(stack);
+        return true;
+    }
+
+    // Bounded, insertion-ordered record of the consumptions already credited to
+    // the local player. Returns false when this exact consumption was credited
+    // before and must not be paid twice.
+    [[nodiscard]] bool remember_consumed_pickup(std::int32_t pickup_id, std::int32_t spawner_id)
+    {
+        constexpr std::size_t remembered_consumptions = 256U;
+        const std::pair<std::int32_t, std::int32_t> key{pickup_id, spawner_id};
+        if (std::ranges::find(credited_pickups_, key) != credited_pickups_.end())
+            return false;
+        credited_pickups_.push_back(key);
+        while (credited_pickups_.size() > remembered_consumptions)
+            credited_pickups_.pop_front();
         return true;
     }
 
@@ -8828,15 +12422,28 @@ class Application::Impl final
     {
         if (protocol == net::ProtocolVersion::classic_v3 || player_name.empty())
             return sender_gid;
-        const std::uint8_t local_gid = online_local_player_gid();
-        const std::string_view local_name = online_persona_name_.empty()
-                                                ? std::string_view{"OpenMinerZ"}
-                                                : std::string_view{online_persona_name_};
-        if (player_name == local_name)
-            return local_gid;
+        // A player whose display tag was de-duplicated at admission still names
+        // itself with its own tag; that name means the sender, not whoever else
+        // is listed under it. The sender's own labels come first on BOTH roles,
+        // which is also the one answer every peer in the session agrees on.
+        if (const auto sender = online_remote_players_.find(sender_gid);
+            sender != online_remote_players_.end() &&
+            online_player_answers_to(sender->second, player_name))
+            return sender_gid;
+        if (online_host_ != nullptr)
+            if (const std::string *self_tag = online_host_->self_reported_tag_for_gid(sender_gid);
+                self_tag != nullptr && !self_tag->empty() && *self_tag == player_name)
+                return sender_gid;
+        // Otherwise the lowest GID answering to that label. Two peers CAN now
+        // answer to the same label - one admitted under it, one self-reporting
+        // it - and every peer must land on the same GID or a kill is credited
+        // to nobody. GID order is the only tie-break the whole session shares.
         std::optional<std::uint8_t> result;
+        if (local_player_answers_to(player_name))
+            result = online_local_player_gid();
         for (const auto &[gid, remote] : online_remote_players_)
-            if (remote.gamer_tag == player_name && (!result.has_value() || gid < *result))
+            if (online_player_answers_to(remote, player_name) &&
+                (!result.has_value() || gid < *result))
                 result = gid;
         return result;
     }
@@ -8858,8 +12465,19 @@ class Application::Impl final
                                             static_cast<std::uint32_t>(message.enemy_id)};
         if (enemy_horde_.find_enemy(identity).has_value())
             return true; // The stock local echo follows our eager local spawn.
-        if (message.enemy_type >= world::enemy_type_count)
+        // The byte is generation-specific; see world::enemy_type_from_wire.
+        const auto enemy_type = world::enemy_type_from_wire(
+            message.enemy_type, protocol == net::ProtocolVersion::modern_v4);
+        if (!enemy_type.has_value())
             return false;
+        // mod-ai: a server mod's retail enemy rules hold for every peer's
+        // spawns; one its sender should not have made is ignored here.
+        if (mod_ai_retail_refuses(*enemy_type,
+                                  {message.spawn_position.x, message.spawn_position.y, message.spawn_position.z},
+                                  message.spawner_position.x != 0.0F || message.spawner_position.y != 0.0F ||
+                                      message.spawner_position.z != 0.0F,
+                                  false))
+            return true;
         if (message.initialization.slow_speed_milliseconds > 100'000 ||
             message.initialization.fast_speed_milliseconds > 100'000 ||
             message.initialization.emerge_speed_milliseconds > 100'000 ||
@@ -8874,15 +12492,23 @@ class Application::Impl final
             const float dx = message.spawn_position.x - remote->second.state.position.x;
             const float dy = message.spawn_position.y - remote->second.state.position.y;
             const float dz = message.spawn_position.z - remote->second.state.position.z;
-            if (dx * dx + dy * dy + dz * dz > 15'625.0F)
+            // An archer spawns up to 40 cells out on each axis, led by five
+            // seconds of the player's velocity, on the TOPMOST ground above a
+            // player who may be deep underground: 125 units clipped the far
+            // corner of what EnemyManager.SpawnAbovegroundEnemy can produce.
+            if (dx * dx + dy * dy + dz * dz > 40'000.0F)
                 return false;
         }
-        std::size_t target_count{};
-        for (const world::Enemy &enemy : enemy_horde_.enemies())
-            if (enemy.target_gid == *target_gid && enemy.state != world::EnemyState::despawn)
-                ++target_count;
-        if (target_count >= 64U)
-            return false;
+        // HandleSpawnEnemyMessage's own admission rule, which both stock
+        // generations share: an announced enemy belonging to another player is
+        // accepted below 45 total enemies, then only one in four up to 50, and
+        // none beyond. A refusal is deliberate and silent in the original, so
+        // the packet stays accepted here (the host must keep relaying it) and
+        // only the local entity is skipped. The previous 64-per-target cap let
+        // this peer hold enemies a stock peer in the same session had thrown
+        // away, and vice versa.
+        if (!enemy_horde_.accept_remote_spawn())
+            return true;
         if (protocol == net::ProtocolVersion::modern_v4 &&
             message.spawner_position.x >= -1'000'000.0F &&
             message.spawner_position.x <= 1'000'000.0F && message.spawner_position.y >= -64.0F &&
@@ -8910,11 +12536,36 @@ class Application::Impl final
             static_cast<float>(message.initialization.run_activation_milliseconds) / 1'000.0F,
             static_cast<float>(message.initialization.normal_activation_milliseconds) / 1'000.0F};
         if (!enemy_horde_.spawn_networked(
-                static_cast<int>(message.enemy_type),
+                *enemy_type,
                 {message.spawn_position.x, message.spawn_position.y, message.spawn_position.z},
                 initialization, static_cast<std::uint32_t>(message.enemy_id), message.random_seed,
                 *target_gid))
             return false;
+        // Modding, gameplay area: every peer scales its copy by the replicated
+        // difficulty; the host's server mods hear of it.
+        mod_gameplay_enemy_appeared(enemy_horde_.enemies().back(), sender_gid);
+        // 1.9.9.8 HandleSpawnEnemyMessage: a non-zero SpawnerPosition that
+        // names a spawner becomes BaseZombie.SpawnSource, and SetDistanceLimit
+        // lets that enemy chase to 100 blocks (300 from a hell block).
+        if (protocol == net::ProtocolVersion::modern_v4 &&
+            (message.spawner_position.x != 0.0F || message.spawner_position.y != 0.0F ||
+             message.spawner_position.z != 0.0F))
+        {
+            const auto source_block = online_block_at(
+                net::IntVector3{static_cast<int>(std::floor(message.spawner_position.x)),
+                                static_cast<int>(std::floor(message.spawner_position.y)),
+                                static_cast<int>(std::floor(message.spawner_position.z))});
+            if (source_block.has_value() && world::is_spawner(*source_block))
+            {
+                world::Enemy &spawned = enemy_horde_.enemies().back();
+                spawned.spawner_sourced = true;
+                spawned.hell_spawner = *source_block == world::BlockType::hell_spawn_on ||
+                                       *source_block == world::BlockType::hell_spawn_off ||
+                                       *source_block == world::BlockType::hell_spawn_dim;
+            }
+        }
+        if (*enemy_type == world::enemy_alien && game_mode_ == GameMode::endurance)
+            progress_.add(ProgressMetric::alien);
         if (require_remote_position && protocol == net::ProtocolVersion::modern_v4 &&
             message.spawn_value > 0)
         {
@@ -8925,8 +12576,7 @@ class Application::Impl final
             if (source_block.has_value() && world::is_spawner(*source_block))
                 remote_spawner_enemy_owners_[identity] = sender_gid;
         }
-        if (world::enemy_stats(static_cast<int>(message.enemy_type)).habitat ==
-            world::EnemyHabitat::aboveground)
+        if (world::enemy_stats(*enemy_type).habitat == world::EnemyHabitat::aboveground)
         {
             const world::Vec3 position{message.spawn_position.x, message.spawn_position.y,
                                        message.spawn_position.z};
@@ -8941,6 +12591,9 @@ class Application::Impl final
                                                 const net::DecodedPacket &decoded,
                                                 bool require_existing)
     {
+        // Retained for call-site symmetry: EnemyManager's handlers never treat
+        // a missing enemy as an error, so neither role demands one exists.
+        static_cast<void>(require_existing);
         net::PayloadError payload_error{};
         if (decoded.message->name == "KillEnemyMessage")
         {
@@ -8948,15 +12601,32 @@ class Application::Impl final
             InventoryItemId weapon{};
             if (!net::decode_kill_enemy_payload(decoded.payload, protocol, message,
                                                 payload_error) ||
-                message.killer_id != sender_gid ||
                 !net::inventory_item_from_wire(message.weapon_id, protocol, weapon))
+                return false;
+            // KillerID is the owner of the damage, NOT the sender: every peer
+            // simulates every bullet, grenade and rocket against its own copy
+            // of the horde, and whichever copy reaches zero health first sends
+            // the kill naming the shooter. BaseZombie.TakeExplosiveDamage in
+            // particular credits the explosion's gamerID while the message
+            // leaves from the peer whose simulation noticed. Demanding
+            // killer == sender silently dropped (and, on the host, refused to
+            // relay) every cross-credited kill, leaving the enemy dead for one
+            // player and alive for everyone else.
+            if (!online_gid_is_known(message.killer_id))
                 return false;
             const world::EnemyIdentity identity{static_cast<std::uint8_t>(message.target_id),
                                                 static_cast<std::uint32_t>(message.enemy_id)};
-            if (!enemy_horde_.find_enemy(identity).has_value())
-                return !require_existing;
+            const auto index = enemy_horde_.find_enemy(identity);
+            // HandleKillEnemyMessage simply finds nothing when this peer culled
+            // the enemy or already killed it. That is a no-op, not a protocol
+            // fault, and the host must still relay it to the other guests.
+            if (!index)
+                return true;
+            const int enemy_type = enemy_horde_.enemies()[*index].type;
             if (!enemy_horde_.kill_enemy(identity, message.killer_id == online_local_player_gid()))
-                return false;
+                return true;
+            if (message.killer_id == online_local_player_gid())
+                progress_.record_enemy_kill(game_mode_, enemy_type, weapon);
             remote_spawner_enemy_owners_.erase(identity);
             notify_local_spawner_enemy_defeated(identity, message.killer_id);
             return true;
@@ -8968,16 +12638,23 @@ class Application::Impl final
             return false;
         const world::EnemyIdentity identity{static_cast<std::uint8_t>(message.target_id),
                                             static_cast<std::uint32_t>(message.enemy_id)};
-        if (!enemy_horde_.find_enemy(identity).has_value())
-            return !require_existing;
+        // Both handlers search for a live enemy and return when nothing matches:
+        // the enemy may have been culled here, already dead, already enraged or
+        // already giving up. None of that is a fault of the sender, and refusing
+        // the packet on the host suppressed the relay and desynchronised the
+        // other guests.
         if (decoded.message->name == "SpeedUpEnemyMessage")
-            return enemy_horde_.speed_up_enemy(identity);
+        {
+            static_cast<void>(enemy_horde_.speed_up_enemy(identity));
+            return true;
+        }
         if (decoded.message->name == "EnemyGiveUpMessage")
         {
-            if (!enemy_horde_.give_up_enemy(identity))
-                return false;
-            remote_spawner_enemy_owners_.erase(identity);
-            notify_local_spawner_enemy_removed(identity);
+            if (enemy_horde_.give_up_enemy(identity))
+            {
+                remote_spawner_enemy_owners_.erase(identity);
+                notify_local_spawner_enemy_removed(identity);
+            }
             return true;
         }
         return false;
@@ -9015,20 +12692,32 @@ class Application::Impl final
             const float dz = position.z - eye.z;
             return dx * dx + dy * dy + dz * dz <= 100.0F;
         };
+        // PRESENTATION ONLY: one muzzle flash per shot message (a shotgun's
+        // five pellets are one trigger pull).
+        bool remote_flash_shown{};
         const auto spawn_shot = [&](world::Vec3 direction, InventoryItemId item) {
             const GunStats *stats = gun_stats(item);
             if (stats == nullptr)
                 return false;
             world::Vec3 origin = eye;
+            const world::Vec3 right{std::cos(remote.yaw), 0.0F, std::sin(remote.yaw)};
+            const world::Vec3 up{right.y * direction.z - right.z * direction.y,
+                                 right.z * direction.x - right.x * direction.z,
+                                 right.x * direction.y - right.y * direction.x};
+            // Where GetGunTipPosition puts the weapon's tip.
+            const world::Vec3 gun_tip{
+                eye.x + direction.x * 0.55F + right.x * 0.28F - up.x * 0.22F,
+                eye.y + direction.y * 0.55F + right.y * 0.28F - up.y * 0.22F,
+                eye.z + direction.z * 0.55F + right.z * 0.28F - up.z * 0.22F};
             if (is_laser_gun(item))
+                origin = gun_tip;
+            if (!remote_flash_shown && world_preview_ != nullptr)
             {
-                const world::Vec3 right{std::cos(remote.yaw), 0.0F, std::sin(remote.yaw)};
-                const world::Vec3 up{right.y * direction.z - right.z * direction.y,
-                                     right.z * direction.x - right.x * direction.z,
-                                     right.x * direction.y - right.y * direction.x};
-                origin = {eye.x + direction.x * 0.55F + right.x * 0.28F - up.x * 0.22F,
-                          eye.y + direction.y * 0.55F + right.y * 0.28F - up.y * 0.22F,
-                          eye.z + direction.z * 0.55F + right.z * 0.28F - up.z * 0.22F};
+                remote_flash_shown = true;
+                world_preview_->spawn_gun_flash(
+                    item, is_laser_gun(item),
+                    weapon_damage_flags(item) == world::DamageFlags::shotgun,
+                    projectile_tint(item), gun_tip, direction, remote.velocity);
             }
             spawn_tracer(origin, direction, stats->enemy_damage, weapon_damage_flags(item), item,
                          false, sender_gid, false);
@@ -9046,6 +12735,7 @@ class Application::Impl final
                 !spawn_shot(direction, item))
                 return false;
             play_positional(gun_stats(item)->shoot_cue, remote.position);
+            mod_ai_noise(remote.position, 32.0F, "gunshot", sender_gid); // mod-ai
             return true;
         }
         if (decoded.message->name == "ShotgunShotMessage")
@@ -9073,8 +12763,9 @@ class Application::Impl final
             net::GrenadePayload message;
             world::Vec3 direction;
             if (!net::decode_grenade_payload(decoded.payload, protocol, message, payload_error) ||
-                !network_direction(message.direction, direction) || message.seconds_left < 1.0F ||
-                message.seconds_left > 5.0F || !close_to_remote_eye(message.position))
+                !network_direction(message.direction, direction) ||
+                !net::stock_grenade_fuse_valid(message.seconds_left) ||
+                !close_to_remote_eye(message.position))
                 return false;
             Grenade grenade;
             grenade.position = {message.position.x, message.position.y, message.position.z};
@@ -9086,6 +12777,10 @@ class Application::Impl final
             grenade.owner_gid = sender_gid;
             grenade.locally_authoritative = false;
             grenades_.push_back(grenade);
+            // Player.ProcessGrenadeMessage: Play("Grenade_Reset", 3, 0) on the thrower.
+            if (const auto thrower = online_remote_players_.find(sender_gid);
+                thrower != online_remote_players_.end() && thrower->second.animator_started)
+                thrower->second.animator.play_grenade_reset();
             return true;
         }
         if (decoded.message->name == "FireRocketMessage")
@@ -9260,22 +12955,35 @@ class Application::Impl final
                                                         payload_error) ||
                 !bounded_world_cell(message.location) || message.explosive_type > 1U)
                 return false;
+            // Explosive.HandleDetonateExplosiveMessage never looks at what is
+            // in the cell: it clears it, shows the effect and applies the
+            // splash, every time. A detonation for a cell that is ALREADY empty
+            // is ordinary stock traffic, because TracerManager detonates a shot
+            // charge on every peer whose own tracer reaches it and each of those
+            // peers broadcasts its own message. Refusing the later ones meant an
+            // OpenMinerZ host did not relay them and an OpenMinerZ guest skipped
+            // a splash every stock peer applied. The one thing kept from the old
+            // rule is that only a cell still holding a charge is cleared, so a
+            // late duplicate cannot erase whatever was built there meanwhile.
             const auto block = online_block_at(message.location);
-            if (!block.has_value() ||
-                (*block != world::BlockType::tnt && *block != world::BlockType::c4))
-                return false;
-            if (require_projectile &&
-                !online_host_->apply_authoritative_block_edit(message.location, 0U))
-                return false;
-            world_preview_->remember_edit(message.location.x, message.location.y,
-                                          message.location.z, world::BlockType::empty);
-            if (world_preview_->region().contains(message.location.x, message.location.y,
-                                                  message.location.z))
+            const bool charge_present = block.has_value() && (*block == world::BlockType::tnt ||
+                                                              *block == world::BlockType::c4);
+            if (charge_present)
             {
-                world_preview_->region().set_block(message.location.x, message.location.y,
-                                                   message.location.z, world::BlockType::empty);
-                world_preview_->rebuild_block_edit(message.location.x, message.location.y,
-                                                   message.location.z);
+                if (require_projectile &&
+                    !online_host_->apply_authoritative_block_edit(message.location, 0U))
+                    return false;
+                world_preview_->remember_edit(message.location.x, message.location.y,
+                                              message.location.z, world::BlockType::empty);
+                if (world_preview_->region().contains(message.location.x, message.location.y,
+                                                      message.location.z))
+                {
+                    world_preview_->region().set_block(message.location.x, message.location.y,
+                                                       message.location.z,
+                                                       world::BlockType::empty);
+                    world_preview_->rebuild_block_edit(message.location.x, message.location.y,
+                                                       message.location.z);
+                }
             }
             std::erase_if(armed_explosives_, [&](const ArmedExplosive &armed) {
                 return armed.x == message.location.x && armed.y == message.location.y &&
@@ -9287,7 +12995,9 @@ class Application::Impl final
             if (message.original_explosion)
             {
                 play_positional("Explosion", location);
-                world_preview_->spawn_fireball_explosion(location, false, true);
+                world_preview_->spawn_fireball_explosion(
+                    location, false, true,
+                    message.explosive_type == 0U ? ExplosionStyle::tnt : ExplosionStyle::c4);
             }
             const world::ExplosiveKind kind =
                 message.explosive_type == 0U ? world::ExplosiveKind::tnt : world::ExplosiveKind::c4;
@@ -9302,17 +13012,25 @@ class Application::Impl final
                                                       payload_error))
                 return false;
             const world::Vec3 location{message.location.x, message.location.y, message.location.z};
-            const bool authorized =
-                authorize_network_detonation(NetworkProjectileKind::grenade, sender_gid,
-                                             message.grenade_type, location, protocol);
-            if (require_projectile && !authorized)
-                return false;
+            // GrenadeProjectile.HandleDetonateGrenadeMessage explodes at the
+            // location the OWNER reports and consults no local grenade: every
+            // peer's own copy of a thrown grenade is scenery that retires itself
+            // on its own timer. This lookup therefore only retires the local
+            // copy early. It used to be a condition, on the host, for relaying
+            // the explosion at all - so whenever this host's simulation of a
+            // stock player's grenade had bounced differently, or had been
+            // refused, the blast existed for the thrower alone.
+            static_cast<void>(authorize_network_detonation(NetworkProjectileKind::grenade,
+                                                           sender_gid, message.grenade_type,
+                                                           location, protocol));
+            static_cast<void>(require_projectile);
             // The recovered Smoke/Flash handlers are intentionally empty. Only
             // HE (ordinal zero) creates an explosion and splash-damage pass.
             if (message.grenade_type == 0U)
             {
                 play_positional("Explosion", location);
-                world_preview_->spawn_fireball_explosion(location, false, message.on_ground);
+                world_preview_->spawn_fireball_explosion(location, false, message.on_ground,
+                                                         ExplosionStyle::grenade);
                 apply_explosion_splash(location, world::he_grenade_damage_bands, pvp_enabled, false,
                                        InventoryItemId::grenade);
             }
@@ -9326,10 +13044,11 @@ class Application::Impl final
                 message.explosive_type != static_cast<std::uint8_t>(world::ExplosiveKind::rocket))
                 return false;
             const world::Vec3 location{message.location.x, message.location.y, message.location.z};
-            const bool authorized = authorize_network_detonation(
-                NetworkProjectileKind::rocket, sender_gid, message.item_type, location, protocol);
-            if (require_projectile && !authorized)
-                return false;
+            // Explosive.HandleDetonateRocketMessage likewise trusts the
+            // owner's location; only RocketEntity's IsLocal copy ever reports
+            // an impact. Retire the local visual, never gate the relay on it.
+            static_cast<void>(authorize_network_detonation(
+                NetworkProjectileKind::rocket, sender_gid, message.item_type, location, protocol));
             InventoryItemId item{};
             if (message.item_type >
                     static_cast<std::uint16_t>(std::numeric_limits<std::int16_t>::max()) ||
@@ -9362,18 +13081,44 @@ class Application::Impl final
             online_bootstrap_client_ != nullptr)
             return;
         const net::IntVector3 corner = net::chunk_corner(location);
-        if (!requested_chunk_reconciliations_.contains(corner))
-            pending_chunk_reconciliations_.insert_or_assign(corner, elapsed_ + 0.35F);
+        pending_chunk_reconciliations_.insert_or_assign(corner, elapsed_ + 0.35F);
+        // A ProvideChunk reply is only a snapshot of the edits the host had
+        // already applied when it built it, and it travels on the
+        // reliable-unordered channel while edits travel reliable-ordered.
+        // Under retransmission the reply can therefore predate an edit this
+        // peer has already applied, and replacing the whole column with it
+        // would un-mine a block that the host is about to confirm. Remember
+        // every cell edited since this corner's check was armed and keep those
+        // cells when the snapshot lands; the rest of the column is still
+        // repaired from the host's authority.
+        constexpr std::size_t maximum_overlay_cells = 4096U;
+        constexpr std::size_t maximum_overlay_chunks = 8192U;
+        const auto existing = chunk_reconcile_overlay_.find(corner);
+        if (existing != chunk_reconcile_overlay_.end())
+        {
+            if (existing->second.size() < maximum_overlay_cells)
+                existing->second.insert(location);
+            return;
+        }
+        // Past the bound a snapshot simply replaces the column, which is the
+        // behaviour before this guard existed rather than unbounded memory.
+        if (chunk_reconcile_overlay_.size() < maximum_overlay_chunks)
+            chunk_reconcile_overlay_[corner].insert(location);
     }
 
     void pump_authoritative_chunk_checks()
     {
-        std::erase_if(requested_chunk_reconciliations_,
-                      [&](const auto &entry) { return entry.second <= elapsed_; });
+        std::erase_if(requested_chunk_reconciliations_, [&](const auto &entry) {
+            if (entry.second > elapsed_)
+                return false;
+            pending_chunk_reconciliations_.insert_or_assign(entry.first, elapsed_ + 0.35F);
+            return true;
+        });
         for (auto iterator = pending_chunk_reconciliations_.begin();
              iterator != pending_chunk_reconciliations_.end();)
         {
-            if (iterator->second > elapsed_)
+            if (iterator->second > elapsed_ ||
+                requested_chunk_reconciliations_.contains(iterator->first))
             {
                 ++iterator;
                 continue;
@@ -9432,6 +13177,33 @@ class Application::Impl final
             edits.push_back({position.x, position.y, position.z, block});
         }
         requested_chunk_reconciliations_.erase(chunk.block_location);
+        // An edit observed after this request makes its response potentially
+        // stale. Preserve the visible edit and request a fresh snapshot.
+        if (pending_chunk_reconciliations_.contains(chunk.block_location))
+            return true;
+        // Every cell edited since this check was armed outranks the snapshot:
+        // those edits are reliable and the host either has them already or is
+        // about to, so the column is repaired around them instead of through
+        // them. A cell the host rejects is put right by its own correction.
+        const auto overlay = chunk_reconcile_overlay_.find(chunk.block_location);
+        if (overlay != chunk_reconcile_overlay_.end())
+        {
+            for (const net::IntVector3 cell : overlay->second)
+            {
+                const auto block = online_block_at(cell);
+                if (!block.has_value())
+                    continue;
+                const auto found = std::ranges::find_if(edits, [&](const std::array<int, 4> &edit) {
+                    return edit[0] == cell.x && edit[1] == cell.y && edit[2] == cell.z;
+                });
+                if (found != edits.end())
+                    (*found)[3] = static_cast<int>(*block);
+                else
+                    edits.push_back(
+                        {cell.x, cell.y, cell.z, static_cast<int>(*block)});
+            }
+            chunk_reconcile_overlay_.erase(overlay);
+        }
         world_preview_->replace_chunk_edits(chunk.block_location.x, chunk.block_location.z, edits);
         dirty_ = true;
         return true;
@@ -9439,6 +13211,8 @@ class Application::Impl final
 
     [[nodiscard]] bool publish_local_block_edit(int x, int y, int z, world::BlockType block)
     {
+        if (block == world::BlockType::empty)
+            inventory_.remove_travel_destination({float(x), float(y), float(z)});
         if (!online_gameplay_active())
             return true;
         const net::ProtocolVersion protocol =
@@ -9466,6 +13240,8 @@ class Application::Impl final
     [[nodiscard]] bool publish_local_block_removals(std::span<const std::array<int, 3>> removed,
                                                     bool do_dig_effects)
     {
+        for (const auto &cell : removed)
+            inventory_.remove_travel_destination({float(cell[0]), float(cell[1]), float(cell[2])});
         if (removed.empty())
             return true;
         for (std::size_t offset{}; offset < removed.size(); offset += net::maximum_remove_blocks)
@@ -9534,6 +13310,8 @@ class Application::Impl final
         const auto found = crate_inventories_.find(location);
         if (found == crate_inventories_.end())
             return;
+        // Modding (Integration): mod items moved in or out reach the server.
+        mod_gameplay_crate_changed(location, before);
         for (std::size_t index{}; index < found->second.size(); ++index)
         {
             net::InventorySlotPayload old_item;
@@ -9549,20 +13327,29 @@ class Application::Impl final
         }
     }
 
-    void publish_local_crate_destroy(const CrateKey &location)
+    // Returns false when the other peers will keep the crate. The caller must
+    // then keep its contents too: ejecting them anyway duplicates every stack,
+    // because the pickups are broadcast while the crate still exists elsewhere.
+    [[nodiscard]] bool publish_local_crate_destroy(const CrateKey &location)
     {
+        if (!online_gameplay_active())
+            return true;
         const net::IntVector3 crate_location{location[0], location[1], location[2]};
         net::PayloadError payload_error{};
         const auto payload = net::encode_int_vector_payload(crate_location, payload_error);
         if (!payload.has_value())
-            return;
+            return false;
         if (online_host_ != nullptr && online_host_->running() &&
             !online_host_->destroy_authoritative_crate(crate_location))
-            return;
+            return false;
         std::string error;
         if (!publish_online_broadcast("DestroyCrateMessage", *payload,
                                       net::MessageDeliveryPolicy::reliable_ordered, error))
+        {
             std::cerr << "network.local.destroy-crate.failure=" << error << '\n';
+            return false;
+        }
+        return true;
     }
 
     void publish_local_custom_door_destroy(const CrateKey &location,
@@ -9596,13 +13383,45 @@ class Application::Impl final
         dirty_ = true;
     }
 
+    [[nodiscard]] bool prepare_online_inventory_for_exit()
+    {
+        if (!held_stack_ || online_client_ == nullptr || !online_client_joined_ ||
+            !online_client_->connected() || online_bootstrap_client_ != nullptr)
+            return true;
+        auto checkpoint = inventory_checkpoint(inventory_, held_stack_);
+        if (!checkpoint)
+        {
+            // Stock PINV has no cursor slot. Keep the world open until the player
+            // places or explicitly drops the surplus instead of silently losing it.
+            menu_.open(ui::MenuScreen::world_preview);
+            inventory_open_ = true;
+            SDL_SetWindowRelativeMouseMode(window_, false);
+            alert("ITEM STILL IN HAND", "Place or drop the held stack before leaving.");
+            return false;
+        }
+        inventory_ = std::move(*checkpoint);
+        held_stack_.reset();
+        sync_selected_item();
+        return true;
+    }
+
     [[nodiscard]] bool publish_local_inventory_store(bool final_save)
     {
         if (online_client_ == nullptr || !online_client_joined_ || !online_client_->connected() ||
             online_bootstrap_client_ != nullptr)
             return true;
+        const auto checkpoint = inventory_checkpoint(inventory_, held_stack_);
+        if (!checkpoint)
+        {
+            // Retry when the cursor is placed. Never overwrite a complete stored
+            // inventory with one that omits a held stack.
+            online_inventory_save_timer_ = 1.0F;
+            if (final_save)
+                alert("PROFILE SAVE UNCONFIRMED", "The held stack does not fit in your inventory.");
+            return !final_save;
+        }
         net::PlayerInventoryPayload visible_inventory;
-        if (!net::player_inventory_to_payload(inventory_, online_client_protocol_,
+        if (!net::player_inventory_to_payload(*checkpoint, online_client_protocol_,
                                               visible_inventory))
             return false;
         net::PlayerInventoryPayload inventory = std::move(visible_inventory);
@@ -9612,9 +13431,22 @@ class Application::Impl final
             net::PlayerInventoryPayload preserved = *online_inventory_payload_;
             preserved.storage = inventory.storage;
             preserved.trays = inventory.trays;
+            preserved.spawn_point = inventory.spawn_point;
+            preserved.teleport_stations = inventory.teleport_stations;
             inventory = std::move(preserved);
         }
         online_inventory_payload_ = inventory;
+        if (final_save)
+        {
+            std::string error;
+            if (!online_client_->save_inventory_and_wait(inventory, error))
+            {
+                std::cerr << "network.local.final-inventory-store.failure=" << error << '\n';
+                alert("PROFILE SAVE UNCONFIRMED", "The host did not confirm your final inventory.");
+                return false;
+            }
+            return true;
+        }
         net::PayloadError payload_error{};
         const auto payload = net::encode_inventory_store_payload(
             {inventory, final_save}, online_client_protocol_, payload_error);
@@ -9643,55 +13475,65 @@ class Application::Impl final
             std::cerr << "network.host.time-of-day.failure=" << error << '\n';
     }
 
-    void publish_local_presence_response()
+    // _processPlayerExistsMessage's reply set, for a peer this one has just
+    // discovered. See net::player_discovery_response for the original's exact
+    // conditions; the carried item and crate focus go out even when the sender
+    // did not request a response, which is how a joiner's held item reaches the
+    // players already in the session.
+    void publish_local_player_discovery(net::PlayerDiscoveryResponse response)
     {
-        if (online_client_ == nullptr || !online_client_joined_ || !online_client_->connected() ||
-            online_bootstrap_client_ != nullptr)
+        if (!response.any() || !online_gameplay_active())
             return;
-        const net::LegacyGamerIdentity *local = online_client_->local_gamer();
-        if (local == nullptr)
-            return;
-        net::PlayerExistsPayload presence;
-        presence.gamer_tag = local->gamer_tag;
-        presence.player_id = local->player_id;
+        const bool hosting = online_host_ != nullptr && online_host_->running();
+        const net::LegacyGamerIdentity *local =
+            online_client_ != nullptr ? online_client_->local_gamer() : nullptr;
         net::PayloadError payload_error{};
-        const auto payload = net::encode_player_exists_payload(presence, payload_error);
         std::string error;
-        if (!payload.has_value() ||
-            !publish_online_broadcast("PlayerExistsMessage", *payload,
-                                      net::MessageDeliveryPolicy::reliable_ordered, error))
+        // The host's own PlayerExists is part of the authoritative bootstrap
+        // transcript, which already delivers it to the newcomer and to every
+        // peer already present; re-broadcasting it here would be ignored by a
+        // stock client anyway (Sender.Tag is no longer null).
+        if (response.presence && !hosting)
         {
-            std::cerr << "network.local.presence-response.failure=" << error << '\n';
-            return;
-        }
-        const std::int64_t connected_ticks = static_cast<std::int64_t>(
-            std::max(0.0, static_cast<double>(world_elapsed_)) * 10'000'000.0);
-        const auto connected_payload =
-            net::encode_time_connected_payload(connected_ticks, payload_error);
-        if (!connected_payload.has_value() ||
-            !publish_online_broadcast("TimeConnectedMessage", *connected_payload,
-                                      net::MessageDeliveryPolicy::reliable_ordered, error))
-            std::cerr << "network.local.time-connected.failure=" << error << '\n';
-        // The recovered handler follows its presence response with the current
-        // carried item so the newcomer does not wait for the next selection.
-        last_online_carried_item_.reset();
-        sync_selected_item();
-        net::CrateFocusPayload focus;
-        if (active_crate_.has_value())
-        {
-            focus.location = {(*active_crate_)[0], (*active_crate_)[1], (*active_crate_)[2]};
-            if (inventory_focus_ >= crate_slot_base)
+            if (local == nullptr)
+                return;
+            net::PlayerExistsPayload presence;
+            // CastleMinerZGame.SetupNewGamer: new AvatarDescription(new byte[10]).
+            // Every other PlayerExists we send already carries these ten bytes;
+            // this reply sent an empty description, a payload no stock client
+            // ever produces.
+            presence.avatar_description.assign(10U, 0U);
+            presence.gamer_tag = local->gamer_tag;
+            presence.player_id = local->player_id;
+            const auto payload = net::encode_player_exists_payload(presence, payload_error);
+            if (!payload.has_value() ||
+                !publish_online_broadcast("PlayerExistsMessage", *payload,
+                                          net::MessageDeliveryPolicy::reliable_ordered, error))
             {
-                const std::size_t slot = inventory_focus_ - crate_slot_base;
-                focus.item_x = static_cast<std::int32_t>(slot % 8U);
-                focus.item_y = static_cast<std::int32_t>(slot / 8U);
+                std::cerr << "network.local.presence-response.failure=" << error << '\n';
+                return;
             }
         }
-        const auto focus_payload = net::encode_crate_focus_payload(focus, payload_error);
-        if (!focus_payload.has_value() ||
-            !publish_online_broadcast("CrateFocusMessage", *focus_payload,
-                                      net::MessageDeliveryPolicy::reliable_ordered, error))
-            std::cerr << "network.local.crate-focus.failure=" << error << '\n';
+        if (response.time_of_day)
+            publish_host_time_of_day();
+        if (response.time_connected)
+        {
+            const std::int64_t connected_ticks = static_cast<std::int64_t>(
+                std::max(0.0, static_cast<double>(world_elapsed_)) * 10'000'000.0);
+            const auto connected_payload =
+                net::encode_time_connected_payload(connected_ticks, payload_error);
+            if (!connected_payload.has_value() ||
+                !publish_online_broadcast("TimeConnectedMessage", *connected_payload,
+                                          net::MessageDeliveryPolicy::reliable_ordered, error))
+                std::cerr << "network.local.time-connected.failure=" << error << '\n';
+        }
+        if (response.carried_item)
+        {
+            last_online_carried_item_.reset();
+            sync_selected_item();
+        }
+        if (response.crate_focus)
+            resend_local_crate_focus();
     }
 
     void publish_local_player_update(const world::PlayerInput &input, float fixed_delta)
@@ -9699,18 +13541,14 @@ class Application::Impl final
         const bool online = (online_host_ != nullptr && online_host_->running()) ||
                             (online_client_ != nullptr && online_client_joined_ &&
                              online_client_->connected() && online_bootstrap_client_ == nullptr);
+        static_cast<void>(fixed_delta);
         if (!online)
         {
             online_player_update_timer_ = 0.0F;
+            last_online_player_update_.reset();
+            player_update_cadence_.reset();
             return;
         }
-        online_player_update_timer_ -= fixed_delta;
-        const bool important = player_.state().using_tool || gun_reloading_ ||
-                               player_life_ != PlayerLife::alive;
-        if (online_player_update_timer_ > 0.0F)
-            return;
-        online_player_update_timer_ = important ? 1.0F / 30.0F : 1.0F / 20.0F;
-
         net::LocalPlayerReplicationInput replication;
         replication.position = player_.state().position;
         replication.velocity = player_.state().velocity;
@@ -9718,18 +13556,46 @@ class Application::Impl final
         replication.torso_pitch = player_.state().pitch;
         replication.movement_x = input.strafe;
         replication.movement_y = input.forward;
-        replication.animation_mode = item_player_animation_mode(inventory_.selected_item());
-        replication.using_tool = player_.state().using_tool;
+        // (Items) A mod item's hold style (a session with server mods only).
+        replication.animation_mode = held_item_animation_mode(inventory_.selected_item());
+        // PlayerUpdateMessage.Send copies Player.UsingTool, which the item's
+        // ProcessInput holds true for ONE frame per shot, swing or placement,
+        // and Player.Shouldering, which only a gun raises. A receiving peer
+        // restarts the use clip on every update that carries Using, so a flag
+        // held for the length of our own swing froze that clip on its first
+        // frame for every stock player watching. These are the very values
+        // this tick's own animation pass read.
+        replication.using_tool = local_animation_input_.using_tool;
         replication.dead = player_life_ != PlayerLife::alive;
-        replication.shouldering = shouldering_;
+        replication.shouldering = local_animation_input_.shouldering;
         replication.reloading = gun_reloading_;
-        replication.throwing_grenade = grenade_animation_time_ > 0.0F;
-        replication.ready_to_throw_grenade = grenade_cooking_;
+        // Player.PlayGrenadeAnim and Player.ReadyToThrowGrenade. KillPlayer
+        // clears both; otherwise the ready bit stays set after a throw until
+        // the next grenade is armed, exactly as the original keeps sending it.
+        if (replication.dead)
+            grenade_arm_.kill();
+        replication.throwing_grenade = grenade_cooking_ && grenade_arm_.playing();
+        replication.ready_to_throw_grenade = grenade_arm_.ready();
         const net::ProtocolVersion protocol =
             online_host_ != nullptr ? host_settings_.protocol : online_client_protocol_;
         net::PlayerUpdatePayload update;
         net::PayloadError payload_error{};
         if (!net::make_player_update(replication, protocol, update, payload_error))
+            return;
+        // CastleMinerZGame.SendNetworkUpdates (net::StockPlayerUpdateCadence):
+        // one update every (players + 1) frames, and every frame while
+        // UsingTool or Reloading. Nothing else hurries it: not a movement or
+        // state edge, not death, not a teleport. This client used a fixed
+        // 20 Hz timer plus an immediate send on every edge, which is the
+        // original's rate only in a two-player session; in a full session it
+        // sent several times what any stock peer sends. A simulation tick is
+        // the frame: the original runs one Update per 60 Hz vsynced frame.
+        // The roster counts every gamer in the session, announced or not, as
+        // AllGamers does. The very first update of a session is not held back.
+        const bool due = player_update_cadence_.frame(online_remote_players_.size() + 1U,
+                                                      replication.using_tool,
+                                                      replication.reloading);
+        if (!due && last_online_player_update_.has_value())
             return;
         const auto payload = net::encode_player_update_payload(update, protocol, payload_error);
         std::string error;
@@ -9737,13 +13603,22 @@ class Application::Impl final
             !publish_online_broadcast("PlayerUpdateMessage", *payload,
                                       net::player_update_delivery(update), error))
             std::cerr << "network.local.player-update.failure=" << error << '\n';
+        else
+            last_online_player_update_ = update;
     }
 
+    // Called when the session reports a peer entering, which is the one moment
+    // a GID changes owner. The original builds a brand-new Player then, so any
+    // state left over from the previous holder of a recycled GID - position,
+    // dead flag, carried item, death animation, locked crate slot, queued
+    // voice - has to go, or the newcomer inherits the departed player's body.
     void remember_online_player(std::uint8_t gid, std::string gamer_tag)
     {
         if ((gid == 0U && online_host_ != nullptr) ||
             (online_client_ != nullptr && gid == online_local_gid_))
             return;
+        if (online_remote_players_.contains(gid))
+            forget_online_player(gid);
         OnlineRemotePlayer &player = online_remote_players_[gid];
         if (!gamer_tag.empty())
             player.gamer_tag = std::move(gamer_tag);
@@ -9761,16 +13636,53 @@ class Application::Impl final
         // sender and does not use the identity echoed inside PlayerExists as an
         // authorization check. Prefer the admitted roster identity and use
         // the embedded tag only when the provider did not supply one.
+        if (!gamer_tag.empty())
+            found->second.self_reported_tag = gamer_tag;
         if (found->second.gamer_tag.empty() && !gamer_tag.empty())
             found->second.gamer_tag = std::move(gamer_tag);
         found->second.presence_announced = true;
         return true;
     }
 
+    // Everything a given GID may legitimately be addressed by in a name-keyed
+    // Modern message: the roster label other peers were told, and the label it
+    // writes into its own packets.
+    [[nodiscard]] bool online_player_answers_to(const OnlineRemotePlayer &player,
+                                                std::string_view name) const noexcept
+    {
+        return (!player.gamer_tag.empty() && player.gamer_tag == name) ||
+               (!player.self_reported_tag.empty() && player.self_reported_tag == name);
+    }
+
+    [[nodiscard]] bool local_player_answers_to(std::string_view name) const
+    {
+        if (name.empty())
+            return false;
+        if (!online_persona_name_.empty() && online_persona_name_ == name)
+            return true;
+        return local_online_gamer_tag() == name;
+    }
+
     [[nodiscard]] bool online_player_presence_ready(std::uint8_t gid) const noexcept
     {
         const auto found = online_remote_players_.find(gid);
         return found != online_remote_players_.end() && found->second.presence_announced;
+    }
+
+    // True only for the first PlayerExists this peer sends, which is the only
+    // one _processPlayerExistsMessage acts on (`if (Sender.Tag == null)`).
+    [[nodiscard]] bool mark_online_presence_seen(std::uint8_t gid)
+    {
+        if ((gid == 0U && online_host_ != nullptr) ||
+            (online_client_ != nullptr && gid == online_local_gid_))
+            return false;
+        // Never create the roster entry here: an unadmitted sender must still
+        // be refused by announce_online_player.
+        const auto found = online_remote_players_.find(gid);
+        if (found == online_remote_players_.end() || found->second.presence_seen)
+            return false;
+        found->second.presence_seen = true;
+        return true;
     }
 
     [[nodiscard]] static bool coalesced_pre_presence_message(
@@ -9806,15 +13718,33 @@ class Application::Impl final
 
     void forget_online_player(std::uint8_t gid) noexcept
     {
+        bootstrap_gameplay_.forget_player(online_client_protocol_, gid);
+        crate_focus_.forget(gid);
+        if (voice_audio_ != nullptr)
+            voice_audio_->forget(gid);
         forget_pending_pre_presence(gid);
+        xbox_avatar_player_left(gid);
         online_remote_players_.erase(gid);
+        if (world_preview_ != nullptr)
+            world_preview_->forget_remote_player(gid);
     }
 
     void clear_online_remote_players() noexcept
     {
+        bootstrap_gameplay_.clear();
+        crate_focus_.clear();
+        last_crate_focus_.reset();
+        // Pickup ids restart at zero in every new PickupManager, so credited
+        // keys from a previous session must never suppress a fresh credit.
+        credited_pickups_.clear();
+        if (voice_audio_ != nullptr)
+            voice_audio_->clear();
         pending_pre_presence_packets_.clear();
         pending_pre_presence_bytes_ = 0U;
+        xbox_avatar_players_cleared();
         online_remote_players_.clear();
+        if (world_preview_ != nullptr)
+            world_preview_->clear_player_animations();
     }
 
     void queue_pre_presence_packet(const net::LegacySteamRuntimeClientEvent &event,
@@ -9892,6 +13822,40 @@ class Application::Impl final
         const bool was_dead = remote.has_update && remote.state.dead;
         if (!net::apply_player_update(update, protocol, remote.state))
             return false;
+        remote.presentation.receive(remote.state, elapsed_);
+        // PlayerUpdateMessage.Apply -> Player.UpdateAnimation, from the bytes
+        // themselves: pitch, (yaw,) flags, PlayerMode and the movement nibbles
+        // follow the twelve position bytes in both generations.
+        if (payload.size() >= 17U)
+        {
+            const world::AnimationGeneration generation =
+                protocol == net::ProtocolVersion::modern_v4 ? world::AnimationGeneration::modern
+                                                            : world::AnimationGeneration::classic;
+            if (!remote.animator_started || remote.animator.generation() != generation)
+            {
+                remote.animator = world::PlayerAnimator{generation};
+                remote.animator_started = true;
+            }
+            world::PlayerAnimationInput remote_input =
+                world::remote_animation_input({payload[12], payload[14], payload[15], payload[16]});
+            gunfx_remote_reload_input(remote_input, remote.carried_item, protocol); // (GunFX)
+            const world::PlayerAnimationResult cues = remote.animator.update(remote_input);
+            // Player.UpdateAnimation plays these through the player's own
+            // SoundEmitter, for every Player and not only the local one:
+            // "GrenadeArm" as the cook clip starts, and the reload cue as the
+            // reload clip starts. A remote Player's ReloadSound is never
+            // assigned (only InGameHUD.EquipActiveItem sets it, on the local
+            // player), so what the others hear is always the generic "Reload",
+            // whatever the gun. They were not played at all.
+            if (cues.grenade_arm_cue)
+                play_positional("GrenadeArm", remote.state.position);
+            if (cues.reload_cue_started &&
+                !gunfx_mutes_remote_reload(remote.animator, remote.carried_item, protocol)) // (GunFX)
+                play_positional("Reload", remote.state.position);
+        }
+        // Several packets can arrive in one pump. Preserve a brief reliable
+        // use pulse until presentation has seen it even if an idle update follows.
+        remote.pending_use_animation = remote.pending_use_animation || remote.state.using_tool;
         if (remote.state.dead && !was_dead)
             remote.death_animation_started = elapsed_;
         remote.last_update = elapsed_;
@@ -9911,8 +13875,16 @@ class Application::Impl final
             if (found == online_remote_players_.end() || !found->second.presence_announced)
                 return false;
             OnlineRemotePlayer &remote = found->second;
-            remote.carried_item = static_cast<std::uint16_t>(decoded.payload[0]) |
-                                  (static_cast<std::uint16_t>(decoded.payload[1]) << 8U);
+            const auto carried = static_cast<std::uint16_t>(
+                static_cast<std::uint16_t>(decoded.payload[0]) |
+                (static_cast<std::uint16_t>(decoded.payload[1]) << 8U));
+            if (remote.carried_item_known && carried != remote.carried_item)
+            {
+                remote.previous_carried_item = remote.carried_item;
+                remote.carried_item_changed = elapsed_;
+            }
+            remote.carried_item = carried;
+            remote.carried_item_known = true;
         }
         else if (decoded.message->name == "TimeConnectedMessage")
         {
@@ -9936,6 +13908,7 @@ class Application::Impl final
             remote.focus_crate = focus.location;
             remote.focus_item_x = focus.item_x;
             remote.focus_item_y = focus.item_y;
+            crate_focus_.set(gid, focus);
         }
         return true;
     }
@@ -9951,10 +13924,13 @@ class Application::Impl final
     [[nodiscard]] static bool melee_source_near_player(const net::Vector3 &source,
                                                        world::Vec3 position) noexcept
     {
-        // The authored box is +/-0.35 x 1.7. A bounded allowance absorbs one
-        // state-snapshot interval without permitting arbitrary remote damage.
-        return std::abs(source.x - position.x) <= 2.0F && source.y >= position.y - 1.5F &&
-               source.y <= position.y + 3.2F && std::abs(source.z - position.z) <= 2.0F;
+        // Stock ProcessMeleePlayerMessage applies every hit it is sent; only the
+        // PVP rule gates it. The attacker struck where ITS copy of the victim
+        // stood, which trails a running or falling victim by a whole update
+        // cycle (stock sends one PlayerUpdate per roster-sized frame cycle), so
+        // this stays a hostile ceiling rather than a hit test.
+        return std::abs(source.x - position.x) <= 6.0F && source.y >= position.y - 6.0F &&
+               source.y <= position.y + 8.0F && std::abs(source.z - position.z) <= 6.0F;
     }
 
     [[nodiscard]] bool validate_online_melee_sender(const net::MeleePlayerPayload &melee,
@@ -9964,8 +13940,16 @@ class Application::Impl final
     {
         const auto sender = online_remote_players_.find(sender_gid);
         if (sender == online_remote_players_.end() || !sender->second.has_update ||
-            elapsed_ - sender->second.last_update > 10.0F || sender->second.state.dead ||
-            sender->second.carried_item != static_cast<std::uint16_t>(melee.item_id))
+            elapsed_ - sender->second.last_update > 10.0F || sender->second.state.dead)
+            return false;
+        // The original does not cross-check the swing against the attacker's
+        // announced item at all. Keep the check, but honour the item it just
+        // replaced for one relay window: ChangeCarriedItem and MeleePlayer use
+        // different delivery classes, so the switch can overtake the swing.
+        if (!net::melee_item_matches_announcement(
+                static_cast<std::uint16_t>(melee.item_id), sender->second.carried_item,
+                sender->second.carried_item_known, sender->second.previous_carried_item,
+                elapsed_ - sender->second.carried_item_changed))
             return false;
         InventoryItemId item{};
         if (!net::inventory_item_from_wire(melee.item_id, protocol, item) ||
@@ -9977,7 +13961,10 @@ class Application::Impl final
         const float source_dx = melee.damage_source.x - eye.x;
         const float source_dy = melee.damage_source.y - eye.y;
         const float source_dz = melee.damage_source.z - eye.z;
-        return source_dx * source_dx + source_dy * source_dy + source_dz * source_dz <= 16.0F &&
+        // InGameHUD's construction probe reaches FIVE units from the camera, and
+        // the attacker's position here is a replicated one: four units refused
+        // real hits at the end of the original's own reach.
+        return source_dx * source_dx + source_dy * source_dy + source_dz * source_dz <= 100.0F &&
                melee_source_near_player(melee.damage_source, victim_position);
     }
 
@@ -9994,6 +13981,8 @@ class Application::Impl final
             crate_inventories_.size() >= net::maximum_world_crates)
             return false;
         crate_inventories_[location][static_cast<std::size_t>(crate.index)] = std::move(slot);
+        // Modding (Integration): a mod item keeps its identity in the crate.
+        mod_gameplay_crate_received(location, static_cast<std::size_t>(crate.index));
         dirty_ = true;
         return true;
     }
@@ -10140,21 +14129,64 @@ class Application::Impl final
         if (!net::valid_network_block_location(location))
             return;
         const CrateKey key{location.x, location.y, location.z};
+        // _processDestroyCrateMessage only flags the crate, so on this peer its
+        // Inventory array is still whole when the open screen notices.
+        const std::optional<InventoryStack> selected_stack = crate_screen_selected_stack(key);
+        const bool open_here = active_crate_.has_value() && *active_crate_ == key;
         crate_inventories_.erase(key);
-        if (active_crate_.has_value() && *active_crate_ == key)
-        {
-            if (held_stack_.has_value())
-            {
-                const std::uint16_t remainder = inventory_.add_stack(*held_stack_);
-                if (remainder != 0U)
-                    drop_stack(held_stack_->with_count(remainder));
-                held_stack_.reset();
-            }
-            active_crate_.reset();
-            inventory_open_ = false;
-            SDL_SetWindowRelativeMouseMode(window_, !inspector_view_);
-        }
+        mod_gameplay_crate_gone(key); // Modding (Integration)
+        if (open_here)
+            force_close_crate_screen(selected_stack);
         dirty_ = true;
+    }
+
+    // CrateScreen.ForceClose's `SelectedItem != null && _selectorInCrateGrid &&
+    // !IsSelectedSlotLocked()`: the stack under this player's selector in the
+    // crate it has open, or nothing.
+    [[nodiscard]] std::optional<InventoryStack> crate_screen_selected_stack(const CrateKey &key) const
+    {
+        if (!active_crate_.has_value() || !(*active_crate_ == key) || !screens_.is_open() ||
+            screens_.screen() != screens::ScreenId::crate)
+            return std::nullopt;
+        const std::size_t selected = screens_.selected_slot();
+        const auto crate = crate_inventories_.find(key);
+        if (selected < screens::crate_base || selected >= screens::crate_base + screens::crate_slots ||
+            crate == crate_inventories_.end() ||
+            inventory_slot_locked(crate_slot_base + (selected - screens::crate_base)))
+            return std::nullopt;
+        return crate->second[selected - screens::crate_base];
+    }
+
+    // CrateScreen.ForceClose: the crate this player has open is gone.
+    //   _holdingItem -> PlayerInventory.AddInventoryItem;
+    //   the selected crate stack (above) -> CreatePickup(player position + 1,
+    //       dropped) + "dropitem";
+    //   PopMe(); CrateFocusMessage.Send(Zero, Point.Zero); ShowBlockPicker().
+    // The second step is the other half of Crate.EjectContents: the destroyer
+    // skips the slot this player has ANNOUNCED its selector on, and this
+    // player throws that stack out itself. Without it the stack was skipped
+    // there and dropped by nobody. (With a selector that was never announced -
+    // a 1.6.3.8 mouse - the destroyer ejects the stack as well; that duplicate
+    // is the original's own.)
+    void force_close_crate_screen(const std::optional<InventoryStack> &selected_stack)
+    {
+        if (held_stack_.has_value())
+        {
+            const std::uint16_t remainder = inventory_.add_stack(*held_stack_);
+            if (remainder != 0U && world_preview_ != nullptr)
+                drop_stack(held_stack_->with_count(remainder));
+            held_stack_.reset();
+        }
+        if (selected_stack.has_value() && world_preview_ != nullptr)
+        {
+            world_preview_->spawn_dropped_stack(*selected_stack, player_.state());
+            sound_bank_->play_cue("dropitem");
+            caption("[ ITEM DROPPED ]");
+        }
+        // The inventory screen takes the crate screen's place: inventory_open_
+        // stays set and the next sync_screens() opens it.
+        active_crate_.reset();
+        send_local_crate_focus({});
     }
 
     [[nodiscard]] bool apply_online_destroy_custom_block(
@@ -10269,6 +14301,17 @@ class Application::Impl final
             !publish_online_broadcast("BroadcastTextMessage", *payload,
                                       net::MessageDeliveryPolicy::reliable_ordered, error))
             std::cerr << "network.local.spawner-announcement.failure=" << error << '\n';
+    }
+
+    // LocalPlayer.Gamer.Gamertag: the SESSION roster tag, which is not the Steam
+    // persona when admission had to de-duplicate a colliding display name.
+    [[nodiscard]] std::string local_online_gamer_tag() const
+    {
+        if (online_host_ == nullptr && online_client_ != nullptr)
+            if (const net::LegacyGamerIdentity *local = online_client_->local_gamer();
+                local != nullptr && !local->gamer_tag.empty())
+                return local->gamer_tag;
+        return online_persona_name_.empty() ? std::string{"OpenMinerZ"} : online_persona_name_;
     }
 
     [[nodiscard]] std::string online_gamer_tag(std::uint8_t gid, std::string_view fallback) const
@@ -10432,9 +14475,12 @@ class Application::Impl final
         };
         const std::uint8_t local_gid =
             online_gameplay_active() ? online_local_player_gid() : std::uint8_t{};
+        // This tag is what goes into SpawnEnemyMessage.PlayerName and the
+        // spawner chat line, so it has to be the SESSION roster label every
+        // other peer holds for this player, not the Steam persona that
+        // admission may have had to de-duplicate away from.
         if (player_life_ == PlayerLife::alive && in_range(player_.state().position))
-            targets.push_back({local_gid, local_gid,
-                               online_persona_name_.empty() ? "OpenMinerZ" : online_persona_name_});
+            targets.push_back({local_gid, local_gid, local_online_gamer_tag()});
         for (const auto &[gid, remote] : online_remote_players_)
             if (remote.has_update && !remote.state.dead && elapsed_ - remote.last_update <= 10.0F &&
                 in_range(remote.state.position) && !remote.gamer_tag.empty())
@@ -10462,10 +14508,23 @@ class Application::Impl final
                                                  const world::SpawnerEnemyAction &action)
     {
         const net::SpawnEnemyPayload &message = action.payload;
-        if (message.enemy_type >= world::enemy_type_count || message.enemy_id < 0 ||
-            message.random_seed < 0 || message.player_name.empty() ||
-            message.player_name.size() > 64U)
+        // SpawnerSimulation speaks Modern's EnemyTypeEnum, as the message does.
+        const auto enemy_type = world::enemy_type_from_wire(message.enemy_type, true);
+        if (!enemy_type.has_value() || message.enemy_id < 0 || message.random_seed < 0 ||
+            message.player_name.empty() || message.player_name.size() > 64U)
             return false;
+        // mod-ai (fix): a member of a family the rules switch off never
+        // appears (on any peer: it is not announced) and counts as defeated,
+        // so the wave can still end.
+        if (mod_ai_spawner_member_refused(*enemy_type, {message.spawn_position.x, message.spawn_position.y,
+                                                        message.spawn_position.z}))
+        {
+            const auto runtime = local_spawners_.find(source);
+            if (runtime != local_spawners_.end() && runtime->second.simulation != nullptr)
+                static_cast<void>(process_local_spawner_actions(
+                    source, runtime->second.simulation->handle_enemy_defeated(action.target.gid)));
+            return true;
+        }
         const world::EnemyIdentity identity{action.target.gid,
                                             static_cast<std::uint32_t>(message.enemy_id)};
         const world::EnemyInitialization initialization{
@@ -10475,7 +14534,7 @@ class Application::Impl final
             static_cast<float>(message.initialization.run_activation_milliseconds) / 1000.0F,
             static_cast<float>(message.initialization.normal_activation_milliseconds) / 1000.0F};
         if (!enemy_horde_.spawn_networked(
-                static_cast<int>(message.enemy_type),
+                *enemy_type,
                 {message.spawn_position.x, message.spawn_position.y, message.spawn_position.z},
                 initialization, identity.enemy_id, message.random_seed, identity.target_gid))
             return false;
@@ -10496,6 +14555,18 @@ class Application::Impl final
             return false;
         }
         local_spawner_enemy_sources_[identity] = source;
+        // BaseZombie.SpawnSource / SetDistanceLimit: a spawner block's enemy
+        // chases to 100 blocks (a hell block's to 300) and digs to 48.
+        if (const auto spawned = enemy_horde_.find_enemy(identity); spawned.has_value())
+        {
+            const auto block = online_block_at(net::IntVector3{source[0], source[1], source[2]});
+            world::Enemy &enemy = enemy_horde_.enemies()[*spawned];
+            enemy.spawner_sourced = true;
+            enemy.hell_spawner =
+                block.has_value() && (*block == world::BlockType::hell_spawn_on ||
+                                      *block == world::BlockType::hell_spawn_off ||
+                                      *block == world::BlockType::hell_spawn_dim);
+        }
         if (message.enemy_type == 51U)
             announce_local_spawner("The Lord of Hell Awakens! Prepare yourself!", "HELL LORD");
         return true;
@@ -10618,6 +14689,14 @@ class Application::Impl final
         if (definition == nullptr || definition->off_block != *block ||
             !world::is_spawner_clickable(*block))
             return false;
+        // mod-ai: a server mod switched spawner blocks (or Hell) off, or every
+        // family its waves could bring.
+        if (mod_ai_spawner_refused(location, *block == world::BlockType::hell_spawn_off) ||
+            mod_ai_spawner_silent(location, *definition))
+        {
+            caption("[ THIS SPAWNER IS SILENT ]", 1.5F);
+            return true;
+        }
         if (existing == local_spawners_.end())
         {
             LocalSpawnerRuntime runtime;
@@ -10737,12 +14816,17 @@ class Application::Impl final
                                            static_cast<float>(location.z) + 0.5F};
                     impact.normal_y = 1;
                     play_positional("GroundCrash", impact.intersection);
+                    // (Presentation only, as for a locally dug block.)
+                    impact.completed = true;
                     world_preview_->spawn_mining_impact(impact);
                 }
                 region.set_block(location.x, location.y, location.z, world::BlockType::empty);
             }
             world_preview_->remember_edit(location.x, location.y, location.z,
                                           world::BlockType::empty);
+            inventory_.remove_travel_destination({float(location.x), float(location.y), float(location.z)});
+            if (requested_chunk_reconciliations_.contains(net::chunk_corner(location)))
+                schedule_authoritative_chunk_check(location);
             changed.push_back({location.x, location.y, location.z});
         }
         std::erase_if(armed_explosives_, [&](const ArmedExplosive &armed) {
@@ -10759,15 +14843,14 @@ class Application::Impl final
     {
         online_remote_visuals_.clear();
         online_remote_visuals_.reserve(online_remote_players_.size());
-        for (const auto &[gid, remote] : online_remote_players_)
+        for (auto &[gid, remote] : online_remote_players_)
         {
             if (!remote.has_update || elapsed_ - remote.last_update > 10.0F)
                 continue;
-            const float extrapolation = std::clamp(elapsed_ - remote.last_update, 0.0F, 0.1F);
-            const world::Vec3 position{
-                remote.state.position.x + remote.state.velocity.x * extrapolation,
-                remote.state.position.y + remote.state.velocity.y * extrapolation,
-                remote.state.position.z + remote.state.velocity.z * extrapolation};
+            const auto visible = options_.diagnostic_multiplayer
+                                     ? remote.state
+                                     : remote.presentation.sample(elapsed_);
+            const world::Vec3 position = visible.position;
             InventoryItemId carried_item = InventoryItemId::bare_hands;
             if (remote.carried_item <=
                 static_cast<std::uint16_t>(std::numeric_limits<std::int16_t>::max()))
@@ -10779,16 +14862,21 @@ class Application::Impl final
                     carried_item));
             }
             online_remote_visuals_.push_back(
-                {gid, carried_item, position, remote.state.velocity, remote.state.yaw,
-                  remote.state.torso_pitch, remote.state.movement_x, remote.state.movement_y,
-                  remote.state.dead
-                      ? std::max(0.0F, elapsed_ - remote.death_animation_started)
-                      : elapsed_ + static_cast<float>(gid) * 0.173F,
-                  remote.state.animation_mode, remote.state.using_tool, remote.state.dead,
-                  remote.state.shouldering, remote.state.reloading,
-                  remote.state.throwing_grenade, remote.state.ready_to_throw_grenade});
+                {gid, carried_item, position, remote.state.velocity, visible.yaw,
+                 visible.torso_pitch, remote.state.movement_x, remote.state.movement_y, elapsed_,
+                 remote.state.animation_mode,
+                 remote.state.using_tool || remote.pending_use_animation, remote.state.dead,
+                 remote.state.shouldering, remote.state.reloading, remote.state.throwing_grenade,
+                 remote.state.ready_to_throw_grenade});
+            if (remote.animator_started)
+            {
+                online_remote_visuals_.back().animation = remote.animator.pose();
+                online_remote_visuals_.back().animation_valid = true;
+            }
+            remote.pending_use_animation = false;
         }
         std::ranges::sort(online_remote_visuals_, {}, &RemotePlayerVisual::gid);
+        mod_items_remote_visuals(online_remote_visuals_); // (Items) mod items in their hands
     }
 
     void pump_online_client()
@@ -10797,31 +14885,52 @@ class Application::Impl final
             online_client_operation_.wait_for(std::chrono::milliseconds{0}) ==
                 std::future_status::ready)
         {
-            OnlineClientOperationResult result = online_client_operation_.get();
+            OnlineClientOperationResult result;
+            try
+            {
+                result = online_client_operation_.get();
+            }
+            catch (const std::exception &exception)
+            {
+                // An operation that threw is a failed operation, never a crash.
+                result = {};
+                result.error = exception.what();
+            }
             const OnlineClientOperation completed = online_client_pending_;
             online_client_pending_ = OnlineClientOperation::none;
-            if (!result.error.empty() || result.client == nullptr || !result.client->running())
+            if (completed == OnlineClientOperation::join && online_join_cancelled_)
+            {
+                // The player cancelled while the helper was entering the lobby.
+                // Leave it now; the flow then restores discovery by itself.
+                online_join_cancelled_ = false;
+                if (result.client != nullptr)
+                {
+                    std::string ignored;
+                    static_cast<void>(result.client->stop(ignored));
+                }
+                join_flow_.transport_lost();
+            }
+            else if (!result.error.empty() || result.client == nullptr ||
+                     !result.client->running())
             {
                 const std::string detail =
                     result.error.empty() ? "STEAM HELPER STOPPED" : result.error;
-                if (completed == OnlineClientOperation::discovery)
-                {
-                    join_browser_state_ = JoinBrowserState::failed;
-                    join_browser_status_ = uppercase(detail);
-                    online_persona_name_.clear();
-                    steam_identity_verified_ = false;
-                }
-                if (completed != OnlineClientOperation::discovery || !online_discovery_quiet_)
-                    toast(completed == OnlineClientOperation::join ? "STEAM JOIN FAILED"
-                                                                   : "STEAM DISCOVERY FAILED",
-                          uppercase(detail));
-                if (completed == OnlineClientOperation::join)
-                    online_join_stage_ = OnlineJoinStage::idle;
                 online_client_.reset();
                 online_client_joined_ = false;
                 online_lobby_host_is_friend_ = false;
                 online_bootstrap_client_.reset();
                 clear_online_remote_players();
+                if (completed == OnlineClientOperation::discovery)
+                {
+                    online_persona_name_.clear();
+                    steam_identity_verified_ = false;
+                    // A queued join reports this failure itself, with its reason.
+                    if (!online_discovery_quiet_ && !join_flow_.join_pending())
+                        toast("STEAM DISCOVERY FAILED", uppercase(detail));
+                    note_discovery_failure(detail);
+                }
+                else if (completed == OnlineClientOperation::join)
+                    fail_online_join(detail);
             }
             else
             {
@@ -10830,20 +14939,25 @@ class Application::Impl final
                 {
                     online_persona_name_ = result.discovery.persona_name;
                     steam_identity_verified_ = true;
-                    const std::string local_default = profile_name_ + "'S FRONTIER";
+                    const std::string local_default = profile_name_ + "'S WORLD";
                     if (host_settings_.server_name == local_default)
-                        host_settings_.server_name = online_persona_name_ + "'S FRONTIER";
-                    join_browser_.replace(net::make_discovered_sessions(result.discovery));
-                    selected_join_session_.reset();
-                    join_password_.clear();
+                        host_settings_.server_name = online_persona_name_ + "'S WORLD";
+                    // Rows are replaced as a set, so servers that disappeared
+                    // expire here. The selection, the highlight and a typed
+                    // password follow their lobby id through the new list.
+                    net::JoinBrowserAction queued_join = join_flow_.discovery_succeeded(
+                        join_browser_, net::make_discovered_sessions(result.discovery),
+                        result.discovery.local_peer);
                     rebuild_join_menu_entries();
                     const std::size_t count = join_browser_.visible_indices().size();
+                    const std::size_t own = join_browser_.own_session_count();
                     join_browser_state_ = JoinBrowserState::ready;
                     join_browser_status_ =
                         count == 0U ? "STEAM AUTHENTICATED  /  NO LIVE CASTLEMINER Z LOBBIES ONLINE"
                                     : std::format("STEAM AUTHENTICATED  /  {} LIVE SESSION{}",
                                                   count, count == 1U ? "" : "S");
-                    join_refresh_timer_ = 30.0F;
+                    if (own != 0U)
+                        join_browser_status_ += "  /  YOUR OWN LOBBY IS NOT LISTED";
                     if (!online_discovery_quiet_)
                         toast("DISCOVERY COMPLETE",
                               count == 0U ? "NO CLASSIC OR MODERN STEAM LOBBIES REPORTED"
@@ -10851,9 +14965,14 @@ class Application::Impl final
                                                         count == 1U ? "" : "S"));
                     std::cout << "network.discovery.results=" << result.discovery.lobbies.size()
                               << '\n';
-                    if (options_.open_join_details && !join_row_sessions_.empty())
+                    // A join requested while this refresh was in flight, or while
+                    // no helper was alive, starts now on the re-resolved lobby or
+                    // ends with the reason it cannot.
+                    apply_join_action(std::move(queued_join));
+                    leave_join_details_if_expired();
+                    if (options_.open_join_details && !join_row_ids_.empty())
                     {
-                        selected_join_session_ = join_row_sessions_.front();
+                        join_browser_.select(join_row_ids_.front());
                         menu_.open(ui::MenuScreen::join_details);
                     }
                     options_.open_join_details = false;
@@ -10915,6 +15034,7 @@ class Application::Impl final
                     online_lobby_host_is_friend_ = result.ready.lobby.host_is_friend;
                     online_bootstrap_client_.reset();
                     online_join_stage_ = OnlineJoinStage::awaiting_admission;
+                    join_watchdog_.restart();
                     if (!result.ready.lobby.name.empty())
                         online_join_server_name_ = uppercase(result.ready.lobby.name);
                     if (!result.ready.lobby.host_name.empty())
@@ -10927,6 +15047,9 @@ class Application::Impl final
                               << " local_peer=" << result.ready.local_peer << '\n';
                 }
             }
+            // (Network) The session's mods and the client half of the mod channel.
+            if (completed == OnlineClientOperation::join)
+                mod_net_join_finished(online_client_ != nullptr && online_client_joined_);
             if (completed == OnlineClientOperation::discovery)
                 online_discovery_quiet_ = false;
         }
@@ -10936,7 +15059,16 @@ class Application::Impl final
         std::string error;
         if (!online_client_->pump(events, error))
         {
-            toast("STEAM SESSION ENDED", uppercase(error));
+            // Before the world is installed this is a failed join: name the
+            // host's reason and let the browser recover. Afterwards the session
+            // itself ended.
+            if (online_join_in_progress())
+                fail_online_join(error);
+            else
+            {
+                alert("STEAM SESSION ENDED", uppercase(error));
+                join_flow_.transport_lost();
+            }
             std::cerr << "network.client.failure=" << error << '\n';
             save_online_position();
             static_cast<void>(online_client_->stop(error));
@@ -10953,8 +15085,12 @@ class Application::Impl final
             online_world_key_.clear();
             pending_chunk_reconciliations_.clear();
             requested_chunk_reconciliations_.clear();
+            chunk_reconcile_overlay_.clear();
             return;
         }
+        // Any traffic from the host is progress for the join watchdog.
+        if (!events.empty())
+            join_watchdog_.restart();
         for (const net::LegacySteamRuntimeClientEvent &event : events)
         {
             switch (event.kind)
@@ -10964,13 +15100,17 @@ class Application::Impl final
                 online_join_detail_ =
                     std::format("ADMITTED AS PLAYER {}  /  REQUESTING WORLD MANIFEST",
                                 static_cast<int>(event.gid));
-                toast("HOST ADMITTED CLIENT",
-                      std::format("LOCAL GID {}  /  REQUESTING AUTHORITATIVE WORLD",
-                                  static_cast<int>(event.gid)));
                 std::cout << "network.client.admitted gid=" << static_cast<int>(event.gid) << '\n';
+                // A stock host refuses a display tag another gamer already holds;
+                // the client then asked again under a distinct tag. Identity is
+                // the Steam id and this session GID, so only the label differs.
+                if (const net::LegacyGamerIdentity *admitted = online_client_->local_gamer();
+                    admitted != nullptr && admitted->gamer_tag != online_persona_name_)
+                    toast("JOINED AS " + uppercase(admitted->gamer_tag),
+                          "ANOTHER PLAYER HERE ALREADY USES YOUR NAME");
                 if (!begin_online_client_bootstrap(event.gid, error))
                 {
-                    toast("WORLD BOOTSTRAP FAILED", uppercase(error));
+                    fail_online_join(error);
                     std::cerr << "network.client.bootstrap.failure=" << error << '\n';
                     static_cast<void>(online_client_->stop(error));
                     discard_remote_projectiles();
@@ -10989,6 +15129,14 @@ class Application::Impl final
                 break;
             case net::LegacySteamRuntimeClientEventKind::peer_joined:
                 remember_online_player(event.gid, event.gamer.gamer_tag);
+                // CastleMinerZGame.OnGamerJoined runs on EVERY peer for every
+                // gamer added to its session -- the ones already there when
+                // this client arrives as well as later joiners -- and its
+                // first statement writes this console line (read, 1.6.3.8 and
+                // 1.9.9.8). A client used to show departures only.
+                if (!event.gamer.gamer_tag.empty())
+                    push_online_chat(retail_message::player_joined(event.gamer.gamer_tag,
+                                                                   presentation_generation()));
                 std::cout << "network.client.peer.joined gid=" << static_cast<int>(event.gid)
                           << " gamer=" << event.gamer.gamer_tag << '\n';
                 break;
@@ -11005,6 +15153,11 @@ class Application::Impl final
                 discard_remote_projectiles(event.gid);
                 discard_network_enemies(event.gid);
                 discard_network_dragon(event.gid);
+                // The GamerLeft console line, while the name is still known.
+                if (const auto departed = online_remote_players_.find(event.gid);
+                    departed != online_remote_players_.end() && !departed->second.gamer_tag.empty())
+                    push_online_chat(retail_message::player_left(departed->second.gamer_tag,
+                                                                 presentation_generation()));
                 forget_online_player(event.gid);
                 std::cout << "network.client.peer.left gid=" << static_cast<int>(event.gid) << '\n';
                 break;
@@ -11015,7 +15168,13 @@ class Application::Impl final
             case net::LegacySteamRuntimeClientEventKind::gameplay:
                 if (!handle_online_client_gameplay(event, error))
                 {
-                    toast("WORLD BOOTSTRAP FAILED", uppercase(error));
+                    if (online_join_in_progress())
+                        fail_online_join(error);
+                    else
+                    {
+                        alert("STEAM SESSION ENDED", uppercase(error));
+                        join_flow_.transport_lost();
+                    }
                     std::cerr << "network.client.bootstrap.failure=" << error << '\n';
                     save_online_position();
                     static_cast<void>(online_client_->stop(error));
@@ -11032,6 +15191,7 @@ class Application::Impl final
                     online_world_key_.clear();
                     pending_chunk_reconciliations_.clear();
                     requested_chunk_reconciliations_.clear();
+                    chunk_reconcile_overlay_.clear();
                     return;
                 }
                 break;
@@ -11039,6 +15199,17 @@ class Application::Impl final
                 std::cerr << "network.client.packet.rejected=" << event.detail << '\n';
                 break;
             case net::LegacySteamRuntimeClientEventKind::transport_failure:
+                break;
+            // The Xbox Avatars add-on (app_xbox_avatar.inc). Not gameplay.
+            case net::LegacySteamRuntimeClientEventKind::avatar_capability:
+                xbox_avatar_capability(event.gid, event.payload);
+                break;
+            case net::LegacySteamRuntimeClientEventKind::avatar_sync:
+                xbox_avatar_packet(event.gid, event.payload);
+                break;
+            // (Network) A mod channel frame from the host (app_mod_net.inc).
+            case net::LegacySteamRuntimeClientEventKind::mod_channel:
+                mod_net_client_frame(event.payload);
                 break;
             }
         }
@@ -11120,6 +15291,20 @@ class Application::Impl final
         return send_online_bootstrap_packets({*request}, local_gid, error);
     }
 
+    // One console line per accepted gameplay packet is a synchronous write on
+    // the frame thread: with a few guests at the stock 20 Hz that is well over
+    // a hundred writes a second, and a console window makes each one
+    // expensive. Keep the per-packet traffic log opt-in
+    // (OPENMINERZ_NET_LOG=1); refusals and session events stay unconditional.
+    [[nodiscard]] static bool online_packet_log_enabled() noexcept
+    {
+        static const bool enabled = [] {
+            const char *value = std::getenv("OPENMINERZ_NET_LOG");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        return enabled;
+    }
+
     [[nodiscard]] static bool drop_online_gameplay_packet(std::uint8_t sender_gid,
                                                           std::string_view message,
                                                           std::string_view reason,
@@ -11134,6 +15319,7 @@ class Application::Impl final
 
     void install_online_world(WorldSaveData save)
     {
+        progress_.add(ProgressMetric::games);
         reset_world_session_state();
         game_mode_ = online_client_mode_;
         difficulty_ = online_client_difficulty_;
@@ -11151,9 +15337,11 @@ class Application::Impl final
         inventory_.set_profile(online_client_protocol_ == net::ProtocolVersion::modern_v4
                                    ? InventoryProfile::modern
                                    : InventoryProfile::classic);
+        gameplay_profile_ = inventory_.profile();
         crate_inventories_ = std::move(save.crates);
         custom_doors_ = std::move(save.doors);
         world_spawners_ = std::move(save.spawners);
+        encounter_state_ = std::move(save.encounters);
         active_world_spawners_.clear();
         sync_selected_item();
         active_world_path_.clear();
@@ -11192,9 +15380,7 @@ class Application::Impl final
         world_ready_frames_ = 0U;
         cancel_world_action();
         SDL_SetWindowRelativeMouseMode(window_, false);
-        toast("AUTHORITATIVE WORLD RECEIVED",
-              std::format("SEED {}  /  {}  /  {}", save.seed, game_mode_label(game_mode_),
-                          net::protocol_label(online_client_protocol_)));
+        start_mod_session_joined(); // Mod runtime area (app_mod_runtime.inc)
     }
 
     [[nodiscard]] bool handle_online_client_gameplay(
@@ -11210,6 +15396,14 @@ class Application::Impl final
                 {
                     error = std::format("Bootstrap contract error {} on {}",
                                         static_cast<int>(result.error), result.input_message);
+                    return false;
+                }
+                // Replay initial crate records too: live destroy/recreate
+                // events may be interleaved with these records during loading.
+                if (result.input_message == "ItemCrateMessage" &&
+                    !bootstrap_gameplay_.push(event.gid, event.payload))
+                {
+                    error = "Gameplay exceeded the bounded loading queue";
                     return false;
                 }
                 if (result.input_message == "WorldInfoMessage")
@@ -11260,8 +15454,54 @@ class Application::Impl final
                     WorldSaveData installed = *save;
                     online_bootstrap_client_.reset();
                     install_online_world(std::move(installed));
+                    for (const auto &pending : bootstrap_gameplay_.take())
+                    {
+                        net::LegacySteamRuntimeClientEvent replay;
+                        replay.kind = net::LegacySteamRuntimeClientEventKind::gameplay;
+                        replay.gid = pending.sender_gid;
+                        replay.payload = pending.packet;
+                        if (!handle_online_client_gameplay(replay, error))
+                            return false;
+                        net::DecodedPacket change;
+                        net::PacketError packet_error{};
+                        net::PayloadError payload_error{};
+                        if (net::decode_packet(online_client_protocol_, pending.packet, change,
+                                               packet_error) &&
+                            change.message)
+                        {
+                            if (change.message->name == "AlterBlockMessage")
+                            {
+                                net::AlterBlockPayload edit;
+                                if (net::decode_alter_block_payload(change.payload,
+                                                                    online_client_protocol_, edit,
+                                                                    payload_error))
+                                    schedule_authoritative_chunk_check(edit.block_location);
+                            }
+                            else if (change.message->name == "RemoveBlocksMessage")
+                            {
+                                net::RemoveBlocksPayload removed;
+                                if (net::decode_remove_blocks_payload(change.payload, removed,
+                                                                      payload_error))
+                                    for (const auto location : removed.blocks)
+                                        schedule_authoritative_chunk_check(location);
+                            }
+                        }
+                    }
                     std::cout << "network.client.bootstrap.complete edits="
                               << world_preview_->exported_edits().size() << '\n';
+                }
+                error.clear();
+                return true;
+            }
+            // Kicks are immediate. Voice has no persistent world state and
+            // can be played during loading. Everything else belongs to the
+            // incoming world and must survive its installation.
+            if (result.input_message != "KickMessage" && result.input_message != "VoiceChatMessage")
+            {
+                if (!bootstrap_gameplay_.push(event.gid, event.payload))
+                {
+                    error = "Gameplay exceeded the bounded loading queue";
+                    return false;
                 }
                 error.clear();
                 return true;
@@ -11274,6 +15514,13 @@ class Application::Impl final
         {
             error = "A validated runtime packet failed application decoding";
             return false;
+        }
+        if (decoded.message->name == "VoiceChatMessage")
+        {
+            if (event.gid != online_local_gid_)
+                receive_online_voice(event.gid, decoded.payload);
+            error.clear();
+            return true;
         }
         const bool requires_announced_player =
             net::player_routed_message(decoded.message->name);
@@ -11325,8 +15572,10 @@ class Application::Impl final
             }
             if (kick.player_id == online_local_gid_)
             {
-                error = kick.banned ? "You were banned by the session host"
-                                    : "You were kicked by the session host";
+                // The original's Session Ended dialog text.
+                error = retail(
+                    kick.banned ? RetailString::You_have_been_banned_by_the_host_of_this_session
+                                : RetailString::You_have_been_kicked_by_the_host_of_the_session);
                 return false;
             }
         }
@@ -11353,17 +15602,22 @@ class Application::Impl final
                 error = "A validated remote presence failed application decoding";
                 return false;
             }
-            if (event.gid != online_local_gid_ &&
-                !announce_online_player(event.gid, presence.gamer_tag))
+            const bool remote = event.gid != online_local_gid_;
+            const bool newly_discovered = remote && mark_online_presence_seen(event.gid);
+            if (remote && !announce_online_player(event.gid, presence.gamer_tag))
             {
                 error = "A remote presence did not match its admitted Steam identity";
                 return false;
             }
-            if (presence.request_response)
-            {
-                publish_local_presence_response();
+            publish_local_player_discovery(
+                net::player_discovery_response(newly_discovered, presence.request_response, false));
+            // BroadcastExistingDragonMessage sits outside the RequestResponse
+            // branch, but _processPlayerExistsMessage as a whole returns at
+            // once for a sender it already knows (`Sender.Tag != null`): the
+            // owner tells each peer about the dragon exactly once, the first
+            // time it sees that peer.
+            if (newly_discovered)
                 publish_existing_dragon(event.gid);
-            }
             if (event.gid != online_local_gid_ &&
                 !replay_pre_presence_packets(event.gid, error))
                 return false;
@@ -11400,8 +15654,9 @@ class Application::Impl final
                 if (!net::inventory_item_from_wire(melee.item_id, online_client_protocol_, item))
                     return drop_online_gameplay_packet(event.gid, decoded.message->name,
                                                        "unsupported-melee-item", error);
+                // (Items) A mod weapon hurts by its own player damage.
                 apply_player_damage(
-                    item_player_melee_damage(item) * 100.0F,
+                    mod_items_melee_player_damage(event.gid, item),
                     {melee.damage_source.x, melee.damage_source.y, melee.damage_source.z});
             }
         }
@@ -11417,10 +15672,16 @@ class Application::Impl final
             day_night_ = world::DayNightCycle{authoritative_day};
             last_day_number_ = static_cast<int>(std::floor(authoritative_day));
         }
-        if (decoded.message->name == "RestartLevelMessage" &&
-            (event.gid != 0U || !apply_online_restart_level()))
+        // The one stock message that relocates another player.
+        // CastleMinerZGame._processRestartLevelMessage (1.6.3.8 and 1.9.9.8)
+        // checks neither the sender nor the game mode: every client that
+        // receives it returns to the start. The shipped menus only ever send it
+        // from the host, but whoever sent it, the stock players beside us have
+        // already restarted, so this client restarts with them instead of
+        // dropping out of the session.
+        if (decoded.message->name == "RestartLevelMessage" && !apply_online_restart_level())
         {
-            error = "A restart-level packet failed host authority or application state";
+            error = "A restart-level packet could not be applied";
             return false;
         }
         if (decoded.message->name == "CreatePickupMessage" &&
@@ -11476,12 +15737,24 @@ class Application::Impl final
                                                    "out-of-bounds-block-edit", error);
             const auto block = static_cast<world::BlockType>(edit.block_type);
             const auto previous = online_block_at(edit.block_location);
+            // _processAlterBlocksMessage is `_terrain.SetBlock(location, type)`
+            // and nothing else in both stock generations: every peer applies
+            // every relayed edit, whoever sent it and whatever was in the cell.
+            // The "non-admin may not replace an occupied cell" rule that used
+            // to be applied here exists only in the OpenClassic mod's
+            // SetBlock(worldIndex, type, admin) overload; enforcing it made
+            // this client ignore the door toggles every stock peer applied.
             if (!remember_online_door_placement(event.gid, online_client_protocol_, edit, previous,
                                                 false))
                 return drop_online_gameplay_packet(event.gid, decoded.message->name,
                                                    "stale-door-identity", error);
+            if (block == world::BlockType::empty)
+                inventory_.remove_travel_destination({float(edit.block_location.x),
+                    float(edit.block_location.y), float(edit.block_location.z)});
             world_preview_->remember_edit(edit.block_location.x, edit.block_location.y,
                                           edit.block_location.z, block);
+            if (requested_chunk_reconciliations_.contains(net::chunk_corner(edit.block_location)))
+                schedule_authoritative_chunk_check(edit.block_location);
             if (world_preview_->region().contains(edit.block_location.x, edit.block_location.y,
                                                   edit.block_location.z))
             {
@@ -11543,8 +15816,10 @@ class Application::Impl final
             for (const net::IntVector3 location : removal.blocks)
                 schedule_authoritative_chunk_check(location);
         }
-        std::cout << "network.client.gameplay.validated sender_gid=" << static_cast<int>(event.gid)
-                  << " message=" << decoded.message->name << '\n';
+        if (online_packet_log_enabled())
+            std::cout << "network.client.gameplay.validated sender_gid="
+                      << static_cast<int>(event.gid) << " message=" << decoded.message->name
+                      << '\n';
         error.clear();
         return true;
     }
@@ -11579,20 +15854,40 @@ class Application::Impl final
         online_world_key_.clear();
         pending_chunk_reconciliations_.clear();
         requested_chunk_reconciliations_.clear();
+        chunk_reconcile_overlay_.clear();
+        online_join_cancelled_ = false;
+        // Forget any queued join; the browser refreshes when it is next shown.
+        join_flow_.cancel_join();
         if (online_client_operation_.valid())
         {
+            // A discovery or lobby entry in flight can take seconds. Waiting for
+            // it here would freeze the window, so a detached thread collects the
+            // result and stops that helper once the operation returns.
             try
             {
-                OnlineClientOperationResult result = online_client_operation_.get();
-                if (result.client != nullptr)
-                {
-                    std::string ignored;
-                    static_cast<void>(result.client->stop(ignored));
-                }
+                std::thread{[operation = std::move(online_client_operation_)]() mutable {
+                    try
+                    {
+                        OnlineClientOperationResult result = operation.get();
+                        if (result.client != nullptr)
+                        {
+                            std::string ignored;
+                            static_cast<void>(result.client->stop(ignored));
+                        }
+                    }
+                    catch (...)
+                    {
+                    }
+                }}.detach();
             }
             catch (...)
             {
+                // No thread could be started; the future is released in place.
             }
+            online_client_operation_ = {};
+            // Nothing is searching for the browser any more.
+            if (join_browser_state_ == JoinBrowserState::searching)
+                join_browser_state_ = JoinBrowserState::idle;
         }
         if (online_client_ != nullptr)
         {
@@ -11612,6 +15907,22 @@ class Application::Impl final
         inventory_.set_profile(host_settings_.protocol == net::ProtocolVersion::modern_v4
                                    ? InventoryProfile::modern
                                    : InventoryProfile::classic);
+        // Nothing the session's generation does not register may be published,
+        // and a session must not fail to start over one. load_world already
+        // cleaned the save; this covers anything that reached the live world
+        // some other way, against the generation actually being hosted.
+        NonRetailItemCleanup late_cleanup = remove_non_retail_items(inventory_, held_stack_);
+        late_cleanup += remove_non_retail_items(crate_inventories_, inventory_.profile());
+        if (late_cleanup.anything())
+        {
+            if (!active_world_path_.empty())
+                keep_save_from_before_item_cleanup(active_world_path_, false);
+            if (pending_item_cleanup_notice_.has_value())
+                late_cleanup += *pending_item_cleanup_notice_;
+            pending_item_cleanup_notice_ = late_cleanup;
+        }
+        // A session is beginning: every non-retail gameplay feature ends here.
+        apply_enhancement_state();
         sync_selected_item();
         net::LegacySteamRuntimeHostOptions host_options;
         host_options.settings = host_settings_;
@@ -11621,6 +15932,11 @@ class Application::Impl final
         host_options.helper_path =
             application_directory() / "SteamBridge" / "OpenMinerZ.SteamBridge32.exe";
         host_options.steam_api_path = installed_steam_api_path();
+        if (!active_world_path_.empty())
+        {
+            host_options.inventory_directory = active_world_path_;
+            host_options.inventory_directory += ".players";
+        }
         host_options.trace_path = options_.network_trace_path;
         WorldSaveData bootstrap_save;
         bootstrap_save.seed = world_seed_;
@@ -11632,6 +15948,7 @@ class Application::Impl final
         bootstrap_save.crates = crate_inventories_;
         bootstrap_save.doors = custom_doors_;
         bootstrap_save.spawners = world_spawners_;
+        bootstrap_save.encounters = encounter_state_;
         bootstrap_save.edits = world_preview_->exported_edits();
         if (!inventory_is_default)
         {
@@ -11640,8 +15957,10 @@ class Application::Impl final
                 pending_load_position_.value_or(player_.state().position);
         }
         net::BootstrapWorldIdentity identity;
+        identity.hell_bosses_spawned = static_cast<std::int32_t>(encounter_state_.hell_bosses_spawned);
+        identity.max_hell_boss_spawns = static_cast<std::int32_t>(encounter_state_.max_hell_boss_spawns);
         identity.name =
-            active_world_path_.empty() ? "OpenMinerZ Frontier" : active_world_path_.stem().string();
+            active_world_path_.empty() ? "OpenMinerZ World" : active_world_path_.stem().string();
         std::uint64_t world_key =
             static_cast<std::uint64_t>(static_cast<std::uint32_t>(world_seed_));
         for (const unsigned char character : identity.name)
@@ -11659,7 +15978,7 @@ class Application::Impl final
                                                         snapshot_error))
         {
             hosting_flow_ = false;
-            toast("HOST SNAPSHOT REJECTED",
+            toast("COULD NOT START SERVER",
                   std::format("BOOTSTRAP CONTRACT ERROR {}", static_cast<int>(snapshot_error)));
             return;
         }
@@ -11682,10 +16001,10 @@ class Application::Impl final
         if (!net::make_steam_bridge_host_config(host_options, checked_config, error))
         {
             hosting_flow_ = false;
-            toast("HOST TRANSPORT UNAVAILABLE", uppercase(std::move(error)));
+            toast("COULD NOT START SERVER", uppercase(std::move(error)));
             return;
         }
-        toast("PUBLISHING STEAM LOBBY", "INITIALIZING THE OWNED 2013 X86 STEAM RUNTIME");
+        toast("STARTING SERVER", "Connecting to Steam...");
         online_host_start_ =
             std::async(std::launch::async, [options = std::move(host_options)]() mutable {
                 OnlineHostStartResult result;
@@ -11713,6 +16032,7 @@ class Application::Impl final
             else if (result.host == nullptr)
             {
                 hosting_flow_ = false;
+                std::cerr << "network.host.start.failure=" << result.error << '\n';
                 toast("STEAM HOST FAILED", uppercase(std::move(result.error)));
             }
             else
@@ -11722,101 +16042,161 @@ class Application::Impl final
                 online_persona_name_ = result.ready.persona_name;
                 steam_identity_verified_ = true;
                 online_world_update_timer_ = 5.0F;
-                toast("STEAM LOBBY ONLINE",
-                      std::format("{}  /  LOBBY {}", result.ready.persona_name,
-                                  result.ready.lobby_id));
+                const bool invites = host_settings_.visibility == net::HostVisibility::invite_only ||
+                                     host_settings_.join_policy == net::HostJoinPolicy::invite_only;
+                const bool friends = host_settings_.visibility == net::HostVisibility::friends_only ||
+                                     host_settings_.join_policy == net::HostJoinPolicy::allow_list;
+                toast(std::format("Hosting {}", net::protocol_label(host_settings_.protocol)),
+                      invites ? "Invite only. Friends can join through a Steam invitation."
+                      : friends ? "Friends only. Choose Public in host settings to appear in the server list."
+                      : std::format("Public game. Listed in the {} server browser.",
+                                    net::protocol_label(host_settings_.protocol)));
                 std::cout << "network.host.online lobby=" << result.ready.lobby_id
                           << " local_peer=" << result.ready.local_peer << '\n';
             }
         }
         if (online_host_ == nullptr)
             return;
-        std::vector<net::LegacySteamRuntimeEvent> events;
-        std::string error;
-        if (!online_host_->pump(events, error))
+        for (std::size_t network_batch = 0; network_batch < 256U; ++network_batch)
         {
-            toast("STEAM HOST STOPPED", uppercase(error));
-            std::cerr << "network.host.failure=" << error << '\n';
-            static_cast<void>(online_host_->stop(error));
-            discard_remote_projectiles();
-            discard_network_enemies(std::nullopt, 0U);
-            discard_network_dragon(std::nullopt, 0U);
-            online_gameplay_rate_limiter_.clear();
-            clear_online_remote_players();
-            online_remote_visuals_.clear();
-            online_host_.reset();
-            online_lobby_id_ = 0U;
-            hosting_flow_ = false;
-            return;
-        }
-        for (const net::LegacySteamRuntimeEvent &event : events)
-        {
-            switch (event.kind)
+            std::vector<net::LegacySteamRuntimeEvent> events;
+            std::string error;
+            if (!online_host_->pump(events, error))
             {
-            case net::LegacySteamRuntimeEventKind::peer_connected:
-                if (const net::LegacyGamerIdentity *gamer =
-                        online_host_->gamer_for_gid(event.inbound.sender_gid);
-                    gamer != nullptr)
-                    remember_online_player(event.inbound.sender_gid, gamer->gamer_tag);
-                {
-                    const std::array<std::uint8_t, 1U> terrain_server{0U};
-                    std::string appointment_error;
-                    if (!publish_online_broadcast("AppointServerMessage", terrain_server,
-                                                  net::MessageDeliveryPolicy::reliable_ordered,
-                                                  appointment_error))
-                        std::cerr << "network.terrain-server.appointment.failure="
-                                  << appointment_error << '\n';
-                }
-                toast("PLAYER CONNECTED", std::format("STEAM PEER {}", event.peer));
-                std::cout << "network.peer.connected peer=" << event.peer
-                          << " gid=" << static_cast<int>(event.inbound.sender_gid) << '\n';
-                break;
-            case net::LegacySteamRuntimeEventKind::peer_disconnected: {
-                std::optional<world::EnemyIdentity> departed_local_spawner_enemy;
-                for (const auto &[identity, source] : local_spawner_enemy_sources_)
-                    if (identity.target_gid == event.inbound.sender_gid)
-                    {
-                        departed_local_spawner_enemy = identity;
-                        break;
-                    }
-                if (departed_local_spawner_enemy.has_value())
-                    notify_local_spawner_enemy_removed(*departed_local_spawner_enemy);
-                std::vector<world::EnemyIdentity> orphaned_spawner_enemies;
-                for (const auto &[identity, owner_gid] : remote_spawner_enemy_owners_)
-                    if (owner_gid == event.inbound.sender_gid)
-                        orphaned_spawner_enemies.push_back(identity);
-                for (const world::EnemyIdentity identity : orphaned_spawner_enemies)
-                {
-                    remote_spawner_enemy_owners_.erase(identity);
-                    publish_local_enemy_target("EnemyGiveUpMessage", identity);
-                }
-                discard_remote_projectiles(event.inbound.sender_gid);
-                discard_network_enemies(event.inbound.sender_gid);
-                discard_network_dragon(event.inbound.sender_gid);
-                forget_online_player(event.inbound.sender_gid);
-                online_gameplay_rate_limiter_.disconnect(event.peer);
-                pending_remote_spawner_triggers_.erase(event.peer);
-                std::erase_if(remote_spawner_owners_,
-                              [&](const auto &owner) { return owner.second == event.peer; });
-                std::erase_if(remote_loot_claims_,
-                              [&](const auto &claim) { return claim.second.owner == event.peer; });
-                toast("PLAYER LEFT", std::format("STEAM PEER {}", event.peer));
-                std::cout << "network.peer.disconnected peer=" << event.peer << '\n';
-                break;
+                alert("STEAM HOST STOPPED", uppercase(error));
+                std::cerr << "network.host.failure=" << error << '\n';
+                static_cast<void>(online_host_->stop(error));
+                discard_remote_projectiles();
+                discard_network_enemies(std::nullopt, 0U);
+                discard_network_dragon(std::nullopt, 0U);
+                online_gameplay_rate_limiter_.clear();
+                clear_online_remote_players();
+                online_remote_visuals_.clear();
+                online_host_.reset();
+                online_lobby_id_ = 0U;
+                hosting_flow_ = false;
+                return;
             }
-            case net::LegacySteamRuntimeEventKind::rejected:
-                std::cerr << "network.packet.rejected peer="
-                          << (event.audit.peer != 0U ? event.audit.peer : event.peer)
-                          << " stage=" << static_cast<int>(event.audit.stage)
-                          << " bytes=" << event.audit.input_length << " reason="
-                          << (!event.audit.reason.empty() ? event.audit.reason : event.detail)
-                          << '\n';
+            if (events.empty())
                 break;
-            case net::LegacySteamRuntimeEventKind::gameplay:
-                handle_online_gameplay(event.inbound);
-                break;
-            case net::LegacySteamRuntimeEventKind::transport_failure:
-                break;
+            for (const net::LegacySteamRuntimeEvent &event : events)
+            {
+                switch (event.kind)
+                {
+                case net::LegacySteamRuntimeEventKind::peer_connected:
+                    if (const net::LegacyGamerIdentity *gamer =
+                            online_host_->gamer_for_gid(event.inbound.sender_gid);
+                        gamer != nullptr)
+                        remember_online_player(event.inbound.sender_gid, gamer->gamer_tag);
+                    {
+                        const std::array<std::uint8_t, 1U> terrain_server{0U};
+                        std::string appointment_error;
+                        if (!publish_online_broadcast("AppointServerMessage", terrain_server,
+                                                      net::MessageDeliveryPolicy::reliable_ordered,
+                                                      appointment_error))
+                            std::cerr << "network.terrain-server.appointment.failure="
+                                      << appointment_error << '\n';
+                    }
+                    {
+                        const net::LegacyGamerIdentity *joined =
+                            online_host_->gamer_for_gid(event.inbound.sender_gid);
+                        const std::string name =
+                            joined != nullptr && !joined->gamer_tag.empty()
+                                ? joined->gamer_tag
+                                : std::format("STEAM PEER {}", event.peer);
+                        toast("PLAYER CONNECTED", std::format("{} is loading the world.", name));
+                        // CastleMinerZGame's GamerJoined handler writes this
+                        // line to the console every peer reads chat from.
+                        push_online_chat(
+                            retail_message::player_joined(name, presentation_generation()));
+                        std::cout << "network.peer.connected peer=" << event.peer
+                                  << " gid=" << static_cast<int>(event.inbound.sender_gid)
+                                  << " name=\"" << name << "\"\n";
+                        // (Network) An extension peer of a modded session gets its mod channel.
+                        mod_net_peer_connected(event.peer, event.inbound.sender_gid, name);
+                    }
+                    // OnGamerJoined: a banned identity is kicked again on arrival.
+                    if (host_ban_list_.contains(event.peer))
+                        send_host_kick(event.inbound.sender_gid, true);
+                    break;
+                case net::LegacySteamRuntimeEventKind::peer_disconnected: {
+                    std::optional<world::EnemyIdentity> departed_local_spawner_enemy;
+                    for (const auto &[identity, source] : local_spawner_enemy_sources_)
+                        if (identity.target_gid == event.inbound.sender_gid)
+                        {
+                            departed_local_spawner_enemy = identity;
+                            break;
+                        }
+                    if (departed_local_spawner_enemy.has_value())
+                        notify_local_spawner_enemy_removed(*departed_local_spawner_enemy);
+                    std::vector<world::EnemyIdentity> orphaned_spawner_enemies;
+                    for (const auto &[identity, owner_gid] : remote_spawner_enemy_owners_)
+                        if (owner_gid == event.inbound.sender_gid)
+                            orphaned_spawner_enemies.push_back(identity);
+                    for (const world::EnemyIdentity identity : orphaned_spawner_enemies)
+                    {
+                        remote_spawner_enemy_owners_.erase(identity);
+                        publish_local_enemy_target("EnemyGiveUpMessage", identity);
+                    }
+                    const std::string departed_name = online_gamer_tag(
+                        event.inbound.sender_gid, std::format("STEAM PEER {}", event.peer));
+                    discard_remote_projectiles(event.inbound.sender_gid);
+                    discard_network_enemies(event.inbound.sender_gid);
+                    discard_network_dragon(event.inbound.sender_gid);
+                    forget_online_player(event.inbound.sender_gid);
+                    online_gameplay_rate_limiter_.disconnect(event.peer);
+                    pending_remote_spawner_triggers_.erase(event.peer);
+                    std::erase_if(remote_spawner_owners_,
+                                  [&](const auto &owner) { return owner.second == event.peer; });
+                    std::erase_if(remote_loot_claims_, [&](const auto &claim) {
+                        return claim.second.owner == event.peer;
+                    });
+                    toast("PLAYER LEFT", departed_name);
+                    push_online_chat(
+                        retail_message::player_left(departed_name, presentation_generation()));
+                    std::cout << "network.peer.disconnected peer=" << event.peer
+                              << " gid=" << static_cast<int>(event.inbound.sender_gid)
+                              << " name=\"" << departed_name << "\"\n";
+                    mod_net_peer_disconnected(event.peer, event.inbound.sender_gid); // (Network)
+                    break;
+                }
+                case net::LegacySteamRuntimeEventKind::join_notice: {
+                    // Who tried to join and why it did not (yet) work, on screen
+                    // and in the log. These never alter gameplay state.
+                    const net::LegacySteamJoinNoticeText text =
+                        net::describe_join_notice(event.notice);
+                    toast(text.title, text.body);
+                    std::cout << text.log << std::endl;
+                    break;
+                }
+                case net::LegacySteamRuntimeEventKind::rejected:
+                    std::cerr << "network.packet.rejected peer="
+                              << (event.audit.peer != 0U ? event.audit.peer : event.peer)
+                              << " stage=" << static_cast<int>(event.audit.stage)
+                              << " bytes=" << event.audit.input_length << " reason="
+                              << (!event.audit.reason.empty() ? event.audit.reason : event.detail)
+                              << '\n';
+                    break;
+                case net::LegacySteamRuntimeEventKind::gameplay:
+                    handle_online_gameplay(event.inbound);
+                    break;
+                case net::LegacySteamRuntimeEventKind::transport_failure:
+                    break;
+                // The Xbox Avatars add-on (app_xbox_avatar.inc). Not gameplay.
+                case net::LegacySteamRuntimeEventKind::avatar_capability:
+                    xbox_avatar_capability(event.inbound.sender_gid, event.inbound.payload);
+                    break;
+                case net::LegacySteamRuntimeEventKind::avatar_sync:
+                    xbox_avatar_packet(event.inbound.sender_gid, event.inbound.payload);
+                    break;
+                // (Network) Mod channel and mod download frames (app_mod_net.inc).
+                case net::LegacySteamRuntimeEventKind::mod_channel:
+                    mod_net_host_frame(event.peer, event.inbound.payload);
+                    break;
+                case net::LegacySteamRuntimeEventKind::mod_download:
+                    mod_download_host_frame(event.peer, event.inbound.payload);
+                    break;
+                }
             }
         }
     }
@@ -11867,11 +16247,17 @@ class Application::Impl final
             std::string text;
             net::PayloadError text_error{};
             const auto sender = online_remote_players_.find(inbound.sender_gid);
+            // The client writes this line with its own tag, which differs from
+            // the roster tag when admission de-duplicated a display name.
+            const std::string *self_tag =
+                online_host_->self_reported_tag_for_gid(inbound.sender_gid);
             exact_spawner_trigger =
                 net::decode_chat_payload(decoded.payload, text, text_error) &&
                 (text == "A linked spawner was also triggered!" ||
                  (sender != online_remote_players_.end() && !sender->second.gamer_tag.empty() &&
-                  text == sender->second.gamer_tag + " has triggered a monster spawner!"));
+                  text == sender->second.gamer_tag + " has triggered a monster spawner!") ||
+                 (self_tag != nullptr && !self_tag->empty() &&
+                  text == *self_tag + " has triggered a monster spawner!"));
         }
         bool spawner_clear_transcript{};
         if (host_settings_.protocol == net::ProtocolVersion::modern_v4 &&
@@ -11901,6 +16287,14 @@ class Application::Impl final
         }
         if (exact_spawner_trigger)
             remember_remote_spawner_trigger(inbound.peer);
+        // Modding, gameplay area: server mods see (and may refuse) another
+        // player's digs, builds and chat before anything is applied or relayed.
+        if (mod_gameplay_live() && !mod_gameplay_remote_message(inbound, decoded))
+            return;
+        // (Authority) A host that decides refuses what the game's rules do not
+        // allow, before anything is applied or relayed (app_mod_auth.inc).
+        if (authority_refuses(inbound, decoded))
+            return;
 
         std::optional<net::RequestPickupPayload> pending_pickup_request;
 
@@ -11908,27 +16302,56 @@ class Application::Impl final
         {
             net::PlayerExistsPayload presence;
             net::PayloadError payload_error{};
-            if (!net::decode_player_exists_payload(decoded.payload, presence, payload_error) ||
-                !announce_online_player(inbound.sender_gid, std::move(presence.gamer_tag)))
+            if (!net::decode_player_exists_payload(decoded.payload, presence, payload_error))
             {
                 std::cerr << "network.authority.presence-payload.rejected peer=" << inbound.peer
                           << '\n';
                 return;
             }
+            const bool request_response = presence.request_response;
+            const bool newly_discovered = mark_online_presence_seen(inbound.sender_gid);
+            if (!announce_online_player(inbound.sender_gid, std::move(presence.gamer_tag)))
+            {
+                std::cerr << "network.authority.presence-payload.rejected peer=" << inbound.peer
+                          << '\n';
+                return;
+            }
+            // The host is a peer in _processPlayerExistsMessage too: it answers
+            // a newcomer with its own time-connected, carried item and crate
+            // focus. Its PlayerExists and TimeOfDay are already part of the
+            // authoritative bootstrap transcript the newcomer just consumed.
+            publish_local_player_discovery(
+                net::player_discovery_response(newly_discovered, request_response, true));
+            // _processPlayerExistsMessage calls BroadcastExistingDragonMessage
+            // on EVERY peer, host included, and the host owns the dragon brain
+            // for every dragon it spawned itself. Without this a player who
+            // joined mid-flight never learned the dragon exists: its waypoints
+            // arrived with no client entity to apply them to, so the dragon was
+            // visible only to the peers that were present when it spawned.
+            // Once per peer: the handler returns at once for a sender it
+            // already knows (`Sender.Tag != null`).
+            if (newly_discovered)
+                publish_existing_dragon(inbound.sender_gid);
         }
+        // The relay is at the end of this handler, so returning here would stop
+        // a player's own state reaching every OTHER peer because the host could
+        // not apply it locally. Authority already accepted the packet; a local
+        // application problem is the host's alone. Carried item and crate focus
+        // in particular are change-only, so a suppressed relay leaves every
+        // other peer permanently wrong about what this player is holding.
         if (decoded.message->name == "PlayerUpdateMessage" &&
             !apply_online_player_update(inbound.sender_gid, host_settings_.protocol,
                                         decoded.payload))
-        {
-            std::cerr << "network.authority.player-update.rejected peer=" << inbound.peer << '\n';
-            return;
-        }
+            std::cerr << "network.authority.player-update.unapplied peer=" << inbound.peer << '\n';
         if (!apply_online_auxiliary_player_state(inbound.sender_gid, decoded))
-        {
-            std::cerr << "network.authority.auxiliary-player-state.rejected peer=" << inbound.peer
+            std::cerr << "network.authority.auxiliary-player-state.unapplied peer=" << inbound.peer
                       << '\n';
-            return;
-        }
+        // _processRestartLevelMessage runs on the host exactly as on a guest:
+        // no sender check, no mode check. The sender restarted itself on its
+        // own echo and the relay below restarts everybody else, so the host
+        // returns to the start with them rather than staying behind alone.
+        if (decoded.message->name == "RestartLevelMessage" && !apply_online_restart_level())
+            std::cerr << "network.authority.restart-level.unapplied peer=" << inbound.peer << '\n';
         if (decoded.message->name == "DigMessage" &&
             !apply_online_dig_effect(inbound.sender_gid, host_settings_.protocol, decoded.payload,
                                      true))
@@ -11950,7 +16373,6 @@ class Application::Impl final
             net::MeleePlayerPayload melee;
             net::PayloadError payload_error{};
             world::Vec3 victim_position = player_.state().position;
-            bool victim_dead = player_life_ != PlayerLife::alive;
             if (inbound.recipient_gid != 0U)
             {
                 const auto victim = online_remote_players_.find(inbound.recipient_gid);
@@ -11962,11 +16384,13 @@ class Application::Impl final
                     return;
                 }
                 victim_position = victim->second.state.position;
-                victim_dead = victim->second.state.dead;
             }
+            // Whether the victim is alive is the victim's own call: ApplyDamage
+            // starts with `!LocalPlayer.Dead`. Suppressing a relay from the
+            // host's replicated copy of that flag loses every hit landed in the
+            // window where the host still believes a respawned player is dead.
             if (!net::decode_melee_player_payload(decoded.payload, host_settings_.protocol, melee,
                                                   payload_error) ||
-                victim_dead ||
                 !melee_pvp_allows(host_settings_.player_versus_player, inbound.recipient_gid == 0U,
                                   false) ||
                 !validate_online_melee_sender(melee, inbound.sender_gid, victim_position,
@@ -11984,8 +16408,9 @@ class Application::Impl final
                               << '\n';
                     return;
                 }
+                // (Items) A mod weapon hurts by its own player damage.
                 apply_player_damage(
-                    item_player_melee_damage(item) * 100.0F,
+                    mod_items_melee_player_damage(inbound.sender_gid, item),
                     {melee.damage_source.x, melee.damage_source.y, melee.damage_source.z});
             }
         }
@@ -12051,27 +16476,41 @@ class Application::Impl final
             {
                 std::cerr << "network.authority.create-pickup.rejected peer=" << inbound.peer
                           << '\n';
+                // Only a payload this host cannot even read is unanswerable; a
+                // decoded one is refunded so the stack is never destroyed.
+                if (payload_error == net::PayloadError::none)
+                    static_cast<void>(
+                        return_refused_pickup_to_sender(inbound.peer, inbound.sender_gid, pickup));
                 return;
             }
-            const float dx = pickup.spawn_position.x - remote->second.state.position.x;
-            const float dy = pickup.spawn_position.y - (remote->second.state.position.y + 1.0F);
-            const float dz = pickup.spawn_position.z - remote->second.state.position.z;
-            const float velocity_squared = pickup.spawn_vector.x * pickup.spawn_vector.x +
-                                           pickup.spawn_vector.y * pickup.spawn_vector.y +
-                                           pickup.spawn_vector.z * pickup.spawn_vector.z;
-            if (pickup.spawn_position.x < -1'000'000.0F || pickup.spawn_position.x > 1'000'000.0F ||
-                pickup.spawn_position.y < -128.0F || pickup.spawn_position.y > 128.0F ||
-                pickup.spawn_position.z < -1'000'000.0F || pickup.spawn_position.z > 1'000'000.0F ||
-                dx * dx + dy * dy + dz * dz > 100.0F || velocity_squared > 400.0F ||
+            // No distance test against the sender. A pickup starts where the
+            // THING was, not where the player is: BaseZombie.CreatePickup drops
+            // loot at the enemy on behalf of whoever is credited with the kill
+            // (run against the owned assembly, a rifle kill 40 units out
+            // publishes its pickup 40 units from the sender), dragon loot lands
+            // where the dragon died, and a remote blast sheds torches, doors
+            // and crate contents at the blast. Ten units refused all of that
+            // and "refunded" it, so a stock player's distant kills teleported
+            // their loot into the inventory and nobody else ever saw a drop.
+            if (!net::stock_pickup_spawn_valid(pickup.spawn_position, pickup.spawn_vector) ||
                 !authorize_remote_loot_pickup(inbound.peer, pickup, stack) ||
                 !world_preview_->spawn_network_pickup(
                     stack,
-                    {pickup.spawn_position.x, pickup.spawn_position.y, pickup.spawn_position.z},
+                    // 1.9.9.8 places the entity half a block past SpawnPosition
+                    // on every axis (HandleCreatePickupMessage).
+                    {pickup.spawn_position.x +
+                         (host_settings_.protocol == net::ProtocolVersion::modern_v4 ? 0.5F : 0.0F),
+                     pickup.spawn_position.y +
+                         (host_settings_.protocol == net::ProtocolVersion::modern_v4 ? 0.5F : 0.0F),
+                     pickup.spawn_position.z +
+                         (host_settings_.protocol == net::ProtocolVersion::modern_v4 ? 0.5F : 0.0F)},
                     {pickup.spawn_vector.x, pickup.spawn_vector.y, pickup.spawn_vector.z},
                     pickup.pickup_id, inbound.sender_gid, pickup.dropped, pickup.display_on_pickup))
             {
                 std::cerr << "network.authority.create-pickup.out-of-range-duplicate-or-full peer="
                           << inbound.peer << '\n';
+                static_cast<void>(
+                    return_refused_pickup_to_sender(inbound.peer, inbound.sender_gid, pickup));
                 return;
             }
         }
@@ -12096,15 +16535,16 @@ class Application::Impl final
                           << '\n';
                 return;
             }
-            const float dx = pickup->position.x - remote->second.state.position.x;
-            const float dy = pickup->position.y - (remote->second.state.position.y + 1.0F);
-            const float dz = pickup->position.z - remote->second.state.position.z;
-            if (dx * dx + dy * dy + dz * dz > 16.0F)
-            {
-                std::cerr << "network.authority.request-pickup.out-of-reach peer=" << inbound.peer
-                          << '\n';
-                return;
-            }
+            // PickupManager.HandleRequestPickupMessage grants the first request
+            // for a pickup the host still holds and measures nothing. The
+            // requester already measured, against ITS simulation of the pickup
+            // and its own unlagged position; this host's copy of both differs,
+            // and the stock requester sets `_pickedUp` for good when it asks.
+            // A reach test here therefore turned ordinary latency, or a pickup
+            // that bounced differently on two machines, into an item one
+            // player could never collect while everyone else could. "Already
+            // pending" needs no list here: the grant below consumes the pickup,
+            // so a second request simply finds it gone (stock_host_grants_pickup).
             pending_pickup_request = request;
         }
 
@@ -12132,6 +16572,9 @@ class Application::Impl final
                 remote == online_remote_players_.end() || !remote->second.has_update)
             {
                 std::cerr << "network.authority.crate-item.rejected peer=" << inbound.peer << '\n';
+                if (payload_error == net::PayloadError::none)
+                    static_cast<void>(
+                        correct_refused_crate_slot(inbound.peer, crate.location, crate.index));
                 return;
             }
             const auto crate_block = online_block_at(crate.location);
@@ -12139,6 +16582,8 @@ class Application::Impl final
             {
                 std::cerr << "network.authority.crate-item.non-container peer=" << inbound.peer
                           << '\n';
+                static_cast<void>(
+                    correct_refused_crate_slot(inbound.peer, crate.location, crate.index));
                 return;
             }
             const float dx = static_cast<float>(crate.location.x) - remote->second.state.position.x;
@@ -12150,6 +16595,8 @@ class Application::Impl final
             {
                 std::cerr << "network.authority.crate-item.out-of-reach-or-full peer="
                           << inbound.peer << '\n';
+                static_cast<void>(
+                    correct_refused_crate_slot(inbound.peer, crate.location, crate.index));
                 return;
             }
         }
@@ -12203,7 +16650,20 @@ class Application::Impl final
             }
         }
 
+        // Explosive.FindBlocksToRemove always ends in RemoveBlocksMessage, so a
+        // blast that broke nothing broadcasts an empty one. It changes no block
+        // and is relayed like anything else; only a non-empty removal has
+        // something for this host to arbitrate.
+        bool empty_block_removal{};
         if (decoded.message->name == "RemoveBlocksMessage")
+        {
+            net::RemoveBlocksPayload probe;
+            net::PayloadError probe_error{};
+            empty_block_removal =
+                net::decode_remove_blocks_payload(decoded.payload, probe, probe_error) &&
+                probe.blocks.empty();
+        }
+        if (decoded.message->name == "RemoveBlocksMessage" && !empty_block_removal)
         {
             net::RemoveBlocksPayload removal;
             net::PayloadError payload_error{};
@@ -12219,10 +16679,28 @@ class Application::Impl final
                 return;
             }
             const net::IntVector3 first = removal.blocks.front();
+            std::vector<std::pair<CrateKey, world::BlockType>> loot_removals;
+            if (host_settings_.protocol == net::ProtocolVersion::modern_v4)
+                for (const auto &cell : removal.blocks)
+                    if (const auto block = online_block_at(cell);
+                        block == world::BlockType::loot_block || block == world::BlockType::lucky_loot_block)
+                    {
+                        const auto key = spawner_key(cell);
+                        const auto claim = remote_loot_claims_.find(key);
+                        if ((claim != remote_loot_claims_.end() && claim->second.owner != inbound.peer) ||
+                            remote_loot_claims_.size() + loot_removals.size() >= 2048U)
+                        {
+                            correct_rejected_block_mutation(inbound.peer, decoded);
+                            return;
+                        }
+                        loot_removals.emplace_back(key, *block);
+                    }
             const float dx = static_cast<float>(first.x) - remote->second.state.position.x;
             const float dy = static_cast<float>(first.y) - remote->second.state.position.y;
             const float dz = static_cast<float>(first.z) - remote->second.state.position.z;
-            if (dx * dx + dy * dy + dz * dz > 40'000.0F ||
+            // Rockets and blaster bolts break terrain wherever they land inside
+            // the shooter's loaded window, which reaches well past 200 units.
+            if (dx * dx + dy * dy + dz * dz > 262'144.0F ||
                 !online_host_->apply_authoritative_block_removals(removal.blocks) ||
                 !apply_online_block_removals(host_settings_.protocol, removal))
             {
@@ -12230,6 +16708,14 @@ class Application::Impl final
                           << inbound.peer << '\n';
                 correct_rejected_block_mutation(inbound.peer, decoded);
                 return;
+            }
+            for (const auto &[key, block] : loot_removals)
+            {
+                auto claim = remote_loot_claims_.try_emplace(key,
+                    RemoteLootClaim{inbound.peer, block, 0U, 0U, 0.0F, false}).first;
+                claim->second.block_removed = true;
+                claim->second.expires_at = world_elapsed_ + 15.0F;
+                active_world_spawners_.erase(key);
             }
         }
 
@@ -12303,23 +16789,23 @@ class Application::Impl final
                 }
             }
             const auto remote = online_remote_players_.find(inbound.sender_gid);
-            if (!infinite_resources_)
+            // Neither stock generation has a reach rule, an edit counter or a
+            // ban: _processAlterBlocksMessage is one unconditional SetBlock. The
+            // ten-metre rule and the one-second anti-cheat sweep belong to the
+            // OpenClassic mod. Refusing a stock guest's edit here does not undo
+            // it for that guest's own machine until the correction lands, and a
+            // falling or just-teleported player is easily ten metres from the
+            // position this host last heard. What remains is a hostile ceiling
+            // only: an edit outside anything the sender could have loaded.
+            if (remote != online_remote_players_.end() && remote->second.has_update)
             {
-                if (remote == online_remote_players_.end() || !remote->second.has_update)
-                {
-                    std::cerr << "network.authority.block-edit.no-position peer=" << inbound.peer
-                              << '\n';
-                    static_cast<void>(send_authoritative_block_correction(
-                        inbound.peer, edit.block_location));
-                    return;
-                }
                 const float dx =
                     static_cast<float>(edit.block_location.x) - remote->second.state.position.x;
                 const float dy =
                     static_cast<float>(edit.block_location.y) - remote->second.state.position.y;
                 const float dz =
                     static_cast<float>(edit.block_location.z) - remote->second.state.position.z;
-                if (dx * dx + dy * dy + dz * dz > 100.0F)
+                if (dx * dx + dy * dy + dz * dz > 262'144.0F)
                 {
                     std::cerr << "network.authority.block-edit.out-of-reach peer=" << inbound.peer
                               << '\n';
@@ -12328,6 +16814,10 @@ class Application::Impl final
                     return;
                 }
             }
+            // No occupied-cell rule either: BlockTerrain.SetBlock takes no
+            // `admin` argument in stock, so a guest replacing one block with
+            // another (every door toggle) is applied by every stock peer and
+            // must be applied and relayed here.
             const CrateKey door_key{edit.block_location.x, edit.block_location.y,
                                     edit.block_location.z};
             const bool had_door_identity = custom_doors_.contains(door_key);
@@ -12369,6 +16859,9 @@ class Application::Impl final
             }
             if (assign_spawner_owner)
                 remote_spawner_owners_[spawner_key(edit.block_location)] = inbound.peer;
+            if (block == world::BlockType::empty)
+                inventory_.remove_travel_destination({float(edit.block_location.x),
+                    float(edit.block_location.y), float(edit.block_location.z)});
             const CrateKey edit_key = spawner_key(edit.block_location);
             if (removes_loot)
             {
@@ -12389,6 +16882,8 @@ class Application::Impl final
             dirty_ = true;
         }
 
+        if (decoded.message->name == "VoiceChatMessage")
+            receive_online_voice(inbound.sender_gid, decoded.payload);
         if (decoded.message->name == "ChatMessage" ||
             decoded.message->name == "BroadcastTextMessage")
         {
@@ -12410,6 +16905,7 @@ class Application::Impl final
         {
             net::LegacySteamOutbound relay;
             relay.application_packet = inbound.payload;
+            authority_relay_packet(inbound.sender_gid, decoded, relay.application_packet); // (Authority)
             relay.delivery = inbound.delivery;
             relay.channel = inbound.channel;
             relay.sender_gid = inbound.sender_gid;
@@ -12425,9 +16921,11 @@ class Application::Impl final
                                     pending_pickup_request->spawner_id, inbound.sender_gid))
             std::cerr << "network.authority.request-pickup.consume-failure peer=" << inbound.peer
                       << '\n';
-        std::cout << "network.gameplay.accepted peer=" << inbound.peer
-                  << " message=" << decoded.message->name << " relay=" << decision.should_relay()
-                  << " consume=" << decision.should_consume() << '\n';
+        if (online_packet_log_enabled())
+            std::cout << "network.gameplay.accepted peer=" << inbound.peer
+                      << " message=" << decoded.message->name
+                      << " relay=" << decision.should_relay()
+                      << " consume=" << decision.should_consume() << '\n';
     }
 
     void shutdown_online_host() noexcept
@@ -12470,8 +16968,23 @@ class Application::Impl final
     // ---- World persistence: one .omw text file per world under the settings
     // directory's Worlds folder (never inside the repo). ----
 
+    [[nodiscard]] static std::int64_t unix_now()
+    {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+
+    [[nodiscard]] std::string current_world_player_name() const
+    {
+        return steam_identity_verified_ && !online_persona_name_.empty() ? online_persona_name_
+                                                                         : profile_name_;
+    }
+
     [[nodiscard]] std::filesystem::path worlds_directory() const
     {
+        if (options_.world_directory)
+            return *options_.world_directory;
         return store_.path().parent_path() / "Worlds";
     }
 
@@ -12483,10 +16996,23 @@ class Application::Impl final
         std::string saved_at;
         std::string mode;
         std::string difficulty;
+        std::int64_t last_played{};
         std::int32_t seed{};
         float day{};
+        WorldHistory history;
+        bool readable{};
+        bool recovered{};
+        std::string content_style;
+        std::string position;
+        std::uintmax_t file_bytes{};
+        std::size_t modified_blocks{};
+        std::size_t crates{};
+        int max_distance{};
+        float health{};
+        bool player_recorded{};
         std::filesystem::path path;
         std::shared_ptr<SDL_Texture> preview;
+        bool preview_checked{};
     };
 
     [[nodiscard]] static std::filesystem::path world_preview_path(
@@ -12531,6 +17057,15 @@ class Application::Impl final
         {
             if (entry.is_regular_file() && entry.path().extension() == ".omw")
                 found.emplace_back(entry.last_write_time(), entry.path());
+            else if (entry.is_regular_file() && entry.path().extension() == ".bak")
+            {
+                auto primary = entry.path();
+                primary.replace_extension();
+                std::error_code exists_error;
+                if (primary.extension() == ".omw" &&
+                    !std::filesystem::exists(primary, exists_error) && !exists_error)
+                    found.emplace_back(entry.last_write_time(), primary);
+            }
         }
         std::sort(found.begin(), found.end(),
                   [](const auto &a, const auto &b) { return a.first > b.first; });
@@ -12538,18 +17073,46 @@ class Application::Impl final
         {
             WorldSlot slot;
             slot.name = path.stem().string();
-            for (char &character : slot.name)
-                character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+            if (slot.name.starts_with("frontier-"))
+                slot.name = "World " + slot.name.substr(9U);
             slot.path = path;
             const std::optional<WorldSaveData> save = read_world_save(path);
             if (save.has_value())
             {
-                slot.owner = save->owner.empty() ? "LEGACY SAVE" : save->owner;
+                slot.readable = true;
+                slot.recovered = save->recovered_from_backup;
+                slot.history = save->history;
+                slot.owner = save->history.creator;
+                if (slot.owner.empty() && save->version < 8)
+                    slot.owner = save->owner;
+                if (slot.owner.empty())
+                    slot.owner = "Not recorded";
                 slot.saved_at = world_saved_at(save->saved_unix_seconds, written);
+                slot.last_played =
+                    save->saved_unix_seconds > 0
+                        ? save->saved_unix_seconds
+                        : std::chrono::duration_cast<std::chrono::seconds>(
+                              (std::chrono::system_clock::now() +
+                               std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                                   written - std::filesystem::file_time_type::clock::now()))
+                                  .time_since_epoch())
+                              .count();
                 slot.mode = game_mode_label(save->mode);
                 slot.difficulty = game_difficulty_label(save->difficulty);
                 slot.seed = save->seed;
                 slot.day = save->day;
+                slot.content_style =
+                    save->inventory.profile() == InventoryProfile::modern ? "MODERN" : "CLASSIC";
+                slot.position =
+                    save->has_player
+                        ? std::format("X {:.0f}   Y {:.0f}   Z {:.0f}", save->player_position.x,
+                                      save->player_position.y, save->player_position.z)
+                        : "Position not recorded";
+                slot.health = save->player_health;
+                slot.player_recorded = save->has_player;
+                slot.modified_blocks = save->edits.size();
+                slot.crates = save->crates.size();
+                slot.max_distance = save->max_distance;
             }
             else
             {
@@ -12560,27 +17123,47 @@ class Application::Impl final
             }
             slot.description =
                 std::format("{}  /  {}  /  {}", slot.owner, slot.saved_at, slot.mode);
-            if (SDL_Texture *texture = load_bmp_texture(renderer_, world_preview_path(path)))
-                slot.preview = std::shared_ptr<SDL_Texture>{texture, SDL_DestroyTexture};
+            std::error_code size_error;
+            slot.file_bytes = std::filesystem::file_size(path, size_error);
+            if (size_error)
+                slot.file_bytes = 0U;
             world_slots_.push_back(std::move(slot));
         }
+        if (world_sort_ == 0)
+            std::stable_sort(
+                world_slots_.begin(), world_slots_.end(),
+                [](const auto &a, const auto &b) { return a.last_played > b.last_played; });
+        else if (world_sort_ == 1)
+            std::stable_sort(world_slots_.begin(), world_slots_.end(),
+                             [](const auto &a, const auto &b) { return a.name < b.name; });
+        else if (world_sort_ == 2)
+            std::stable_sort(world_slots_.begin(), world_slots_.end(),
+                             [](const auto &a, const auto &b) {
+                                 return a.history.play_seconds > b.history.play_seconds;
+                             });
         std::vector<ui::MenuEntry> entries;
-        entries.push_back({"NEW WORLD",
-                           "Generate a fresh frontier with a new seed.",
-                           ui::MenuCommand::create_new_world,
-                           true,
-                           {}});
+        entries.push_back(
+            {"NEW WORLD", "Create a new world.", ui::MenuCommand::create_new_world, true, {}});
         for (const WorldSlot &slot : world_slots_)
             entries.push_back(
                 {slot.name, slot.description, ui::MenuCommand::select_world, true, "SAVED"});
         entries.push_back(
             {"BACK", "Back to game mode selection.", ui::MenuCommand::back, true, {}});
         menu_.set_world_entries(std::move(entries));
+        if (!world_slots_.empty())
+            menu_.set_selection(1U, settings_);
     }
 
     // Clears everything a previous session left behind before a world starts.
     void reset_world_session_state()
     {
+        encounter_state_ = {};
+        pending_encounter_edits_.clear();
+        world_history_ = {};
+        world_thumbnail_.reset();
+        world_thumbnail_requested_ = false;
+        pending_world_exit_ = false;
+        world_thumbnail_captured_for_pause_ = false;
         sound_bank_->clear_enemy_voices();
         sound_bank_->clear_fireball_cues();
         enemy_horde_.enemies().clear();
@@ -12607,13 +17190,19 @@ class Application::Impl final
         dragon_kill_announced_ = false;
         dragon_loot_pending_ = false;
         dragon_box_valid_ = false;
+        dragon_schedule_ = {};
         zombie_fest_ = false;
         fest_countdown_ = -1.0F;
         dragon_distance_index_ = 0;
+        dragon_spawn_retry_ = 0;
+        cavern_dragon_altitude_.reset();
         distance_origin_set_ = false;
         current_distance_ = 0;
         max_distance_ = 0;
         next_song_index_ = 0;
+        environment_song_.clear();
+        environment_song_candidate_.clear();
+        environment_song_hold_ = 0;
         last_song_distance_ = -1.0F;
         last_dragon_distance_ = -1.0F;
         crater_music_triggered_ = false;
@@ -12637,6 +17226,7 @@ class Application::Impl final
         lightning_cycle_.reset(static_cast<std::uint64_t>(static_cast<std::uint32_t>(world_seed_)) ^
                                0x5A17C0DEULL);
         lightning_visible_ = false;
+        lightning_strength_ = 0.0F;
         previous_biome_band_ = -1;
         if (locator_name_editing_)
             SDL_StopTextInput(window_);
@@ -12646,11 +17236,14 @@ class Application::Impl final
         locator_name_draft_.clear();
         locator_key_fallback_.clear();
         chat_editing_ = false;
+        pending_station_placement_.reset();
+        station_placement_confirmed_ = false;
         player_roster_visible_ = false;
         chat_draft_.clear();
         chat_key_fallback_.clear();
         online_chat_lines_.clear();
         grenade_cooking_ = false;
+        grenade_arm_.kill();
         grenade_cooking_type_ = 0U;
         grenade_cook_time_ = 0.0F;
         grenade_cooldown_ = 0.0F;
@@ -12674,6 +17267,8 @@ class Application::Impl final
         remote_spawner_enemy_owners_.clear();
         defeated_spawner_count_ = 0;
         active_crate_.reset();
+        held_stack_.reset();
+        inventory_open_ = false;
     }
 
     void recreate_world(std::int32_t seed, world::TerrainProfile terrain_profile)
@@ -12687,24 +17282,27 @@ class Application::Impl final
         loot_random_.reset(
             static_cast<std::int32_t>(static_cast<std::uint32_t>(world_seed_) ^ 0x4C4F4F54U));
         lightning_visible_ = false;
+        lightning_strength_ = 0.0F;
         world_preview_ = std::make_unique<WorldPreviewRenderer>(
             renderer_, world_seed_, settings_.view_distance, 0, terrain_profile, game_mode_);
         world_preview_->set_doors(&custom_doors_);
         world_preview_->set_particle_density(particle_density(settings_.particle_quality));
+        // A new renderer starts from built-in defaults; without this the tone,
+        // exposure, colour and quality settings were lost on every world start.
+        apply_render_settings();
     }
 
     void start_new_world()
     {
+        progress_.add(ProgressMetric::games);
         std::random_device device;
         const auto seed = static_cast<std::int32_t>(device() & 0x7FFFFFFFU);
         reset_world_session_state();
         const world::TerrainProfile terrain_profile =
-            hosting_flow_ && host_settings_.protocol == net::ProtocolVersion::modern_v4
-                ? world::TerrainProfile::modern
-                : inventory_.profile() == InventoryProfile::modern
-                      ? world::TerrainProfile::modern
-                      : world::TerrainProfile::classic;
+            gameplay_profile_ == InventoryProfile::modern ? world::TerrainProfile::modern
+                                                         : world::TerrainProfile::classic;
         recreate_world(seed, terrain_profile);
+        world_history_.begin_session(unix_now(), current_world_player_name(), true);
         // Endurance worlds are throwaway in the original; everything else saves.
         if (game_mode_ == GameMode::endurance)
         {
@@ -12714,17 +17312,23 @@ class Application::Impl final
         {
             std::error_code make_error;
             std::filesystem::create_directories(worlds_directory(), make_error);
-            active_world_path_ = worlds_directory() / std::format("frontier-{}.omw", seed);
+            active_world_path_ = worlds_directory() / std::format("World {}.omw", seed);
         }
         day_night_ = world::DayNightCycle{};
         if (options_.world_time.has_value())
             day_night_.set_time(*options_.world_time);
         begin_offline_world();
         begin_online_host(true);
+        mod_world_prepare_new(); // mod-world: a new world takes a mod's generator
+        start_mod_session_local(); // Mod runtime area (app_mod_runtime.inc)
     }
 
-    void save_world()
+    void save_world(bool refresh_thumbnail = true)
     {
+        persist_progress();
+        persist_mods(); // Mod runtime area: mod storage beside the world
+        mod_gameplay_save(); // Modding, gameplay area: the world's gameplay sidecar
+        mod_world_save();    // mod-world: the generator the world was made with
         if (active_world_path_.empty() || !world_ready())
             return;
         const world::PlayerState &player = player_.state();
@@ -12736,6 +17340,7 @@ class Application::Impl final
         save.saved_unix_seconds = std::chrono::duration_cast<std::chrono::seconds>(
                                       std::chrono::system_clock::now().time_since_epoch())
                                       .count();
+        save.history = world_history_;
         save.mode = game_mode_;
         save.difficulty = difficulty_;
         save.infinite_resources = infinite_resources_;
@@ -12752,11 +17357,24 @@ class Application::Impl final
         save.max_distance = max_distance_;
         save.next_song_index = next_song_index_;
         save.inventory = inventory_;
+        save.held_stack = held_stack_;
         save.crates = crate_inventories_;
         save.doors = custom_doors_;
         save.spawners = world_spawners_;
+        save.encounters = encounter_state_;
         save.edits = world_preview_->exported_edits();
-        (void)write_world_save(active_world_path_, save);
+        if (!write_world_save(active_world_path_, save))
+            alert("SAVE FAILED", "The previous world save is intact. Check disk space and access.");
+        // The library card's picture only has to be current when the library can
+        // be seen, so it is refreshed when the world is left, not on every
+        // periodic save: the capture is a full framebuffer readback and the
+        // write is ~2 MB, which measured 164-351 ms of blocked main thread on
+        // each autosave. A host blocked that long freezes every guest with it.
+        else if (refresh_thumbnail)
+        {
+            persist_world_thumbnail();
+            world_thumbnail_requested_ = true;
+        }
     }
 
     void save_online_position()
@@ -12770,6 +17388,44 @@ class Application::Impl final
                               {player.position, player.yaw, player.pitch});
     }
 
+    // The save exactly as it was before non-retail items were removed from it.
+    // The ordinary `.bak` is the PREVIOUS checkpoint and is replaced by every
+    // save, so on its own it would hold those items for one autosave and no
+    // longer. This copy has its own name, is written once and is never touched
+    // again; the world list ignores it (its stem does not end in `.omw`).
+    static void keep_save_from_before_item_cleanup(const std::filesystem::path &save_path,
+                                                   bool loaded_from_backup)
+    {
+        std::filesystem::path source = save_path;
+        if (loaded_from_backup)
+            source += ".bak";
+        std::filesystem::path kept = save_path;
+        kept += ".before-item-cleanup.bak";
+        std::error_code error;
+        std::filesystem::copy_file(source, kept, std::filesystem::copy_options::skip_existing,
+                                   error);
+        std::cout << "world.item-cleanup.backup=" << kept.string()
+                  << (error ? " failed=" + error.message() : std::string{}) << '\n';
+    }
+
+    // Told once, in the world, where a toast can be read: the cleanup happens
+    // while the loading screen is still up.
+    void announce_pending_item_cleanup()
+    {
+        if (!pending_item_cleanup_notice_.has_value())
+            return;
+        const NonRetailItemCleanup cleanup = *pending_item_cleanup_notice_;
+        pending_item_cleanup_notice_.reset();
+        std::cout << "world.item-cleanup stacks=" << cleanup.stacks << " items=" << cleanup.items
+                  << '\n';
+        toast(cleanup.stacks == 1U ? std::string{"1 ITEM STACK REMOVED"}
+                                   : std::format("{} ITEM STACKS REMOVED", cleanup.stacks),
+              std::format("{} {} not in the original game {} taken out of this world. Your save "
+                          "from before is kept as a backup file.",
+                          cleanup.items, cleanup.items == 1U ? "item that is" : "items that are",
+                          cleanup.items == 1U ? "was" : "were"));
+    }
+
     void load_world(const std::filesystem::path &path)
     {
         std::optional<WorldSaveData> loaded = read_world_save(path);
@@ -12778,8 +17434,35 @@ class Application::Impl final
             toast("LOAD FAILED", "The world file could not be opened.");
             return;
         }
+        // mod-world: a world made by a mod's generator needs that mod.
+        if (!mod_world_can_open(path))
+            return;
         WorldSaveData &save = *loaded;
+        const auto save_protocol = save.inventory.profile() == InventoryProfile::modern
+                                       ? net::ProtocolVersion::modern_v4 : net::ProtocolVersion::classic_v3;
+        if (hosting_flow_ && host_settings_.protocol != save_protocol)
+        {
+            menu_.open(ui::MenuScreen::world_select);
+            toast("DIFFERENT GAME VERSION", "Choose a world that matches the server's Classic or Modern setting.");
+            return;
+        }
+        // Retail parity (retail_items.hpp): a world plays with the items its
+        // own generation has. Stacks of anything else, left by earlier builds,
+        // go before anything reads the save, so they can neither be sent nor
+        // stop a session from starting. The file as it was is kept first.
+        const NonRetailItemCleanup item_cleanup = remove_non_retail_items(save);
+        if (item_cleanup.anything())
+            keep_save_from_before_item_cleanup(path, save.recovered_from_backup);
+        // The gate's answer has to be in place before the world is built and
+        // the player is placed, not only before the first tick.
+        apply_enhancement_state();
         reset_world_session_state();
+        if (item_cleanup.anything())
+            pending_item_cleanup_notice_ = item_cleanup;
+        world_history_ = save.history;
+        if (save.version < 8 && world_history_.creator.empty())
+            world_history_.creator = save.owner;
+        world_history_.begin_session(unix_now(), current_world_player_name(), false);
         game_mode_ = save.mode;
         difficulty_ = save.difficulty;
         infinite_resources_ = save.infinite_resources;
@@ -12793,12 +17476,24 @@ class Application::Impl final
         world_preview_->import_edits(save.edits);
         day_night_ = world::DayNightCycle{save.day};
         inventory_ = std::move(save.inventory);
+        gameplay_profile_ = inventory_.profile();
+        progress_.add(ProgressMetric::games);
+        held_stack_ = std::move(save.held_stack);
+        inventory_open_ = held_stack_.has_value();
         crate_inventories_ = std::move(save.crates);
         custom_doors_ = std::move(save.doors);
         world_spawners_ = std::move(save.spawners);
+        encounter_state_ = std::move(save.encounters);
+        if (save.version < 9)
+            for (const auto &edit : save.edits)
+                encounter_state_.populated_chunks.insert(
+                    {int(std::floor(double(edit[0]) / 16)), int(std::floor(double(edit[2]) / 16))});
         active_world_spawners_.clear();
         sync_selected_item();
         dragon_distance_index_ = save.dragon_distance_index;
+        // Earlier builds could consume the final crossing without spawning.
+        if (dragon_distance_index_ >= 5 && progress_.value(ProgressMetric::undead_dragon) == 0)
+            dragon_distance_index_ = 4;
         max_distance_ = save.max_distance;
         next_song_index_ = save.next_song_index;
         last_day_number_ = static_cast<int>(std::floor(save.day));
@@ -12827,9 +17522,8 @@ class Application::Impl final
         waiting_for_world_ = !world_preview_->preload_complete();
         cancel_world_action();
         SDL_SetWindowRelativeMouseMode(window_, false);
-        toast("LOADING WORLD",
-              std::format("SEED {}  /  {}", save.seed, game_mode_label(game_mode_)));
         begin_online_host(false);
+        start_mod_session_local(); // Mod runtime area (app_mod_runtime.inc)
     }
 
     [[nodiscard]] bool world_ready() const noexcept
@@ -12844,6 +17538,28 @@ class Application::Impl final
         case ui::MenuCommand::play_offline:
             hosting_flow_ = false;
             std::cout << "menu.action=play_offline\n";
+            break;
+        case ui::MenuCommand::use_teleport_station: {
+            const auto index = menu_.selection();
+            // ShowTeleportStationMenu plays "Teleport" as the choice is made,
+            // before the move; the respawn at a spawn block has no cue.
+            if (index < travel_points_.size())
+            {
+                sound_bank_->play_cue("Teleport");
+                (void)travel_to_block(travel_points_[index], world::BlockType::teleport_station);
+            }
+            menu_.open(ui::MenuScreen::world_preview);
+            SDL_SetWindowRelativeMouseMode(window_, true);
+            break;
+        }
+        case ui::MenuCommand::select_profile_classic:
+        case ui::MenuCommand::select_profile_modern:
+            gameplay_profile_ = event.command == ui::MenuCommand::select_profile_modern
+                                    ? InventoryProfile::modern : InventoryProfile::classic;
+            settings_.gameplay_profile = static_cast<int>(gameplay_profile_);
+            menu_.set_gameplay_profile(gameplay_profile_ == InventoryProfile::modern,
+                                      progress_.value(ProgressMetric::undead_dragon) > 0);
+            dirty_ = true;
             break;
         // Original FrontEndScreen semantics: picking a mode resets creative
         // and difficulty first; Endurance and Dragon Endurance start
@@ -12867,9 +17583,17 @@ class Application::Impl final
             infinite_resources_ = false;
             break;
         case ui::MenuCommand::select_mode_creative:
-            // Creative is Survival + infinite resources in the original.
-            game_mode_ = GameMode::survival;
+            game_mode_ = gameplay_profile_ == InventoryProfile::modern ? GameMode::creative
+                                                                     : GameMode::survival;
             infinite_resources_ = true;
+            break;
+        case ui::MenuCommand::select_mode_exploration:
+            game_mode_ = GameMode::exploration;
+            infinite_resources_ = true;
+            break;
+        case ui::MenuCommand::select_mode_scavenger:
+            game_mode_ = GameMode::scavenger;
+            infinite_resources_ = false;
             break;
         case ui::MenuCommand::select_difficulty_no_enemies:
             difficulty_ = GameDifficulty::no_enemies;
@@ -12896,6 +17620,11 @@ class Application::Impl final
             const std::size_t row = menu_.selection();
             if (row >= 1U && row - 1U < world_slots_.size())
             {
+                if (!world_slots_[row - 1U].readable)
+                {
+                    toast("SAVE UNAVAILABLE", "The world and its backup could not be opened.");
+                    break;
+                }
                 const std::filesystem::path chosen = world_slots_[row - 1U].path;
                 menu_.open(ui::MenuScreen::world_preview);
                 load_world(chosen);
@@ -12903,7 +17632,7 @@ class Application::Impl final
             break;
         }
         case ui::MenuCommand::open_inventory:
-            cancel_world_action();
+            cancel_world_action(true);
             inventory_open_ = true;
             inventory_focus_ = PlayerInventory::storage_size + inventory_.selected_index();
             SDL_SetWindowRelativeMouseMode(window_, false);
@@ -12912,18 +17641,84 @@ class Application::Impl final
         case ui::MenuCommand::teleport_start:
             if (game_mode_ == GameMode::endurance || difficulty_ == GameDifficulty::hardcore)
             {
-                toast("TELEPORT UNAVAILABLE", "Endurance and Hardcore refuse the easy way out.");
+                toast("TELEPORT UNAVAILABLE", "Unavailable in Endurance and Hardcore.");
                 SDL_SetWindowRelativeMouseMode(window_, true);
                 break;
             }
             teleport_player(event.command == ui::MenuCommand::teleport_start);
             SDL_SetWindowRelativeMouseMode(window_, true);
             break;
+        // TeleportMenu and HostOptions push SelectPlayerScreen(showME: false).
+        case ui::MenuCommand::teleport_to_player:
+        case ui::MenuCommand::host_kick_player:
+        case ui::MenuCommand::host_ban_player:
+            player_pick_purpose_ =
+                event.command == ui::MenuCommand::teleport_to_player ? PlayerPickPurpose::teleport
+                : event.command == ui::MenuCommand::host_kick_player ? PlayerPickPurpose::kick
+                                                                     : PlayerPickPurpose::ban;
+            player_pick_gids_.clear();
+            player_pick_names_.clear();
+            menu_.set_player_entries({});
+            refresh_player_pick_entries();
+            break;
+        case ui::MenuCommand::choose_player:
+            choose_picked_player();
+            break;
+        // HostOptionItems.Restart: RestartLevelMessage, then the notice.
+        case ui::MenuCommand::host_restart:
+            if (online_host_ != nullptr && online_host_->running())
+                restart_online_level();
+            // 1.9.9.8's Restart button ends in GameScreen.PopToHUD(); 1.6.3.8
+            // leaves HostOptions up.
+            if (gameplay_profile_ == InventoryProfile::modern)
+            {
+                menu_.open(ui::MenuScreen::world_preview);
+                cancel_world_action(true);
+                SDL_SetWindowRelativeMouseMode(window_, true);
+            }
+            break;
+        case ui::MenuCommand::host_cycle_pvp:
+            host_cycle_pvp();
+            break;
+        // HostOptionItems.Password / ServerMessage: the text dialog opens on
+        // the current value (CurrentWorld.ServerPassword, ServerMessage), and
+        // confirming it rewrites the lobby (apply_live_host_text).
+        case ui::MenuCommand::host_set_password:
+            if (online_host_ != nullptr && online_host_->running())
+                begin_host_text_edit(HostTextField::password);
+            break;
+        case ui::MenuCommand::host_server_message:
+            if (online_host_ != nullptr && online_host_->running())
+                begin_host_text_edit(HostTextField::server_name);
+            break;
+        case ui::MenuCommand::host_cycle_join_policy:
+            host_cycle_join_policy();
+            break;
+        // HostOptionItems.ClearBanList: BanList.Clear(), then SaveData().
+        case ui::MenuCommand::host_clear_ban_list:
+            if (!host_ban_list_.clear())
+                std::cerr << "network.host.ban.failure=the ban list could not be saved\n";
+            break;
         case ui::MenuCommand::host_online:
             hosting_flow_ = false;
-            toast("HOST SESSION SETUP",
-                  "CONFIGURE COMPATIBILITY, ADMISSION, SAFETY, AND MOD PLAYLIST");
             std::cout << "menu.action=host_online\n";
+            break;
+        // The Add-Ons screen's Xbox Avatars rows (app_xbox_avatar.inc).
+        case ui::MenuCommand::toggle_avatar_mine:
+        case ui::MenuCommand::toggle_avatar_others:
+        case ui::MenuCommand::reload_avatar:
+            handle_xbox_avatar_command(event.command);
+            break;
+        // (Add-Ons) An installed mod's row, and Open Mods Folder (app_mod_addons.inc).
+        case ui::MenuCommand::toggle_addon:
+            toggle_selected_addon();
+            break;
+        case ui::MenuCommand::open_mods_folder:
+            open_mods_folder();
+            break;
+        // UI area (app_mod_ui.inc): a row a mod added to this menu.
+        case ui::MenuCommand::mod_entry:
+            activate_mod_menu_entry();
             break;
         case ui::MenuCommand::edit_host_name:
             begin_host_text_edit(HostTextField::server_name);
@@ -12935,6 +17730,7 @@ class Application::Impl final
         case ui::MenuCommand::select_host_max_players:
         case ui::MenuCommand::select_host_visibility:
         case ui::MenuCommand::select_host_join_policy:
+        case ui::MenuCommand::toggle_host_openminerz_only: // (Authority)
         case ui::MenuCommand::select_host_pvp:
         case ui::MenuCommand::toggle_host_anticheat:
         case ui::MenuCommand::toggle_host_join_safety:
@@ -12945,10 +17741,10 @@ class Application::Impl final
             const std::size_t synchronized = static_cast<std::size_t>(std::count_if(
                 host_settings_.mod_manifest.mods.begin(), host_settings_.mod_manifest.mods.end(),
                 [](const net::ModDescriptor &mod) { return mod.scope != net::ModScope::client; }));
-            toast(synchronized == 0U ? "VANILLA PLAYLIST" : "SYNCHRONIZED PLAYLIST",
+            toast(synchronized == 0U ? "NO ADD-ONS" : "REQUIRED ADD-ONS",
                   synchronized == 0U
-                      ? "STOCK CLIENTS MAY JOIN; CLIENT-ONLY PACKS ARE IGNORED"
-                      : std::format("{} SERVER/CORE MODS MUST MATCH IN ORDER", synchronized));
+                      ? "No extra add-ons are needed to join."
+                      : std::format("Players need the same {} add-ons to join.", synchronized));
             break;
         }
         case ui::MenuCommand::confirm_host_settings: {
@@ -12967,7 +17763,11 @@ class Application::Impl final
                 break;
             }
             hosting_flow_ = true;
-            toast("HOST PROFILE ARMED",
+            gameplay_profile_ = host_settings_.protocol == net::ProtocolVersion::modern_v4
+                                    ? InventoryProfile::modern : InventoryProfile::classic;
+            menu_.set_gameplay_profile(gameplay_profile_ == InventoryProfile::modern,
+                                      progress_.value(ProgressMetric::undead_dragon) > 0);
+            toast("SERVER SETTINGS SAVED",
                   std::format("{}  /  {} PLAYERS  /  {}",
                               net::protocol_label(host_settings_.protocol),
                               host_settings_.maximum_players,
@@ -12989,6 +17789,7 @@ class Application::Impl final
             else
                 join_client_manifest_.protocol = net::ProtocolVersion::classic_v3;
             join_browser_.set_client(join_client_manifest_, true);
+            join_failure_text_.clear();
             refresh_join_sessions(false);
             std::cout << "menu.action=join_online\n";
             break;
@@ -13004,10 +17805,13 @@ class Application::Impl final
         case ui::MenuCommand::select_join_session:
             if (menu_.selection() < join_row_sessions_.size())
             {
-                selected_join_session_ = join_row_sessions_[menu_.selection()];
-                join_password_.clear();
                 const net::DiscoveredSession &chosen =
-                    join_browser_.sessions()[*selected_join_session_];
+                    join_browser_.sessions()[join_row_sessions_[menu_.selection()]];
+                // The selection is the lobby id. A password typed for this server
+                // survives reopening its details; another server starts clean.
+                if (join_browser_.selected_id() != chosen.session_id)
+                    join_password_.clear();
+                join_browser_.select(chosen.session_id);
                 if (chosen.properties[0].has_value() &&
                     (*chosen.properties[0] ==
                          static_cast<std::int32_t>(net::ProtocolVersion::classic_v3) ||
@@ -13050,11 +17854,10 @@ class Application::Impl final
             if (session == nullptr)
             {
                 menu_.open(ui::MenuScreen::join_browser);
-                toast("SESSION EXPIRED", "REFRESH DISCOVERY AND SELECT THE HOST AGAIN");
+                toast("SERVER NO LONGER LISTED", "IT WENT OFFLINE. PICK ANOTHER SERVER.");
                 break;
             }
-            const net::JoinAssessment assessment =
-                join_browser_.assessment(*selected_join_session_);
+            const net::JoinAssessment assessment = assess_join_session(*session);
             if (!assessment.joinable())
             {
                 toast(net::join_compatibility_label(assessment.status),
@@ -13073,16 +17876,22 @@ class Application::Impl final
             break;
         }
         case ui::MenuCommand::confirm_exit:
+            if (!prepare_online_inventory_for_exit())
+                break;
+            stop_mod_session(); // Mod runtime area: world.unloading, storage
             save_world();
             shutdown_online_client();
             shutdown_online_host();
             running_ = false;
             break;
         case ui::MenuCommand::resume_game:
-            cancel_world_action();
+            cancel_world_action(true);
             SDL_SetWindowRelativeMouseMode(window_, true);
             break;
         case ui::MenuCommand::return_to_main:
+            if (!prepare_online_inventory_for_exit())
+                break;
+            stop_mod_session(); // Mod runtime area: world.unloading, storage
             save_world();
             shutdown_online_client();
             shutdown_online_host();
@@ -13090,7 +17899,7 @@ class Application::Impl final
             close_inventory();
             SDL_SetWindowRelativeMouseMode(window_, false);
             sound_bank_->play_menu_music();
-            sound_bank_->set_ambience(1.0F, 0.0F, 0.0F, 0.0F, 1.0F);
+            sound_bank_->set_ambience(0.0F, 0.0F, 0.0F, 0.0F, 1.0F);
             begin_online_discovery(true);
             break;
         case ui::MenuCommand::back:
@@ -13114,6 +17923,7 @@ class Application::Impl final
             }
             if (iterator->kind == HitKind::menu_item || iterator->kind == HitKind::setting_row)
             {
+                menu_focus_moved_by_input_ = true;
                 menu_.set_selection(iterator->index, settings_);
             }
             return;
@@ -13122,6 +17932,7 @@ class Application::Impl final
 
     void click_at(float x, float y)
     {
+        menu_focus_moved_by_input_ = true;
         for (auto iterator = hits_.rbegin(); iterator != hits_.rend(); ++iterator)
         {
             if (!iterator->rect.contains(x, y))
@@ -13134,47 +17945,168 @@ class Application::Impl final
                 menu_.set_selection(iterator->index, settings_);
                 handle(menu_.activate(settings_));
                 break;
+            case HitKind::world_item:
+                menu_.set_selection(iterator->index, settings_);
+                break;
+            case HitKind::world_sort:
+                world_sort_ = (world_sort_ + 1) % 3;
+                refresh_world_list();
+                break;
             case HitKind::setting_row:
                 menu_.set_selection(iterator->index, settings_);
-                if (x > iterator->rect.x + iterator->rect.width * 0.58F)
+                // The value area starts at 56% of the row (see draw_settings);
+                // its left half steps back, its right half steps forward.
+                if (x > iterator->rect.x + iterator->rect.width * 0.55F)
                 {
                     adjust(x < iterator->rect.x + iterator->rect.width * 0.78F ? -1 : 1);
                 }
                 break;
             case HitKind::tab: {
-                const int target = static_cast<int>(iterator->index);
-                while (static_cast<int>(menu_.settings_tab()) != target)
+                const auto tabs = ui::all_tabs();
+                if (iterator->index >= tabs.size())
+                    break;
+                for (std::size_t step = 0U;
+                     step < tabs.size() && menu_.settings_tab() != tabs[iterator->index]; ++step)
                 {
                     menu_.change_tab(1, settings_);
                 }
                 break;
             }
             case HitKind::back:
-                handle(menu_.back());
+                if (menu_.screen() == ui::MenuScreen::settings)
+                    leave_settings_screen();
+                else
+                    handle(menu_.back());
+                break;
+            case HitKind::reset_page:
+                request_page_reset();
+                break;
+            case HitKind::display_keep:
+                keep_display_change();
+                break;
+            case HitKind::display_revert:
+                revert_display_change();
+                break;
+            case HitKind::blocker:
+                break;
+            case HitKind::addon_prompt: // (Add-Ons)
+                answer_addon_prompt(iterator->index == 0U);
                 break;
             }
             return;
         }
     }
 
+    void receive_online_voice(std::uint8_t gid, std::span<const std::uint8_t> payload)
+    {
+        net::PayloadError payload_error{};
+        std::vector<std::uint8_t> audio;
+        if (voice_audio_ != nullptr &&
+            net::decode_voice_chat_payload(payload, audio, payload_error))
+            static_cast<void>(voice_audio_->receive(gid, audio));
+    }
+
+    void update_online_voice()
+    {
+        if (voice_audio_ == nullptr)
+            return;
+        const bool talking = online_gameplay_active() && window_focused_ &&
+                             menu_.screen() == ui::MenuScreen::world_preview &&
+                             !waiting_for_world_ && !text_editing() && !inventory_open_ &&
+                             SDL_GetKeyboardState(nullptr)[SDL_SCANCODE_V];
+        const auto packets = voice_audio_->capture(talking);
+        if (talking && !voice_talking_ && !voice_audio_->error().empty())
+            toast("MICROPHONE UNAVAILABLE", uppercase(voice_audio_->error()));
+        voice_talking_ = talking;
+        for (const auto &audio : packets)
+        {
+            net::PayloadError payload_error{};
+            const auto payload = net::encode_voice_chat_payload(audio, payload_error);
+            std::string error;
+            if (payload && !publish_online_broadcast("VoiceChatMessage", *payload,
+                                                     net::MessageDeliveryPolicy::chat, error))
+                std::cerr << "network.voice.send.failure=" << error << '\n';
+        }
+    }
+
     void update(float delta)
     {
+        const MainThreadBusy busy{main_thread_busy_};
+        const auto update_time = Clock::now();
+        if (!modal_frame_ && modal_frames_since_loop_frame_)
+        {
+            // The frame loop timed this frame from before the modal loop began,
+            // but the frames ticked inside it already simulated that stretch.
+            modal_frames_since_loop_frame_ = false;
+            delta = std::min(delta,
+                             bounded_update_delta(std::chrono::duration<double>(
+                                                      update_time - last_update_time_)
+                                                      .count()));
+            world_play_time_frame_seconds_ =
+                std::min(world_play_time_frame_seconds_, static_cast<double>(delta));
+        }
+        last_update_time_ = update_time;
         elapsed_ += delta;
         if (online_join_stage_ != OnlineJoinStage::idle)
             online_join_elapsed_ += delta;
         pump_online_host();
         pump_online_client();
-        pump_authoritative_chunk_checks();
-        if (menu_.screen() == ui::MenuScreen::join_browser &&
-            join_browser_state_ == JoinBrowserState::ready && online_client_ != nullptr &&
-            !online_client_joined_ && !online_client_operation_.valid())
+        // The Xbox Avatars add-on: the local file, decoded avatars, and its
+        // exchange over the session just pumped (presentation only).
+        update_xbox_avatars();
+        // (Add-Ons) Opening the Add-Ons screen reads the mod folders again.
+        update_addon_screen();
+        // Mod runtime area: world.loaded once the world is ready, client
+        // mods' `frame`; nothing without a mod session.
+        update_mod_runtime(delta);
+        mod_world_update(delta); // mod-world: host's choice, biome atmosphere and music
+        mod_liquid_update();     // mod-liquid: the session's liquid blocks (app_mod_liquid.inc)
+        mod_graphics_duck_retail_music(delta); // (fix) the soundtrack steps aside for mod music
+        // UI area (app_mod_ui.inc): toasts and titles age, the pointer returns
+        // to the world when a mod screen closes; nothing without mod UI.
+        update_mod_ui(delta);
+        // Modding, network area: mod channel frames and mod downloads (nothing
+        // without server mods).
+        pump_mod_net();
+        // Authority: the host's authority and the client's half start and stop
+        // with their session; nothing outside an OpenMinerZ-only one.
+        update_authority();
+        // Once a frame, after the session state above has moved and before
+        // anything is simulated, placed or drawn with it (retail_parity.hpp).
+        apply_enhancement_state();
+        update_online_voice();
+        // --screen-script, once the world is up: a scripted inventory screen.
+        // (Before the first simulated frame, so a --screenshot run, which
+        // captures on the second, shows the scripted screen.)
+        if (!screens_script_done_ && options_.screen_script.has_value() && !waiting_for_world_ &&
+            menu_.screen() == ui::MenuScreen::world_preview && retail_screens_ready())
         {
-            join_refresh_timer_ -= delta;
-            if (join_refresh_timer_ <= 0.0F)
-            {
-                join_refresh_timer_ = 30.0F;
-                refresh_join_sessions(false, true);
-            }
+            screens_script_done_ = true;
+            run_screen_script(*options_.screen_script);
+        }
+        if (screens_script_done_)
+            ++screens_script_frames_;
+        // --hud-option notice=1|2 / caption=1: a sample notice or sound caption
+        // for a capture of the HUD (app_remastered.inc), held on screen.
+        if (!options_.hud_options.empty() && !waiting_for_world_ &&
+            menu_.screen() == ui::MenuScreen::world_preview)
+            show_hud_samples();
+        refresh_screen_pointer();
+        if (inventory_open_)
+            update_screens(delta);
+        pump_authoritative_chunk_checks();
+        // The server browser keeps itself current: it refreshes when it opens,
+        // periodically while it is shown, after a failed refresh, and whenever a
+        // join gave its helper up. A queued join is driven from here as well.
+        watch_online_join(delta);
+        if (online_host_ == nullptr && !online_host_start_.valid())
+        {
+            const bool browser_shown =
+                (menu_.screen() == ui::MenuScreen::join_browser ||
+                 menu_.screen() == ui::MenuScreen::join_details) &&
+                join_browser_state_ != JoinBrowserState::diagnostic &&
+                online_join_stage_ == OnlineJoinStage::idle;
+            apply_join_action(join_flow_.tick(delta, browser_shown, join_transport_view()));
         }
         sync_network_pickup_mode();
         std::erase_if(recent_network_projectiles_, [&](const RecentNetworkProjectile &projectile) {
@@ -13228,7 +18160,13 @@ class Application::Impl final
         // PickInventoryItemClass owns the laser-sword hum for exactly the
         // duration that its item class remains equipped.
         update_equipped_item_sound();
-        if (menu_.screen() != ui::MenuScreen::world_preview || waiting_for_world_)
+        // Whether the world runs is decided by the pause contract in
+        // input_contract.hpp, not by which screen happens to be showing: the
+        // pause menu (and anything opened from it) freezes a private game only;
+        // a hosting or joined session keeps simulating behind it.
+        const WorldOverlay overlay = world_overlay();
+        const bool online_session = online_gameplay_active();
+        if (!world_simulation_active(overlay, online_session, waiting_for_world_))
         {
             (void)world_preview_->preload_step(waiting_for_world_ ? 16U : 4U);
             if (waiting_for_world_ && world_preview_->preload_complete())
@@ -13236,17 +18174,46 @@ class Application::Impl final
                 waiting_for_world_ = false;
                 if (online_join_stage_ == OnlineJoinStage::preparing_world)
                     online_join_stage_ = OnlineJoinStage::idle;
+                // A world entered is a new InGameHUD: its one-second fade
+                // starts over and lastTOD is -1 again (see the day banner).
+                // A screenshot run captures the settled HUD, not the fade.
+                hud_fade_in_seconds_ = options_.screenshot_path.has_value() ? 1.0F : 0.0F;
+                hud_last_time_of_day_ = -1.0F;
                 spawn_player();
                 if (!options_.screenshot_path.has_value())
-                    SDL_SetWindowRelativeMouseMode(window_, !inventory_open_);
-                toast("WORLD READY", std::format("{} CHUNKS PRELOADED  /  {:L} EXPOSED FACES",
-                                                 world_preview_->stats().chunk_count,
-                                                 world_preview_->stats().visible_face_count));
+                    SDL_SetWindowRelativeMouseMode(window_, pointer_capture_allowed(overlay) &&
+                                                                !inventory_open_);
             }
         }
-        if (menu_.screen() == ui::MenuScreen::world_preview && !waiting_for_world_)
+        // InGameHUD.OnLostFocus: the frame the controls are taken away is the
+        // frame every held action ends, whichever path took them.
+        const bool local_controls = local_controls_enabled();
+        const bool local_movement =
+            local_player_movement_enabled(local_controls, player_life_ == PlayerLife::alive);
+        if (local_controls_released(local_controls_were_enabled_, local_controls))
+            cancel_world_action(true);
+        local_controls_were_enabled_ = local_controls;
+        if (!local_movement)
         {
+            keyboard_jump_latch_.arm();
+            gamepad_jump_latch_.arm();
+        }
+        const bool simulate_world =
+            world_simulation_active(overlay, online_session, waiting_for_world_);
+        if (activity_trace_)
+            trace_activity(delta, simulate_world);
+        if (simulate_world)
+        {
+            populate_world_encounters();
             ++world_ready_frames_;
+            if (options_.diagnostic_save_exit && options_.world_file && world_ready_frames_ == 24U)
+            {
+                SDL_Event quit{};
+                quit.type = SDL_EVENT_QUIT;
+                SDL_PushEvent(&quit);
+            }
+            if (window_focused_ && !active_world_path_.empty())
+                world_history_.add_play_time(world_play_time_frame_seconds_);
             update_audio_environment(delta);
             if (!active_world_path_.empty())
             {
@@ -13254,7 +18221,7 @@ class Application::Impl final
                 if (autosave_timer_ <= 0.0F)
                 {
                     autosave_timer_ = 30.0F;
-                    save_world();
+                    save_world(false);
                 }
             }
             else if (!online_world_key_.empty() && online_client_ != nullptr &&
@@ -13274,7 +18241,9 @@ class Application::Impl final
             {
                 world_elapsed_ += delta;
                 const std::string previous_period{current_sky_state().period};
+                const float progress_previous_day = day_night_.day();
                 day_night_.update(delta, world_time_speed_);
+                update_progress(delta, progress_previous_day);
                 const auto updated_sky = current_sky_state();
                 if (updated_sky.period != previous_period)
                 {
@@ -13282,27 +18251,46 @@ class Application::Impl final
                           std::format("{}  /  DAY {}", day_night_.clock_text(),
                                       static_cast<int>(std::floor(day_night_.day())) + 1));
                 }
-                // The original plays the horror stinger on each day rollover.
+                // InGameHUD.OnUpdate, both builds:
+                //     if (lastTOD < 0.4f && TimeOfDay > 0.4f) {
+                //         currentDay = (int)Day + 1;
+                //         PlayInstance("HorrorStinger"); drawDayTimer.Reset(); }
+                //     lastTOD = TimeOfDay;
+                // The stinger and the nine-second "Day N" banner belong to the
+                // MORNING (time of day 0.4), not to the day number rolling
+                // over at midnight, and lastTOD starts at -1, so entering a
+                // world whose clock is already past 0.4 (a new one starts at
+                // 0.41) plays them once straight away.
                 const int day_number = static_cast<int>(std::floor(day_night_.day()));
-                if (day_number > last_day_number_)
+                last_day_number_ = std::max(last_day_number_, day_number);
+                const float time_of_day = day_night_.time_of_day();
+                if (hud_last_time_of_day_ < 0.4F && time_of_day > 0.4F)
                 {
-                    last_day_number_ = day_number;
                     sound_bank_->play_cue("HorrorStinger");
+                    hud_banner_day_ = day_number + 1;
+                    hud_day_banner_seconds_ = 0.0F;
                 }
+                hud_last_time_of_day_ = time_of_day;
+                hud_day_banner_seconds_ = std::min(hud_day_banner_seconds_ + delta, 9.0F);
+                // fadeInGameStart: the one-second fade a new HUD opens with.
+                hud_fade_in_seconds_ = std::min(hud_fade_in_seconds_ + delta, 1.0F);
             }
             update_weather(delta);
-            if (!inspector_view_)
+            if (world_fixed_step_active(simulate_world, inspector_view_, online_session))
             {
                 physics_accumulator_ = std::min(physics_accumulator_ + delta, 0.25F);
                 const bool *keys = SDL_GetKeyboardState(nullptr);
+                // With the controls away (pause overlay, inventory, text entry,
+                // inspector, death) the player gets an empty input: it keeps
+                // obeying physics and replicating, but nothing held reaches it.
                 world::PlayerInput input;
-                if (!inventory_open_ && !locator_name_editing_ && player_life_ == PlayerLife::alive)
+                if (local_movement)
                 {
                     input.strafe =
                         (keys[SDL_SCANCODE_D] ? 1.0F : 0.0F) - (keys[SDL_SCANCODE_A] ? 1.0F : 0.0F);
                     input.forward =
                         (keys[SDL_SCANCODE_W] ? 1.0F : 0.0F) - (keys[SDL_SCANCODE_S] ? 1.0F : 0.0F);
-                    input.jump = keys[SDL_SCANCODE_SPACE];
+                    input.jump = keyboard_jump_latch_.filter(keys[SDL_SCANCODE_SPACE]);
                     const bool left_shift = keys[SDL_SCANCODE_LSHIFT];
                     input.sprint = left_shift && inventory_.profile() == InventoryProfile::modern &&
                                    game_mode_ != GameMode::endurance &&
@@ -13310,20 +18298,39 @@ class Application::Impl final
                     input.descend =
                         keys[SDL_SCANCODE_LCTRL] || (player_.state().fly_mode && left_shift);
                 }
-                // Flight is a Creative power: leaving creative (or loading a
-                // survival save) drops the player back under gravity.
-                if (!infinite_resources_ && player_.state().fly_mode)
+                // Flight ends the tick it stops being allowed: another world or
+                // mode, or a session starting under the Free flight extra.
+                if (player_.state().fly_mode && !flight_available())
                     player_.state().fly_mode = false;
+                player_.set_flight_model(flight_is_free()
+                                             ? world::PlayerSimulation::FlightModel::free
+                                             : world::PlayerSimulation::FlightModel::retail);
                 if (options_.bench_frames > 0)
                 {
                     // Benchmark runs walk forward so chunk streaming and remeshing
                     // are part of the measured frames, not just the cached view.
+                    // The glide scenario flies level instead of walking and
+                    // jumping, so its velocity is constant by construction.
                     input.forward = 1.0F;
-                    input.jump = true;
+                    input.jump = !pacing_overrides_.bench_glide;
                 }
-                if (!inventory_open_ && !locator_name_editing_)
+                if (diagnostic_autofire_ && !diagnostic_autofire_walk_)
+                {
+                    // The destruction benchmark stands still so streaming cost
+                    // cannot hide in the measured block-edit frames ("walk"
+                    // keeps the --bench stride to measure both together).
+                    input.forward = 0.0F;
+                    input.jump = false;
+                }
+                gunfx_diagnostic_input(input, delta); // (GunFX) capture aid, inert without it
+                if (local_movement)
                     poll_gamepad(input, delta);
                 constexpr float fixed_delta = 1.0F / 60.0F;
+                // Retail parity gate: re-evaluated before every batch of ticks
+                // so a non-retail feature ends the moment a session begins.
+                apply_enhancement_state();
+                if (world_ready())
+                    announce_pending_item_cleanup();
                 while (physics_accumulator_ >= fixed_delta)
                 {
                     melee_cooldown_ = std::max(0.0F, melee_cooldown_ - fixed_delta);
@@ -13347,144 +18354,140 @@ class Application::Impl final
                             sync_selected_item();
                         }
                     }
-                    constexpr float gun_shoulder_seconds = 0.15F;
                     const GunStats *active_gun = selected_gun();
-                    if (active_gun == nullptr)
+                    // InGameHUD.EquipActiveItem: whenever the item in hand is no
+                    // longer the one that was (however it changed: slot keys,
+                    // an inventory move, a drop, wear), Player.Equip abandons
+                    // any reload. Nothing else does.
+                    const GunEquipIdentity equipped{inventory_.current_tray_index(),
+                                                    inventory_.selected_index(),
+                                                    inventory_.selected_item()};
+                    if (equipped != gun_equipped_)
                     {
-                        gun_aim_progress_ = 0.0F;
+                        gun_equipped_ = equipped;
+                        withdraw_gun_reload();
+                        // The outgoing item's fire clip is not replayed on the
+                        // incoming one.
+                        gun_recoil_time_ = 0.0F;
                     }
-                    else if (gun_reloading_ && gun_aim_progress_ > 0.0F)
-                    {
-                        // Vanilla reverses the shoulder clip before it starts channel-2 reload.
-                        gun_aim_progress_ =
-                            std::max(0.0F, gun_aim_progress_ - fixed_delta / gun_shoulder_seconds);
-                    }
-                    else
-                    {
-                        const float aim_target = shouldering_ && !gun_reloading_ ? 1.0F : 0.0F;
-                        gun_aim_progress_ += std::clamp(aim_target - gun_aim_progress_,
-                                                        -fixed_delta / gun_shoulder_seconds,
-                                                        fixed_delta / gun_shoulder_seconds);
-                    }
-                    if (gun_reloading_ && gun_aim_progress_ <= 0.0F && active_gun != nullptr)
-                    {
-                        if (!gun_reload_cue_started_)
+                    // Player.UpdateAnimation, then the avatar's animation clock.
+                    // The shoulder clip, the fire clip that has to finish before
+                    // a reload may start, the reload clip whose end inserts the
+                    // rounds, and the grenade swing all run on the original's
+                    // own clocks here (world::PlayerAnimator).
+                    step_local_animation(active_gun, input);
+                    gunfx_diagnostic_remotes(); // (GunFX) capture aid, inert without it
+                    // Avatar.OnUpdate for every other player in the session,
+                    // and Player.UpdateAudio's footstep clock, which the
+                    // original runs for every Player at its own emitter.
+                    for (auto &[remote_gid, remote_player] : online_remote_players_)
+                        if (remote_player.animator_started)
                         {
-                            gun_reload_cue_started_ = true;
-                            sound_bank_->play_cue(active_gun->reload_cue);
-                            caption(std::format("[ {} RELOADS ]",
-                                                item_name(inventory_.selected_item())),
-                                    1.7F);
+                            remote_player.animator.advance();
+                            if (remote_player.footsteps.step(
+                                    remote_player.animator, true,
+                                    remote_player.has_update && !remote_player.state.dead &&
+                                        remote_player_in_contact(remote_player.state.position)))
+                                play_positional("FootStep", remote_player.state.position);
                         }
-                        gun_reload_time_ = std::max(0.0F, gun_reload_time_ - fixed_delta);
-                        if (gun_reload_time_ <= 0.0F)
-                        {
-                            auto &active = inventory_.tray()[inventory_.selected_index()];
-                            const GunStats *slot_stats =
-                                active.has_value() ? gun_stats(active->item) : nullptr;
-                            bool continue_reloading{};
-                            if (slot_stats != nullptr)
-                            {
-                                const GunReloadCycle cycle =
-                                    gun_reload_cycle(*slot_stats, active->rounds_in_clip,
-                                                     inventory_.count(slot_stats->ammo_item));
-                                if (cycle.loaded > 0U &&
-                                    (infinite_resources_ ||
-                                     inventory_.consume_item(slot_stats->ammo_item, cycle.loaded)))
-                                {
-                                    active->rounds_in_clip = static_cast<std::uint16_t>(
-                                        active->rounds_in_clip + cycle.loaded);
-                                    continue_reloading = cycle.continue_reloading;
-                                }
-                            }
-                            // Player.FinishReload plays Click after every cycle,
-                            // including each individually inserted shotgun shell.
-                            sound_bank_->play_cue("Click");
-                            gun_reloading_ = continue_reloading;
-                            if (continue_reloading && slot_stats != nullptr)
-                                gun_reload_time_ = slot_stats->reload_seconds;
-                            gun_reload_cue_started_ = false;
-                        }
-                    }
                     update_guided_lock(fixed_delta);
+                    // Presentation bookkeeping: remember where the camera was
+                    // before this tick so render() can blend across it.
+                    tick_started_ = Clock::now();
+                    fixed_step_camera_.begin_tick(player_.state());
+                    record_tick_poses();
                     const float fall_velocity_before = player_.state().velocity.y;
-                    const bool was_grounded = player_.state().grounded;
-                    const bool was_in_water = player_in_water(player_.state());
+                    // 1.9.9.8 InGameHUD.CanUseStamina: `!IsEnduranceMode`, so
+                    // neither sprint nor the second jump exists in Endurance
+                    // or Dragon Endurance.
+                    player_.set_stamina_usable(game_mode_ != GameMode::endurance &&
+                                               game_mode_ != GameMode::dragon_endurance);
                     player_.update(world_preview_->region(), input, fixed_delta,
                                    settings_.auto_climb, player_water_world(),
-                                   settings_.creative_flight_speed,
+                                   // The glide bench cruises at walking speed;
+                                   // the far-terrain sweep at its own.
+                                   pacing_overrides_.bench_sweep
+                                       ? pacing_overrides_.sweep_speed
+                                       : pacing_overrides_.bench_glide
+                                             ? world::PlayerSimulation::movement_speed
+                                             : settings_.creative_flight_speed,
                                    inventory_.profile() == InventoryProfile::modern);
-                    // Player.Jump: the takeoff itself plays a FootStep; a
-                    // landing plays one too so airtime never mutes the feet.
-                    if (was_grounded != player_.state().grounded && !was_in_water &&
-                        !player_in_water(player_.state()) && player_life_ == PlayerLife::alive)
+                    // Player.UpdateAudio, the only place either release plays
+                    // "FootStep": a OneShotTimer advanced by the frame time
+                    // times _walkSpeed while the walk animation says the
+                    // player is moving (so a pure strafe in first person,
+                    // which has no walk clip, is silent), 0.5 s walking and
+                    // 0.4 s running, heard only `!_flyMode && !InWater &&
+                    // InContact`. The clock is the animation port's
+                    // (world::FootstepClock, held to the original's traces by
+                    // AnimationParityProbe). This replaces a timer on the
+                    // horizontal speed, and the extra step it played on every
+                    // take-off and landing, which the original does not have.
+                    if (local_footsteps_.step(local_animator_, true,
+                                              !player_.state().fly_mode &&
+                                                  !player_in_water(player_.state()) &&
+                                                  !player_.touched_liquid() && // (mod-liquid)
+                                                  player_.state().grounded))
                     {
-                        const bool jumped =
-                            !player_.state().grounded && player_.state().velocity.y > 1.0F;
-                        const bool landed = player_.state().grounded;
-                        if (jumped || landed)
-                        {
-                            sound_bank_->play_footstep();
-                            footstep_timer_ = 0.4F;
-                        }
+                        sound_bank_->play_footstep();
+                        caption("[ FOOTSTEPS ]", 0.65F);
                     }
-                    // Original fall damage: when a landing absorbs more than 15
-                    // units of vertical speed, damage = (delta - 15) / 15 of max
-                    // health (safe to ~5.6 blocks, lethal from ~22.5).
-                    const float fall_delta = player_.state().velocity.y - fall_velocity_before;
-                    if (fall_delta > 15.0F && player_.state().velocity.y < 0.1F)
+                    // Original fall damage (Player.ResolveCollsion): when a
+                    // landing absorbs more than the threshold of vertical speed,
+                    // damage = (delta - threshold) / 15 of max health. The
+                    // threshold is 15 in 1.6.3.8 (safe to ~5.6 blocks) and 18 in
+                    // 1.9.9.8 (safe to ~8.1); both exempt `_flyMode`, where
+                    // stopping a fast descent is not a landing.
+                    const float fall_threshold =
+                        inventory_.profile() == InventoryProfile::modern ? 18.0F : 15.0F;
+                    // The change is measured inside ResolveCollsion, from the
+                    // velocity AFTER this frame's gravity. Measuring it from
+                    // before the update came out one frame of gravity (0.33)
+                    // short: a six-block drop did no damage where the shipped
+                    // client takes 2% of health, and every fall cost 2% less.
+                    const float fall_delta = player_.landing_speed_change();
+                    static_cast<void>(fall_velocity_before);
+                    // (mod-liquid) A fall into a mod liquid, however shallow,
+                    // is no landing (never true where no liquids exist).
+                    if (!player_.state().fly_mode && fall_delta > fall_threshold &&
+                        player_.state().velocity.y < 0.1F && !player_.touched_liquid())
                     {
                         world::Vec3 below = player_.state().position;
                         below.y -= 1.0F;
                         caption("[ HARD LANDING ]", 0.9F);
-                        apply_player_damage((fall_delta - 15.0F) * (100.0F / 15.0F), below);
+                        apply_player_damage((fall_delta - fall_threshold) * (100.0F / 15.0F),
+                                            below, modding::gameplay::DamageCause::fall);
                     }
                     update_environmental_survival(fixed_delta);
-                    const float horizontal_speed =
-                        std::hypot(player_.state().velocity.x, player_.state().velocity.z);
-                    if (player_.state().grounded && !player_in_water(player_.state()) &&
-                        horizontal_speed > 0.1F)
-                    {
-                        footstep_timer_ -= fixed_delta;
-                        if (footstep_timer_ <= 0.0F)
-                        {
-                            sound_bank_->play_footstep();
-                            caption("[ FOOTSTEPS ]", 0.65F);
-                            // Player.UpdateAudio: 0.4 s cadence running, 0.5 s
-                            // walking.
-                            footstep_timer_ +=
-                                horizontal_speed > world::PlayerSimulation::movement_speed * 0.8F
-                                    ? 0.4F
-                                    : 0.5F;
-                        }
-                    }
-                    else if (!player_.state().grounded)
-                    {
-                        footstep_timer_ = std::max(footstep_timer_, 0.15F);
-                    }
-                    else
-                    {
-                        footstep_timer_ = 0.5F;
-                    }
                     const bool action_held = mine_button_down_ || secondary_action_down_;
                     const bool gun_selected = active_gun != nullptr;
-                    const bool grenade_selected =
-                        item_grenade_type(inventory_.selected_item()).has_value();
-                    // Automatic guns keep cycling while the trigger is held; semi-autos
-                    // only fire on the press edge in primary_action_pressed.
-                    if (gun_selected && mine_button_down_ && active_gun->automatic)
-                        fire_gun();
-                    const bool melee_hit =
-                        action_held && !gun_selected && !grenade_selected && try_melee();
-                    const bool breaking = action_held && !melee_hit && !grenade_selected &&
-                                          player_.state().target.has_value() && !gun_selected &&
-                                          (inventory_.selected_block() == world::BlockType::empty ||
-                                           secondary_action_down_);
+                    // Automatic guns keep cycling while the trigger is held, including
+                    // straight out of a reload the trigger was held through;
+                    // semi-autos only act on the press edge in primary_action_pressed.
+                    if (diagnostic_autofire_ && gun_selected)
+                    {
+                        auto &endless = inventory_.tray()[inventory_.selected_index()];
+                        if (endless.has_value())
+                        {
+                            // "reload" lets the clip run dry, so the fire clip,
+                            // the automatic reload and its completion are timed.
+                            if (!diagnostic_autofire_reload_)
+                                endless->rounds_in_clip = active_gun->clip_capacity;
+                            endless->durability = 1.0F;
+                        }
+                        gun_input(true, false);
+                    }
+                    else if (gun_selected && mine_button_down_ && active_gun->automatic)
+                        gun_input(false, false);
                     const InventoryItemId action_item = inventory_.selected_item();
-                    const bool block_action =
-                        inventory_.selected_block() != world::BlockType::empty;
-                    const float impact_period =
-                        block_action ? 0.1F : item_use_cooldown_seconds(action_item);
+                    // Only InventoryItem.ProcessInput (the base) digs and melees.
+                    // A held block, torch or door overrides it and can do
+                    // neither, on either trigger; so do guns, GPS and grenades.
+                    const bool tool_input = item_uses_tool_input(action_item);
+                    const bool melee_hit = action_held && tool_input && try_melee();
+                    const bool breaking = action_held && !melee_hit && tool_input &&
+                                          player_.state().target.has_value();
+                    const float impact_period = item_use_cooldown_seconds(action_item);
                     const std::uint8_t action_key =
                         action_item == InventoryItemId::bare_hands
                             ? 0U
@@ -13492,15 +18495,15 @@ class Application::Impl final
                     // TimeToDig for the held tool against the aimed block.
                     const float dig_seconds =
                         player_.state().target.has_value()
-                            ? dig_time_seconds(action_item, player_.state().target->block)
+                            ? held_dig_seconds(action_item, *player_.state().target)
                             : -1.0F;
                     const auto block_update =
                         player_.update_breaking(world_preview_->region(), breaking, fixed_delta,
                                                 impact_period, action_key, dig_seconds);
-                    if (action_held && !breaking && !gun_selected && !grenade_selected &&
-                        air_punch_time_ <= 0.0F)
+                    if (action_held && !breaking && tool_input && air_punch_time_ <= 0.0F)
                     {
                         air_punch_time_ = 0.5F;
+                        animation_use_pulse_ = true;
                     }
                     if (air_punch_time_ > 0.0F)
                     {
@@ -13524,6 +18527,7 @@ class Application::Impl final
                     }
                     if (block_update.has_value() && block_update->impact)
                     {
+                        animation_use_pulse_ = true; // InventoryItem.ProcessInput: UsingTool
                         sound_bank_->play_break(block_update->block);
                         caption(
                             std::format("[ {} IMPACT ]", world::block_name(block_update->block)),
@@ -13533,7 +18537,10 @@ class Application::Impl final
                             std::cerr << "network.local.dig-effect.failure=" << dig_error << '\n';
                         world_preview_->spawn_mining_impact(*block_update);
                     }
-                    if (block_update.has_value() && block_update->completed)
+                    // Modding, gameplay area: block.breaking may keep the block
+                    // (mod_gameplay_breaking puts the dug cells back).
+                    if (block_update.has_value() && block_update->completed &&
+                        mod_gameplay_breaking(*block_update))
                     {
                         // Mining the crash-site goo or space rock wakes the aliens.
                         if (block_update->block == world::BlockType::slime ||
@@ -13544,7 +18551,11 @@ class Application::Impl final
                             toast("THE ORB STIRS", "Something is coming out of the goo.");
                         }
                         std::vector<std::array<int, 3>> removed_cells;
+                        // What each dug cell held, so the renderer's shading
+                        // probe compares the exact previous light field.
+                        std::vector<world::BlockType> removed_previous;
                         removed_cells.reserve(block_update->removed_blocks.size());
+                        removed_previous.reserve(block_update->removed_blocks.size());
                         std::map<CrateKey, std::pair<InventoryItemId, world::BlockType>>
                             removed_doors;
                         for (const world::BlockRemovalEffect &effect : block_update->removed_blocks)
@@ -13584,10 +18595,18 @@ class Application::Impl final
                                     const auto door = removed_doors.find(key);
                                     if (door != removed_doors.end())
                                     {
+                                        // InGameHUD.Dig: CreatePickup(tool.CreatesWhenDug(block),
+                                        // _worldIndex + (0.5, 0.5, 0.5)) for the half that was
+                                        // dug, and neighborIndex + 0.5 for a door whose support
+                                        // was: the CENTRE of that cell. It was the corner of the
+                                        // lower half's cell, whichever half was hit, so the
+                                        // CreatePickupMessage every peer received put the door
+                                        // half a block (and up to a block and a half) away.
                                         world_preview_->spawn_created_stack_at(
                                             InventoryStack{door->second.first, 1U},
-                                            {static_cast<float>(key[0]), static_cast<float>(key[1]),
-                                             static_cast<float>(key[2])});
+                                            {static_cast<float>(effect.x) + 0.5F,
+                                             static_cast<float>(effect.y) + 0.5F,
+                                             static_cast<float>(effect.z) + 0.5F});
                                         processed_loot = true;
                                     }
                                 }
@@ -13611,7 +18630,8 @@ class Application::Impl final
                                                  loot_drop.spawn_velocity[2]});
                                     }
                                 }
-                                if (!processed_loot)
+                                // Modding, gameplay area: a mod block drops its own.
+                                if (!processed_loot && mod_gameplay_retail_drop(effect))
                                 {
                                     world::BlockBreakUpdate drop = *block_update;
                                     drop.x = effect.x;
@@ -13627,11 +18647,12 @@ class Application::Impl final
                             static_cast<void>(publish_local_block_edit(effect.x, effect.y, effect.z,
                                                                        world::BlockType::empty));
                             removed_cells.push_back({effect.x, effect.y, effect.z});
+                            removed_previous.push_back(effect.block);
                         }
                         for (const auto &[key, door] : removed_doors)
                             publish_local_custom_door_destroy(key, door.second);
-                        world_preview_->rebuild_block_edits(removed_cells);
-                        toast("BLOCK MINED", std::string{world::block_name(block_update->block)});
+                        world_preview_->rebuild_block_edits(removed_cells, removed_previous);
+                        mod_gameplay_broken(*block_update); // Modding, gameplay area: block.broken
                     }
                     if (block_update.has_value() && block_update->impact &&
                         action_item != InventoryItemId::gps &&
@@ -13647,7 +18668,10 @@ class Application::Impl final
                     if (!publish_spawned_network_pickups())
                         std::cerr << "network.local.pickup-publication.failure\n";
                     for (const CollectedBlockStack &collected :
-                         world_preview_->update_effects(fixed_delta, player_.state().position))
+                         world_preview_->update_effects(options_.screenshot_path.has_value() &&
+                                                        SDL_getenv("OPENMINERZ_DIAGNOSTIC_EFFECT_SECONDS") != nullptr
+                                                        ? 0.0F : fixed_delta, player_.state().position,
+                                                        player_life_ == PlayerLife::alive))
                     {
                         if (collected.pickup_id.has_value())
                             static_cast<void>(publish_local_pickup_request(collected));
@@ -13655,18 +18679,41 @@ class Application::Impl final
                             award_local_pickup(collected.stack);
                     }
                     publish_local_player_update(input, fixed_delta);
+                    fixed_step_camera_.end_tick(player_.state());
+                    ++frame_phases_.ticks;
+                    frame_phases_.physics +=
+                        std::chrono::duration<double, std::milli>(Clock::now() - tick_started_)
+                            .count();
+                    // Mod runtime area: server mods' `tick` and timers, once per
+                    // step (nothing without a mod session).
+                    tick_mods(fixed_delta);
+                    // Modding, gameplay area: stats, effects, creatures, edits
+                    // and replication (nothing without a mod VM).
+                    // Authority: regeneration, lava, unreported damage and the
+                    // host's answers, once per step (nothing unless hosting an
+                    // OpenMinerZ-only session). Before the gameplay step, so
+                    // a death reaches player.died with its cause.
+                    tick_authority();
+                    mod_gameplay_tick(fixed_delta);
+                    // mod-ai (fix): enemies.rules{clear_existing} sends the
+                    // retail enemies it switches off away (app_mod_ai.inc).
+                    mod_ai_clear_retail();
+                    // Modding, network area: replicated state, once per step.
+                    flush_mod_net();
                     physics_accumulator_ -= fixed_delta;
                 }
                 const std::string previous_biome{world_preview_->biome_name()};
-                if (world_preview_->stream_around(player_.state()))
+                const auto stream_started = Clock::now();
+                const bool stream_installed = world_preview_->stream_around(player_.state());
+                frame_phases_.stream +=
+                    std::chrono::duration<double, std::milli>(Clock::now() - stream_started)
+                        .count();
+                if (stream_installed)
                 {
                     player_.refresh_target(world_preview_->region());
                     if (world_preview_->biome_name() != previous_biome)
                     {
-                        toast("FRONTIER DISCOVERED",
-                              std::format("{} BIOME  /  WORLD STREAM {}",
-                                          world_preview_->biome_name(),
-                                          world_preview_->stats().stream_serial));
+                        toast("NEW AREA", std::string{world_preview_->biome_name()});
                     }
                 }
                 if (player_.state().position.y < static_cast<float>(world::world_min_y) + 1.0F)
@@ -13675,6 +18722,11 @@ class Application::Impl final
                 }
             }
         }
+        // Every menu owns a free cursor. The world can now change state behind a
+        // pause overlay (death closes the inventory, a load finishes, a crate
+        // is destroyed), so no such path may leave the pointer captured there.
+        if (!pointer_capture_allowed(world_overlay()) && SDL_GetWindowRelativeMouseMode(window_))
+            SDL_SetWindowRelativeMouseMode(window_, false);
         if (last_transition_serial_ != menu_.transition_serial())
         {
             last_transition_serial_ = menu_.transition_serial();
@@ -13692,6 +18744,22 @@ class Application::Impl final
         {
             toast_time_ -= delta;
         }
+        // InGameHUD.UpdateAcheivements: one award at a time, ten seconds each.
+        // A new one plays the "Award" cue and tells the session.
+        if (achievement_popup_.has_value())
+        {
+            achievement_popup_seconds_ -= delta;
+            if (achievement_popup_seconds_ <= 0.0F)
+                achievement_popup_.reset();
+        }
+        else if (!achievement_notifications_.empty())
+        {
+            achievement_popup_ = achievement_notifications_.front();
+            achievement_popup_seconds_ = 10.0F;
+            achievement_notifications_.erase(achievement_notifications_.begin());
+            sound_bank_->play_cue("Award");
+            announce_local_achievement(achievement_definitions()[*achievement_popup_].name);
+        }
         if (dirty_)
         {
             dirty_timer_ -= delta;
@@ -13704,6 +18772,62 @@ class Application::Impl final
 
     void render()
     {
+        const MainThreadBusy busy{render_busy_};
+        refresh_in_game_menus();
+        // OPENMINERZ_DIAGNOSTIC_TELEPORT_TO=<gid>: with --diagnostic-multiplayer,
+        // moves that stand-in player far away and into the air, then runs the
+        // real Teleport To Player on it once, so a capture shows the arrival.
+        if (options_.diagnostic_multiplayer && !diagnostic_teleport_done_ &&
+            world_ready_frames_ >= 2U && !waiting_for_world_)
+            if (const char *wanted_gid = SDL_getenv("OPENMINERZ_DIAGNOSTIC_TELEPORT_TO"))
+            {
+                diagnostic_teleport_done_ = true;
+                const auto gid = static_cast<std::uint8_t>(std::atoi(wanted_gid));
+                if (const auto remote = online_remote_players_.find(gid);
+                    remote != online_remote_players_.end())
+                {
+                    remote->second.state.position.x += 310.0F;
+                    remote->second.state.position.y += 30.0F;
+                    remote->second.state.position.z -= 275.0F;
+                    remote->second.presentation.receive(remote->second.state, elapsed_);
+                    const bool moved = teleport_to_online_player(gid);
+                    const world::Vec3 at = player_.state().position;
+                    const auto &region = world_preview_->region();
+                    const int x = static_cast<int>(std::floor(at.x));
+                    const int y = static_cast<int>(std::floor(at.y));
+                    const int z = static_cast<int>(std::floor(at.z));
+                    std::cout << "teleport.diagnostic moved=" << (moved ? 1 : 0) << " ground="
+                              << (region.contains(x, y - 1, z) &&
+                                          world::blocks_player(region.block(x, y - 1, z))
+                                      ? 1
+                                      : 0)
+                              << " clear="
+                              << (world::PlayerSimulation::touches_solid(region, at) ? 0 : 1)
+                              << " column_delta=" << at.x - remote->second.state.position.x << ','
+                              << at.z - remote->second.state.position.z << std::endl;
+                }
+            }
+        if (const std::optional<ui::MenuScreen> wanted = diagnostic_in_game_menu();
+            wanted.has_value() && world_ready_frames_ >= 2U && !waiting_for_world_ &&
+            menu_.screen() != *wanted)
+        {
+            menu_.open(ui::MenuScreen::pause);
+            if (*wanted != ui::MenuScreen::pause)
+            {
+                player_pick_purpose_ = PlayerPickPurpose::teleport;
+                menu_.open(*wanted);
+            }
+            if (*wanted == ui::MenuScreen::settings)
+            {
+                if (options_.diagnostic_settings_tab >= 0)
+                    while (static_cast<int>(menu_.settings_tab()) != options_.diagnostic_settings_tab)
+                        menu_.change_tab(1, settings_);
+                menu_.set_selection(options_.settings_selection, settings_);
+            }
+            if (*wanted == ui::MenuScreen::addons)
+                run_addon_diagnostic(); // (Add-Ons)
+            refresh_in_game_menus();
+        }
         int width{};
         int height{};
         if (!SDL_GetRenderOutputSize(renderer_, &width, &height))
@@ -13712,18 +18836,30 @@ class Application::Impl final
         }
         metrics_ =
             ui::DesignCanvas::compute(width, height, settings_.ui_scale, settings_.safe_area);
+        if (menu_.screen() != ui::MenuScreen::world_preview && !in_game_menu_screen())
+        {
+            // Keep reading distances and card proportions stable on ultrawide screens.
+            const float menu_width = std::min(metrics_.safe.width, 1760.0F * metrics_.scale);
+            metrics_.safe.x += (metrics_.safe.width - menu_width) * 0.5F;
+            metrics_.safe.width = menu_width;
+        }
         hits_.clear();
+        // Display-change and reset timers; independent of the simulation clock.
+        service_settings_runtime();
+        // The originals' one menu cue, for focus moves and for choices.
+        service_menu_sounds();
         if (online_join_stage_ != OnlineJoinStage::idle &&
             online_join_stage_ != OnlineJoinStage::preparing_world)
         {
             draw_background();
             draw_chrome();
             draw_online_join_loading();
-            SDL_RenderPresent(renderer_);
+            draw_mod_download_dialog(); // UI area (app_mod_ui.inc): add-ons the host needs
+            present_frame();
             return;
         }
-        if (menu_.screen() == ui::MenuScreen::world_preview ||
-            menu_.screen() == ui::MenuScreen::pause)
+        if (menu_.screen() == ui::MenuScreen::world_preview || in_game_menu_screen() ||
+            settings_over_world())
         {
             if (waiting_for_world_)
             {
@@ -13733,45 +18869,84 @@ class Application::Impl final
                     draw_online_join_loading();
                 else
                     draw_world_loading();
-                SDL_RenderPresent(renderer_);
+                present_frame();
                 return;
             }
+            // Take any mouse movement that arrived while the world was being
+            // updated before the view is fixed for this frame, and keep the
+            // aimed block in step with the crosshair between ticks.
+            sample_late_mouse_look();
+            if (world_controls_active() && (player_.state().yaw != targeted_yaw_ ||
+                                            player_.state().pitch != targeted_pitch_))
+            {
+                targeted_yaw_ = player_.state().yaw;
+                targeted_pitch_ = player_.state().pitch;
+                player_.refresh_target(world_preview_->region());
+            }
             world::PlayerState render_player = player_.state();
+            // The plain channel list a character rig poses from.
+            render_player.animation = local_animator_.pose();
+            // Before its first UpdateAnimation pass the animator still holds
+            // SetupAnimation's state (the paused Tilt clip at progress 0: a torso
+            // bent to the ground), which the original never draws.
+            render_player.animation_valid = local_animation_started_;
+            frame_phases_.alpha = pacing::interpolation_alpha(physics_accumulator_, 1.0F / 60.0F);
+            if (motion_smoothing_active())
+            {
+                // The simulation moves in 60 Hz steps. Draw the camera where it
+                // is between the last two of them so it covers the same ground
+                // every presented frame; a teleport or respawn cuts instead.
+                const pacing::CameraSample camera =
+                    fixed_step_camera_.present(player_.state(), frame_phases_.alpha);
+                render_player.position = camera.position;
+                render_player.step_view_offset = camera.step_view_offset;
+            }
+            presented_camera_ = render_player.position;
+            if (options_.still_camera.has_value())
+            {
+                // --camera: the frame is drawn from a chosen eye point. The
+                // player (and so the terrain that is loaded) stays where it is.
+                const std::array<float, 3> &eye = *options_.still_camera;
+                render_player.position = {eye[0], eye[1] - world::PlayerSimulation::eye_height,
+                                          eye[2]};
+                render_player.step_view_offset = 0.0F;
+                render_player.velocity = {};
+                render_player.target.reset();
+            }
+            if (!settings_.hud_visible || !settings_.hud_target ||
+                player_life_ != PlayerLife::alive)
+                render_player.target.reset();
             float render_aim_progress = gun_aim_progress_;
             render_player.viewmodel_cue = world::ViewmodelCue::idle;
             render_player.viewmodel_cue_progress = 0.0F;
-            if (player_life_ != PlayerLife::alive)
+            if (player_life_ != PlayerLife::alive || options_.diagnostic_death_seconds.has_value())
             {
-                // The body faints: the eye accelerates down like a felled body
-                // (quadratic, not linear), tips forward as it goes, and lands
-                // with a small settle bounce instead of stopping dead.
-                constexpr float fall_duration = 0.85F;
-                constexpr float fall_depth = 1.15F;
-                const float t = std::min(1.0F, death_timer_ / fall_duration);
-                float drop = t * t * fall_depth;
-                if (death_timer_ > fall_duration)
-                {
-                    const float after = std::min(1.0F, (death_timer_ - fall_duration) / 0.4F);
-                    drop = fall_depth - std::sin(after * 3.14159265F) * 0.07F * (1.0F - after);
-                }
-                render_player.position.y -= drop;
-                render_player.pitch =
-                    render_player.pitch + (-0.30F - render_player.pitch) * (t * t);
-                render_player.yaw += 0.10F * t * t;
+                render_player.dead = true;
+                render_player.death_animation_seconds =
+                    options_.diagnostic_death_seconds.value_or(death_timer_);
+                // --diagnostic-death poses the body at a chosen instant of a death
+                // that never happened to the running animator; the rig's own
+                // driver places the faint clip from death_animation_seconds.
+                if (options_.diagnostic_death_seconds.has_value())
+                    render_player.animation_valid = false;
+                render_player.using_tool = false;
+                render_player.velocity = {};
+                render_aim_progress = 0.0F;
             }
-            if (menu_.screen() == ui::MenuScreen::world_preview && !inventory_open_ &&
-                !inspector_view_)
+            if (menu_.screen() == ui::MenuScreen::world_preview && !render_player.dead &&
+                !inventory_open_ && !inspector_view_)
             {
                 // Simulation is intentionally fixed at 60 Hz, but the first-person rig should
                 // advance on every presented frame. Extrapolate only the visual swing through
                 // the unconsumed fixed-step remainder; authoritative mining and firing stay on
                 // their deterministic ticks.
                 const float subframe = std::clamp(physics_accumulator_, 0.0F, 1.0F / 60.0F);
+                const auto render_animator = local_animator_.presented(subframe * 60.0F);
+                render_player.animation = render_animator.pose();
                 const bool gun_selected = selected_gun() != nullptr;
-                const bool grenade_selected =
-                    item_grenade_type(inventory_.selected_item()).has_value();
-                if (gun_selected)
+                if (gun_selected && !(gun_reloading_ && gun_recoil_time_ > 0.0F))
                 {
+                    // (A requested reload holds the shoulder until the fire clip ends.)
                     constexpr float gun_shoulder_seconds = 0.15F;
                     const float aim_target = shouldering_ && !gun_reloading_ ? 1.0F : 0.0F;
                     render_aim_progress += std::clamp(aim_target - render_aim_progress,
@@ -13779,16 +18954,12 @@ class Application::Impl final
                                                       subframe / gun_shoulder_seconds);
                 }
                 const bool action_held = mine_button_down_ || secondary_action_down_;
+                // Same gate as the fixed tick: only base-input items swing at blocks.
                 const bool breaking = action_held && render_player.target.has_value() &&
-                                      !gun_selected && !grenade_selected &&
-                                      (inventory_.selected_block() == world::BlockType::empty ||
-                                       secondary_action_down_);
+                                      item_uses_tool_input(inventory_.selected_item());
                 if (breaking)
                 {
-                    const bool block_action =
-                        inventory_.selected_block() != world::BlockType::empty;
-                    const float period =
-                        block_action ? 0.1F : item_use_cooldown_seconds(inventory_.selected_item());
+                    const float period = item_use_cooldown_seconds(inventory_.selected_item());
                     render_player.using_tool = true;
                     render_player.tool_swing_progress =
                         std::fmod(render_player.tool_swing_progress + subframe / period, 1.0F);
@@ -13811,14 +18982,27 @@ class Application::Impl final
                     render_player.viewmodel_cue = world::ViewmodelCue::primary_use;
                     render_player.viewmodel_cue_progress = render_player.tool_swing_progress;
                 }
-                if (grenade_cooking_)
+                if (grenade_cooking_ && grenade_arm_.swinging())
+                {
+                    // Grenade_Throw plays before the grenade leaves the hand.
+                    render_player.using_tool = true;
+                    render_player.viewmodel_cue = world::ViewmodelCue::grenade_throw;
+                    render_player.viewmodel_cue_progress =
+                        std::clamp((grenade_arm_.throw_clip_time() + subframe) /
+                                       net::GrenadeArm::throw_clip_seconds,
+                                   0.0F, 1.0F);
+                }
+                else if (grenade_cooking_)
                 {
                     render_player.using_tool = true;
                     render_player.viewmodel_cue = world::ViewmodelCue::grenade_cook;
                     // GrenadeCook is authored at 0.983333 s; after it finishes,
                     // the final pose remains held until release or auto-throw.
+                    // The clip keeps running after an early release.
                     render_player.viewmodel_cue_progress =
-                        std::clamp((grenade_cook_time_ + subframe) / 0.9833333F, 0.0F, 1.0F);
+                        std::clamp((grenade_arm_.cook_clip_time() + subframe) /
+                                       net::GrenadeArm::cook_clip_seconds,
+                                   0.0F, 1.0F);
                 }
                 else if (grenade_animation_time_ > 0.0F)
                 {
@@ -13831,19 +19015,10 @@ class Application::Impl final
                 if (gun_selected)
                 {
                     const float reload_seconds = std::max(0.1F, selected_gun()->reload_seconds);
-                    if (gun_reloading_ && render_aim_progress > 0.0F)
-                    {
-                        render_player.viewmodel_cue = world::ViewmodelCue::unshoulder;
-                        render_player.viewmodel_cue_progress = 1.0F - render_aim_progress;
-                    }
-                    else if (gun_reloading_)
-                    {
-                        render_player.viewmodel_cue = world::ViewmodelCue::reload;
-                        render_player.viewmodel_cue_progress = std::clamp(
-                            1.0F - std::max(0.0F, gun_reload_time_ - subframe) / reload_seconds,
-                            0.0F, 1.0F);
-                    }
-                    else if (gun_recoil_time_ > 0.0F)
+                    // Same order as Player.UpdateAnimation: the channel-3 fire
+                    // clip always plays out, then a requested reload lowers the
+                    // weapon, and only then does the reload clip itself run.
+                    if (gun_recoil_time_ > 0.0F)
                     {
                         render_player.using_tool = true;
                         render_player.tool_swing_progress =
@@ -13853,6 +19028,18 @@ class Application::Impl final
                                                           ? world::ViewmodelCue::shoulder_use
                                                           : world::ViewmodelCue::primary_use;
                         render_player.viewmodel_cue_progress = render_player.tool_swing_progress;
+                    }
+                    else if (gun_reloading_ && render_aim_progress > 0.0F)
+                    {
+                        render_player.viewmodel_cue = world::ViewmodelCue::unshoulder;
+                        render_player.viewmodel_cue_progress = 1.0F - render_aim_progress;
+                    }
+                    else if (gun_reload_clip_active_)
+                    {
+                        render_player.viewmodel_cue = world::ViewmodelCue::reload;
+                        render_player.viewmodel_cue_progress = std::clamp(
+                            1.0F - std::max(0.0F, gun_reload_time_ - subframe) / reload_seconds,
+                            0.0F, 1.0F);
                     }
                     else if (render_aim_progress >= 0.999F)
                     {
@@ -13869,9 +19056,15 @@ class Application::Impl final
                 }
                 render_player.tool_swing_progress =
                     std::clamp(render_player.tool_swing_progress, 0.0F, 1.0F);
+                // Which clip shows, and how far along it is, comes from the
+                // original's own animation state and clip clocks.
+                apply_local_animation_cue(render_player, render_aim_progress, render_animator);
             }
             if (options_.preview_viewmodel.has_value())
             {
+                // A posed capture is the view's own driver at a fixed progress,
+                // not the running animation state.
+                render_player.animation_valid = false;
                 const std::string &state = *options_.preview_viewmodel;
                 const float progress = std::clamp(options_.preview_viewmodel_progress, 0.0F, 1.0F);
                 render_player.viewmodel_cue_progress = progress;
@@ -13915,9 +19108,19 @@ class Application::Impl final
             }
             const GunStats *drawn_gun = selected_gun();
             const float draw_aim = drawn_gun != nullptr ? render_aim_progress : 0.0F;
-            world_preview_->set_enemies(&enemy_horde_.enemies());
+            // Everything the fixed tick moves is drawn on the camera's timeline:
+            // creatures between their last two ticks, free-flying projectiles
+            // and effects moved back along their velocity by the same amount.
+            const float presentation_alpha = render_interpolation_alpha();
+            presentation_lag_seconds_ = (1.0F - presentation_alpha) / 60.0F;
+            world_preview_->set_presentation_lag(presentation_lag_seconds_);
+            // Presentation only: how far the weapon is raised opens the lens
+            // of the Enhanced depth of field.
+            world_preview_->set_aim_progress(draw_aim);
+            world_preview_->set_enemies(presented_enemies(presentation_alpha));
             world_preview_->set_remote_players(&online_remote_visuals_);
-            world_preview_->set_dragon(dragon_.visible() ? &dragon_.dragon() : nullptr);
+            present_xbox_avatars();
+            world_preview_->set_dragon(presented_dragon(presentation_alpha));
             world_preview_->set_projectiles(build_projectile_visuals());
             world_preview_->set_rockets(build_rocket_visuals());
             world_preview_->set_explosive_fuses(build_fuse_visuals());
@@ -13925,32 +19128,62 @@ class Application::Impl final
                 std::vector<FireballVisual> fireball_visuals;
                 fireball_visuals.reserve(fireballs_.size());
                 for (const Fireball &fireball : fireballs_)
-                    fireball_visuals.push_back({fireball.position, fireball.velocity,
+                    fireball_visuals.push_back({fireball.awaiting_detonation
+                                                    ? fireball.position
+                                                    : presented_projectile(fireball.position,
+                                                                           fireball.velocity),
+                                                fireball.velocity,
                                                 world_elapsed_ * 3.0F, fireball.id,
                                                 fireball.kind == world::DragonKind::ice});
                 world_preview_->set_fireball_visuals(std::move(fireball_visuals));
             }
             world::SkyState biome_sky = current_sky_state();
             biome_sky.lightning = options_.force_lightning || lightning_visible_;
+            if (settings_.presentation == PresentationProfile::rebirth)
+                biome_sky.lightning_strength =
+                    (options_.force_lightning ? 1.0F : lightning_strength_) *
+                    (settings_.reduced_motion ? 0.35F : 1.0F);
             apply_biome_atmosphere(biome_sky);
             apply_depth_fog(biome_sky);
+            if (settings_.presentation == PresentationProfile::rebirth)
+                world::apply_lightning_illumination(biome_sky);
+            // WORLD projection: the player's field of view. FPSCamera.
+            // FieldOfView lerps to DefaultFOV / ShoulderMagnification; the
+            // zoom keeps that magnification at every setting.
+            float world_fov = presented_world_fov(drawn_gun, draw_aim);
+            // Graphics area (app_mod_graphics.inc): installed packs, mods'
+            // atmosphere layers and camera effects. Nothing without mods.
+            mod_graphics_sync();
+            mod_graphics_before_world_draw(biome_sky, render_player, world_fov);
+            mod_graphics_items_before_world_draw(); // Modding, visuals area: mod items in 3D
             world_preview_->draw(
-                metrics_, biome_sky, render_player,
-                // FPSCamera.FieldOfView lerps to DefaultFOV / ShoulderMagnification
-                // with the gun's own zoom factor.
-                std::lerp(settings_.vertical_fov,
-                          settings_.vertical_fov /
-                              (drawn_gun != nullptr ? drawn_gun->shoulder_magnification : 1.0F),
-                          draw_aim),
+                metrics_, biome_sky, render_player, world_fov,
                 world_elapsed_, settings_.render_scale, settings_.camera_bob,
                 settings_.screen_shake,
+                // VIEWMODEL projection: its own depth pass, scaled with FOV.
                 // The original halves the avatar-eye FOV when fully shouldered
                 // (ShoulderedAvatarFOV = viewFOV * 0.5), magnifying the gun while the
                 // arms leave the frame edges.
-                std::lerp(settings_.viewmodel_fov, settings_.viewmodel_fov * 0.5F, draw_aim),
+                presented_viewmodel_fov(draw_aim),
                 settings_.presentation == PresentationProfile::rebirth, settings_.reduced_motion,
                 inspector_view_, settings_.ambient_occlusion, settings_.ore_glow,
-                terrain_shadow_strength(settings_.shadow_quality));
+                // Zero skips every sun-shadow pass (Shadows: Off). Otherwise this
+                // is how dark shadows are; their quality goes through set_quality.
+                settings_.shadows_enabled ? settings_.shadow_darkness : 0.0F);
+            if (pending_world_exit_ || world_thumbnail_requested_)
+            {
+                capture_world_thumbnail();
+                world_thumbnail_requested_ = false;
+                if (pending_world_exit_)
+                {
+                    stop_mod_session(); // Mod runtime area: world.unloading, storage
+                    save_world();
+                    running_ = false;
+                    pending_world_exit_ = false;
+                }
+                else
+                    persist_world_thumbnail();
+            }
             if (menu_.screen() == ui::MenuScreen::world_preview)
                 world_thumbnail_captured_for_pause_ = false;
             else if (!world_thumbnail_captured_for_pause_)
@@ -13958,23 +19191,57 @@ class Application::Impl final
                 capture_world_thumbnail();
                 world_thumbnail_captured_for_pause_ = true;
             }
-            draw_world_hud();
-            draw_online_chat_feed();
-            if (player_roster_visible_)
-                draw_player_roster();
-            if (player_life_ != PlayerLife::alive)
+            const bool gameplay_hud =
+                menu_.screen() == ui::MenuScreen::world_preview && !inventory_open_;
+            // UI area (app_mod_ui.inc): HUD elements a mod hid are switched
+            // off for this frame's HUD only.
+            const ModUiHudScope mod_ui_hud_scope{*this, gameplay_hud};
+            // The original draws gamertags from the scene screen's AfterDraw:
+            // after the world (and after the save thumbnail above was taken),
+            // underneath the HUD and every menu.
+            if (settings_.hud_visible)
+                draw_remote_nametags();
+            if (settings_.hud_visible)
+                mod_graphics_draw_nametags(); // Modding, visuals area: mod NPC names
+            if (gameplay_hud)
+                draw_world_hud();
+            if (gameplay_hud && settings_.hud_visible)
+                draw_mod_ui_hud(); // UI area: mod HUD elements and stat bars
+            // (The chat feed and the player list are part of the HUD in every
+            // interface style: ConsoleElement and InGameHUD.DrawPlayerList in
+            // the retail ones, rm_draw_chat and rm_draw_roster in Remastered.)
+            if (gameplay_hud && settings_.hud_visible && settings_.hud_death &&
+                (player_life_ != PlayerLife::alive || options_.diagnostic_death_seconds))
                 draw_death_overlay();
+            if (gameplay_hud && settings_.hud_visible)
+                draw_achievement_popup();
             if (inventory_open_)
                 draw_inventory_overlay();
             if (locator_name_editing_)
                 draw_locator_name_dialog();
             if (chat_editing_)
                 draw_chat_dialog();
-            if (menu_.screen() == ui::MenuScreen::pause)
+            if (in_game_menu_screen())
                 draw_pause_menu();
-            draw_subtitle();
-            draw_toast();
-            SDL_RenderPresent(renderer_);
+            if (settings_over_world())
+            {
+                // The same screen the main menu shows, over the live world
+                // instead of the menu backdrop (see settings_over_world).
+                draw_chrome();
+                draw_settings();
+                draw_toast();
+            }
+            if (gameplay_hud && settings_.hud_visible)
+            {
+                draw_subtitle();
+                // Notices are the Remastered HUD's. The Classic and Modern
+                // styles copy a HUD that has none and show only failures.
+                draw_hud_notice();
+                draw_mod_ui_notices(); // UI area: mod toasts and titles
+            }
+            draw_mod_ui_screens(); // UI area: mod screens over everything
+            draw_fps_counter();
+            present_frame();
             return;
         }
         draw_background();
@@ -13991,6 +19258,8 @@ class Application::Impl final
         case ui::MenuScreen::join_browser:
         case ui::MenuScreen::join_details:
         case ui::MenuScreen::game_mode:
+        case ui::MenuScreen::game_profile:
+        case ui::MenuScreen::travel:
         case ui::MenuScreen::difficulty:
         case ui::MenuScreen::world_select:
             draw_main_menu();
@@ -14004,6 +19273,9 @@ class Application::Impl final
         case ui::MenuScreen::credits:
             draw_credits();
             break;
+        case ui::MenuScreen::achievements:
+            draw_achievements();
+            break;
         case ui::MenuScreen::world_preview:
         case ui::MenuScreen::pause:
             break;
@@ -14013,8 +19285,12 @@ class Application::Impl final
         }
         if (host_text_field_ != HostTextField::none)
             draw_host_text_dialog();
+        if (addon_world_prompt_.has_value())
+            draw_addon_world_prompt(); // (Add-Ons) app_menus.inc
         draw_toast();
-        SDL_RenderPresent(renderer_);
+        draw_mod_ui_screens(); // UI area (app_mod_ui.inc): mod screens over the menus
+        draw_fps_counter();
+        present_frame();
     }
 
     void fill(Rect rect, SDL_Color color)
@@ -14040,8 +19316,109 @@ class Application::Impl final
                     outline);
     }
 
+    // ---- Retail text -------------------------------------------------------
+    // Which shipped build's WORDS and FONTS a screen shows: the interface
+    // style's own release for Classic and Modern, the world's generation for
+    // Remastered, which has no release of its own (see retail_build_of).
+    [[nodiscard]] RetailGeneration presentation_generation() const noexcept
+    {
+        return retail_build_of(settings_.ui_style,
+                               inventory_.profile() == InventoryProfile::modern) == UiStyle::modern
+                   ? RetailGeneration::modern
+                   : RetailGeneration::classic;
+    }
+    // A string from that build's table (openminerz/retail_text.hpp).
+    [[nodiscard]] std::string_view retail(RetailString id) const noexcept
+    {
+        return retail_text(id, presentation_generation());
+    }
+    // That build's sprite fonts; null when its content pack carries no font
+    // import (rerun the content import), in which case callers use text().
+    [[nodiscard]] RetailFonts *retail_fonts() noexcept
+    {
+        RetailFonts *fonts = presentation_generation() == RetailGeneration::modern
+                                 ? modern_fonts_.get()
+                                 : classic_fonts_.get();
+        return fonts != nullptr && fonts->complete() ? fonts : nullptr;
+    }
+    // The surface a retail 2D screen is laid out on, and where it lands in the
+    // window. The two builds differ (both checked in the shipped DNAGame):
+    //
+    //   1.6.3.8  CastleMinerZGame calls CreateOffscreenBuffer(1280, 720) and
+    //            DNAGame.Draw stretches that buffer over the largest centred
+    //            rectangle of its aspect. EVERY 2D element - sprite fonts
+    //            included - is therefore authored for 1280x720 and scaled with
+    //            the window; nothing is "unscaled" above 720p.
+    //   1.9.9.8  creates no offscreen buffer: the back buffer is the window,
+    //            Screen.Adjuster.ScreenSize follows it, and a draw is scaled
+    //            only where its own code multiplies by Adjuster.ScaleFactor.
+    //
+    // Lay out in canvas units (width x height), then place with wx()/wy() and
+    // draw text at `scale`. hud::layout() does the same for the in-world HUD.
+    struct RetailCanvas final
+    {
+        float width{};
+        float height{};
+        float left{};
+        float top{};
+        float scale{1.0F};
+        [[nodiscard]] float wx(float x) const noexcept { return left + x * scale; }
+        [[nodiscard]] float wy(float y) const noexcept { return top + y * scale; }
+    };
+    [[nodiscard]] RetailCanvas retail_canvas() const noexcept
+    {
+        const int window_width = std::max(metrics_.output_width, 1);
+        const int window_height = std::max(metrics_.output_height, 1);
+        if (presentation_generation() == RetailGeneration::modern)
+            return {static_cast<float>(window_width), static_cast<float>(window_height), 0.0F,
+                    0.0F, 1.0F};
+        // DNAGame.Draw's _bufferDestRect, with its integer arithmetic.
+        int width = window_width;
+        int height = window_height;
+        if (static_cast<float>(window_width) / static_cast<float>(window_height) >
+            1280.0F / 720.0F)
+            width = window_height * 1280 / 720;
+        else
+            height = window_width * 720 / 1280;
+        return {1280.0F, 720.0F, static_cast<float>((window_width - width) / 2),
+                static_cast<float>((window_height - height) / 2),
+                static_cast<float>(width) / 1280.0F};
+    }
+    // SpriteBatch.DrawString / DrawOutlinedText at a canvas position.
+    void canvas_text(RetailFonts &fonts, const RetailCanvas &canvas, RetailFont font,
+                     std::string_view value, float x, float y, SDL_Color color,
+                     int outline_width = 0)
+    {
+        if (outline_width > 0)
+            fonts.draw_outlined(font, value, canvas.wx(x), canvas.wy(y), color,
+                                {0U, 0U, 0U, color.a}, outline_width, canvas.scale);
+        else
+            fonts.draw(font, value, canvas.wx(x), canvas.wy(y), color, canvas.scale);
+    }
+    void canvas_fill(const RetailCanvas &canvas, float x, float y, float width, float height,
+                     SDL_Color color)
+    {
+        fill({canvas.wx(x), canvas.wy(y), width * canvas.scale, height * canvas.scale}, color);
+    }
+    void canvas_sprite(const RetailCanvas &canvas, SDL_Texture *texture, const SDL_FRect *source,
+                       float x, float y, float width, float height, bool mirrored = false)
+    {
+        const SDL_FRect target{canvas.wx(x), canvas.wy(y), width * canvas.scale,
+                               height * canvas.scale};
+        SDL_RenderTextureRotated(renderer_, texture, source, &target, 0.0, nullptr,
+                                 mirrored ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE);
+    }
+
     void draw_background()
     {
+        // The player's own picture of the tower, when they have one
+        // (app_menus.inc); what follows is the built-in backdrop, drawn
+        // without one and underneath it while it fades in.
+        if (menu_backdrop_shown() >= 1.0F)
+        {
+            draw_menu_backdrop();
+            return;
+        }
         const int bands = 28;
         for (int band = 0; band < bands; ++band)
         {
@@ -14107,259 +19484,492 @@ class Application::Impl final
         fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
               static_cast<float>(metrics_.output_height)},
              {2U, 4U, 5U, 52U});
+        draw_menu_backdrop();
     }
 
+    // The player's name and the key hints (app_menus.inc). The title lettering
+    // belongs to the title screen; other screens carry a heading instead.
     void draw_chrome()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const float top = metrics_.safe.y + 26.0F * s;
-        text("OPEN", metrics_.safe.x + 34.0F * s, top, 58.0F, colors.text, TextAlign::left, true);
-        text("MINER", metrics_.safe.x + 205.0F * s, top, 58.0F, colors.text, TextAlign::left, true);
-        text("Z", metrics_.safe.x + 406.0F * s, top - 7.0F * s, 72.0F, colors.accent,
-             TextAlign::left, true);
-        fill({metrics_.safe.x + 36.0F * s, top + 72.0F * s, 390.0F * s, 3.0F * s}, colors.accent);
-        text("CLEAN-ROOM FRONTEND  /  BUILD 0.1.0", metrics_.safe.x + 38.0F * s, top + 84.0F * s,
-             14.0F, colors.secondary);
-
-        const std::string_view visible_profile =
-            steam_identity_verified_ && !online_persona_name_.empty()
-                ? std::string_view{online_persona_name_}
-                : std::string_view{profile_name_};
-        text(visible_profile, metrics_.safe.x + metrics_.safe.width - 28.0F * s, top + 4.0F * s,
-             20.0F, colors.text, TextAlign::right);
-        text(steam_identity_verified_ ? "STEAM PROFILE" : "LOCAL PROFILE",
-             metrics_.safe.x + metrics_.safe.width - 28.0F * s, top + 34.0F * s, 13.0F,
-             colors.secondary, TextAlign::right);
-
-        const float bottom = metrics_.safe.y + metrics_.safe.height - 34.0F * s;
-        text(online_join_stage_ == OnlineJoinStage::idle
-                 ? "ARROWS / WASD  NAVIGATE    ENTER  SELECT    ESC  BACK"
-                 : "CONNECTION IN PROGRESS  /  KEEP OPENMINERZ RUNNING",
-             metrics_.safe.x + 34.0F * s, bottom, 13.0F, colors.secondary);
-        text(settings_.presentation == PresentationProfile::classic ? "CLASSIC PROFILE"
-                                                                    : "REBIRTH PROFILE",
-             metrics_.safe.x + metrics_.safe.width - 28.0F * s, bottom, 13.0F, colors.accent,
-             TextAlign::right);
+        draw_menu_chrome();
     }
 
-    void draw_world_hud()
+    static SDL_Color protocol_color(net::ProtocolVersion protocol) noexcept
     {
-        const auto colors = palette(settings_.high_contrast);
-        const auto &player = player_.state();
-        const float s = metrics_.scale;
-        const float safe_left = metrics_.safe.x + 26.0F * s;
-        const float safe_right = metrics_.safe.x + metrics_.safe.width - 26.0F * s;
-        const float safe_top = metrics_.safe.y + 22.0F * s;
-        const float safe_bottom = metrics_.safe.y + metrics_.safe.height - 24.0F * s;
-        const auto sky = current_sky_state();
+        return protocol == net::ProtocolVersion::classic_v3  ? SDL_Color{236U, 191U, 108U, 255U}
+               : protocol == net::ProtocolVersion::modern_v4 ? SDL_Color{108U, 191U, 239U, 255U}
+                                                             : SDL_Color{164U, 171U, 176U, 255U};
+    }
 
-        Rect world_card{safe_left, safe_top, 374.0F * s, 86.0F * s};
-        fill(world_card, {5U, 8U, 9U, 208U});
-        stroke(world_card, {129U, 143U, 145U, 110U});
-        fill({world_card.x, world_card.y, 5.0F * s, world_card.height}, colors.accent);
-        text(inspector_view_ ? "WORLD INSPECTOR"
-                             : (online_gameplay_active() ? "STEAM MULTIPLAYER"
-                                                         : "OFFLINE SURVIVAL"),
-             world_card.x + 20.0F * s,
-             world_card.y + 13.0F * s, 12.0F, colors.accent);
-        text(world_preview_->biome_name() == "CLASSIC"
-                 ? "ORIGIN FRONTIER"
-                 : std::format("{} FRONTIER", world_preview_->biome_name()),
-             world_card.x + 20.0F * s, world_card.y + 34.0F * s, 23.0F, colors.text,
-             TextAlign::left, true);
-        text(std::format("SEED {}  /  {} BIOME", world_seed_, world_preview_->biome_name()),
-             world_card.x + 20.0F * s, world_card.y + 65.0F * s, 11.0F, colors.secondary);
+    // ---- The retail HUD ----------------------------------------------------
+    // hud::layout() (openminerz/hud_layout.hpp) is InGameHUD.OnDraw of 1.6.3.8
+    // or 1.9.9.8 as a draw list; this renders that list with the build's own
+    // sprites and fonts. Which build is Settings::ui_style, a presentation
+    // choice: everything the list shows comes from the world being played.
 
-        Rect clock_card{safe_right - 272.0F * s, safe_top, 272.0F * s, 86.0F * s};
-        fill(clock_card, {5U, 8U, 9U, 208U});
-        stroke(clock_card, {129U, 143U, 145U, 110U});
-        text(sky.period, clock_card.x + 18.0F * s, clock_card.y + 14.0F * s, 12.0F, colors.accent);
-        text(day_night_.clock_text(), clock_card.x + 18.0F * s, clock_card.y + 34.0F * s, 25.0F,
-             colors.text, TextAlign::left, true);
-        text(std::format("DAY {}", static_cast<int>(std::floor(day_night_.day())) + 1),
-             clock_card.x + clock_card.width - 18.0F * s, clock_card.y + 17.0F * s, 12.0F,
-             colors.secondary, TextAlign::right);
-        text(world_time_speed_ == 0.0F ? "PAUSED" : std::format("CYCLE {:.0f}X", world_time_speed_),
-             clock_card.x + clock_card.width - 18.0F * s, clock_card.y + 56.0F * s, 11.0F,
-             world_time_speed_ == 0.0F ? colors.accent : colors.secondary, TextAlign::right);
-        fill({clock_card.x + 18.0F * s, clock_card.y + clock_card.height - 7.0F * s,
-              clock_card.width - 36.0F * s, 2.0F * s},
-             {68U, 78U, 80U, 180U});
-        fill({clock_card.x + 18.0F * s, clock_card.y + clock_card.height - 7.0F * s,
-              (clock_card.width - 36.0F * s) * sky.time_of_day, 2.0F * s},
-             colors.accent);
+    // One build's HUD sprites, indexed by hud::Sprite.
+    struct HudArt final
+    {
+        std::array<SDL_Texture *, static_cast<std::size_t>(hud::Sprite::count)> textures{};
+        // Every sprite that build's HUD draws was found in its content pack.
+        bool complete{};
+    };
 
-        const float center_x = static_cast<float>(metrics_.output_width) * 0.5F;
-        const float compass_y = safe_top + 111.0F * s;
-        Rect compass{center_x - 190.0F * s, compass_y, 380.0F * s, 37.0F * s};
-        fill(compass, {5U, 8U, 9U, 156U});
-        fill({compass.x + compass.width * 0.5F - 1.0F * s, compass.y, 2.0F * s, 9.0F * s},
-             colors.accent);
-        constexpr std::array compass_points{"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
-        constexpr float pi = 3.14159265358979323846F;
-        const float heading = std::fmod(player.yaw * 180.0F / pi + 360.0F, 360.0F);
-        const int heading_index = static_cast<int>(std::floor(heading / 45.0F));
-        const float marker_spacing = 74.0F * s;
-        const float compass_center = compass.x + compass.width * 0.5F;
-        for (int offset = -3; offset <= 4; ++offset)
+    void load_hud_art(HudArt &art, UiStyle style, const std::filesystem::path &derived_data)
+    {
+        art.complete = true;
+        for (std::size_t index = 0U; index < art.textures.size(); ++index)
         {
-            const int absolute_index = heading_index + offset;
-            const float marker_heading = static_cast<float>(absolute_index) * 45.0F;
-            const float x = compass_center + (marker_heading - heading) / 45.0F * marker_spacing;
-            if (x < compass.x + 12.0F * s || x > compass.x + compass.width - 12.0F * s)
+            const auto sprite = static_cast<hud::Sprite>(index);
+            const std::string_view name = hud::sprite_sheet_name(sprite);
+            if (name.empty() || hud::sprite_size(style, sprite).width == 0)
                 continue;
-            const int wrapped = (absolute_index % 8 + 8) % 8;
-            const float center_distance = std::abs(x - compass_center) / (compass.width * 0.5F);
-            const float emphasis = 1.0F - std::clamp(center_distance, 0.0F, 1.0F);
-            const SDL_Color marker_color =
-                emphasis > 0.72F ? colors.text
-                                 : with_alpha(colors.secondary, 0.45F + emphasis * 0.55F);
-            text(compass_points[static_cast<std::size_t>(wrapped)], x,
-                 compass.y + (emphasis > 0.72F ? 9.0F : 11.0F) * s,
-                 emphasis > 0.72F ? 15.0F : 11.0F, marker_color, TextAlign::center);
+            SDL_Texture *texture = load_bmp_texture(
+                renderer_, derived_data / std::format("hud_{}.bmp", name));
+            art.textures[index] = texture;
+            if (texture == nullptr)
+            {
+                art.complete = false;
+                continue;
+            }
+            // XNA content is premultiplied and SpriteBatch blends it that way;
+            // several HUD tints only come out right with the same blend.
+            SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+            SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
         }
+    }
 
-        // The original's top-of-screen block counter: current distance from the
-        // start point and the best distance reached this session.
-        text("DISTANCE - MAX", center_x, compass.y + compass.height + 6.0F * s, 9.0F,
-             colors.secondary, TextAlign::center);
-        text(std::format("{} - {}", current_distance_, max_distance_), center_x,
-             compass.y + compass.height + 21.0F * s, 13.0F, colors.text, TextAlign::center, true);
-
-        const bool submerged = player_underwater(player);
-        if (submerged)
+    // SpriteFont.MeasureString / LineSpacing of the style's own fonts.
+    class HudMetrics final : public hud::TextMetrics
+    {
+      public:
+        explicit HudMetrics(const RetailFonts &fonts) : fonts_(fonts) {}
+        [[nodiscard]] hud::Extent measure(hud::Font font, std::string_view value) const override
         {
-            Rect water_status{center_x - 116.0F * s, compass.y + compass.height + 44.0F * s,
-                              232.0F * s, 27.0F * s};
-            fill(water_status, {4U, 37U, 52U, 218U});
-            stroke(water_status, {94U, 186U, 201U, 155U});
-            const float oxygen = std::clamp(player_oxygen_, 0.0F, 1.0F);
-            const float inset = 3.0F * s;
-            fill({water_status.x + inset, water_status.y + inset,
-                  (water_status.width - inset * 2.0F) * oxygen, water_status.height - inset * 2.0F},
-                 {24U, 119U, 151U, 180U});
-            text("OXYGEN", center_x, water_status.y + 7.0F * s, 9.0F, {205U, 244U, 248U, 255U},
-                 TextAlign::center, true);
+            const TextExtent extent = fonts_.measure(retail_font(font), value);
+            return {extent.width, extent.height};
         }
-
-        if (!settings_.hud_visible)
+        [[nodiscard]] int line_spacing(hud::Font font) const override
         {
-            text("HUD HIDDEN IN SETTINGS  /  ESC RETURNS TO MENU", safe_left, safe_bottom, 11.0F,
-                 colors.secondary);
-            return;
+            const SpriteFont *loaded = fonts_.font(retail_font(font));
+            return loaded != nullptr ? loaded->line_spacing() : 0;
+        }
+        [[nodiscard]] static RetailFont retail_font(hud::Font font) noexcept
+        {
+            switch (font)
+            {
+            case hud::Font::small:
+                return RetailFont::small;
+            case hud::Font::medium:
+                return RetailFont::medium;
+            case hud::Font::medium_large:
+                return RetailFont::medium_large;
+            case hud::Font::large:
+                return RetailFont::large;
+            case hud::Font::console:
+            case hud::Font::count:
+                break;
+            }
+            return RetailFont::console;
         }
 
-        // InGameHUD damage feedback: a low-health red wash plus directional
-        // indicators that swing around the crosshair toward each attacker.
-        const float center_y_feedback = static_cast<float>(metrics_.output_height) * 0.5F;
-        const float hurt = 1.0F - std::clamp(player.health / 100.0F, 0.0F, 1.0F);
-        if (hurt > 0.0F)
-            fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
-                  static_cast<float>(metrics_.output_height)},
-                 {static_cast<Uint8>(hurt * 102.0F), 0U, 0U, static_cast<Uint8>(hurt * 120.0F)});
-        // InGameHUD.Draw overlays the lava fade after the low-health wash and
-        // promotes it to opaque red once the player's feet are two blocks
-        // below the global lava surface.
-        const float lava = world::lava_submersion(player.position.y);
-        if (lava > 0.0F)
-            fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
-                  static_cast<float>(metrics_.output_height)},
-                 {255U, 0U, 0U, static_cast<Uint8>(lava * 255.0F)});
+      private:
+        const RetailFonts &fonts_;
+    };
+
+    // The interface style in effect: remastered, classic or modern (never
+    // automatic). One answer for the HUD and for every inventory screen.
+    [[nodiscard]] UiStyle interface_style() const noexcept
+    {
+        return resolved_ui_style(settings_, inventory_.profile() == InventoryProfile::modern);
+    }
+
+    // The RETAIL RELEASE whose sprites, sprite fonts, words and item icons are
+    // in use: always exactly classic or modern. It is the interface style
+    // itself for the two retail styles and the world's generation for
+    // Remastered, whose item icons and names are still the game's own.
+    [[nodiscard]] UiStyle hud_style() const noexcept
+    {
+        return retail_build_of(settings_.ui_style, inventory_.profile() == InventoryProfile::modern);
+    }
+
+    // A retail style is selected and its sprites and fonts are imported. When
+    // this is false the Remastered HUD is drawn: because it was chosen, or
+    // because the chosen retail style's art is not in the content pack (one
+    // made before the HUD import existed) and Remastered needs none.
+    [[nodiscard]] bool retail_hud_ready() noexcept
+    {
+        if (!is_retail_style(interface_style()))
+            return false;
+        const HudArt &art = hud_style() == UiStyle::modern ? modern_hud_art_ : classic_hud_art_;
+        return art.complete && retail_fonts() != nullptr;
+    }
+
+    // ActiveInventoryItem.GetDisplayText: the name, a gun's "clip/reserve", a
+    // locator's name and distance.
+    [[nodiscard]] std::string hud_item_text() const
+    {
+        const InventoryItemId item = inventory_.selected_item();
+        std::string label{mod_item_label(inventory_.selected(), item_name(item))}; // Modding, visuals area
+        if (!inventory_.selected().has_value())
+            return label; // PlayerInventory._bareHands
+        const InventoryStack &stack = *inventory_.selected();
+        const bool launcher = item == InventoryItemId::rocket_launcher ||
+                              item == InventoryItemId::guided_rocket_launcher;
+        if (const GunStats *stats = selected_gun(); stats != nullptr && !launcher)
+            return std::format("{} {}/{}", label, stack.rounds_in_clip,
+                               inventory_.count(stats->ammo_item));
+        if ((item == InventoryItemId::gps || item == InventoryItemId::teleport_gps) &&
+            stack.waypoint_valid)
+        {
+            const auto &position = player_.state().position;
+            const float dx = stack.waypoint[0] - position.x;
+            const float dy = stack.waypoint[1] - position.y;
+            const float dz = stack.waypoint[2] - position.z;
+            return std::format("{}: {} - {}: {}", label, stack.waypoint_name,
+                               retail(RetailString::Distance),
+                               static_cast<int>(std::sqrt(dx * dx + dy * dy + dz * dz)));
+        }
+        return label;
+    }
+
+    [[nodiscard]] hud::State hud_state(bool scoped_aim, bool shouldering) const
+    {
+        const auto &player = player_.state();
+        const bool modern_world = inventory_.profile() == InventoryProfile::modern;
+        hud::State state;
+        state.health = std::clamp(player.health / 100.0F, 0.0F, 1.0F);
+        state.stamina = std::clamp(player.stamina / 100.0F, 0.0F, 1.0F);
+        // CastleMinerZGame.IsEnduranceMode: both Endurance modes show health alone.
+        state.has_stamina = modern_world && game_mode_ != GameMode::endurance &&
+                            game_mode_ != GameMode::dragon_endurance;
+        state.stamina_blocked = player_.stamina_blocked();
+        state.underwater = player_underwater(player);
+        state.oxygen = std::clamp(player_oxygen_, 0.0F, 1.0F);
+        state.lava = world::lava_submersion(player.position.y);
+        state.dead = player_life_ != PlayerLife::alive ||
+                     options_.diagnostic_death_seconds.has_value();
+        state.shouldering = shouldering;
+
+        const auto fill_tray = [&](std::array<hud::TraySlot, 8> &slots,
+                                   const PlayerInventory::Tray &tray) {
+            for (std::size_t index = 0U; index < slots.size() && index < tray.size(); ++index)
+                if (tray[index].has_value())
+                    slots[index] = {true, 0, static_cast<int>(tray[index]->count),
+                                    item_self_damage_per_use(tray[index]->item,
+                                                             inventory_.profile()) > 0.0F,
+                                    std::clamp(tray[index]->durability, 0.0F, 1.0F)};
+        };
+        fill_tray(state.tray, inventory_.tray());
+        state.has_next_tray = modern_world;
+        if (modern_world)
+            fill_tray(state.next_tray, inventory_.tray(1U - inventory_.current_tray_index()));
+        // PlayerStats.SecondTrayFaded is off unless the player asks for it
+        // ("Fade Inactive Item Tray"); on, _secondTrayAlpha is 0.4.
+        state.next_tray_alpha = settings_.fade_inactive_tray ? 0.4F : 1.0F;
+        state.selected = static_cast<int>(inventory_.selected_index());
+        state.item_name = mod_item_label(inventory_.selected(),
+                                         item_name(inventory_.selected_item())); // Modding, visuals area
+        state.item_text = hud_item_text();
+        // ConstructionProbe.AbleToBuild: a block within reach under the reticle.
+        if (player.target.has_value() && !state.dead)
+        {
+            state.aiming_at_block = true;
+            state.block_name = mod_target_block_name(*player.target); // (fix) mod blocks' own names
+        }
+        state.distance_word = std::string{retail(RetailString::Distance)};
+        state.max_word = std::string{retail(RetailString::Max)};
+        state.distance = current_distance_;
+        state.max_distance = max_distance_;
+
         for (const auto &indicator : damage_indicators_)
         {
-            const float fade =
-                indicator.age < 2.0F ? 1.0F : std::clamp(3.0F - indicator.age, 0.0F, 1.0F);
-            if (fade <= 0.0F)
+            // DamageIndicator.fadeAmount over its three seconds.
+            const float complete = std::min(indicator.age / 3.0F, 1.0F);
+            if (complete >= 1.0F)
                 continue;
             const float world_angle = std::atan2(indicator.source.x - player.position.x,
                                                  -(indicator.source.z - player.position.z));
-            const float screen_angle = world_angle - player.yaw;
-            const float dir_x = std::sin(screen_angle);
-            const float dir_y = -std::cos(screen_angle);
-            const float perp_x = -dir_y;
-            const float perp_y = dir_x;
-            const float ring = 158.0F * s;
-            const float tip = 196.0F * s;
-            const float half = 24.0F * s;
-            const SDL_FColor blood{0.545F * fade, 0.0F, 0.0F, fade};
-            const std::array<SDL_Vertex, 3> wedge{
-                SDL_Vertex{{center_x + dir_x * tip, center_y_feedback + dir_y * tip}, blood, {}},
-                SDL_Vertex{{center_x + dir_x * ring + perp_x * half,
-                            center_y_feedback + dir_y * ring + perp_y * half},
-                           blood,
-                           {}},
-                SDL_Vertex{{center_x + dir_x * ring - perp_x * half,
-                            center_y_feedback + dir_y * ring - perp_y * half},
-                           blood,
-                           {}}};
-            SDL_RenderGeometry(renderer_, nullptr, wedge.data(), static_cast<int>(wedge.size()),
-                               nullptr, 0);
+            state.damage.push_back(
+                {world_angle - player.yaw, complete < 0.67F ? 1.0F : (1.0F - complete) * 3.0F});
+        }
+        state.day_banner_seconds = hud_day_banner_seconds_;
+        state.fade_in_seconds = hud_fade_in_seconds_;
+        state.day_text = std::format("{} {}", retail(RetailString::Day), hud_banner_day_);
+        state.scope = scoped_aim;
+        // 1.9.9.8's reticle opens by (spread / FPS camera field of view). A
+        // tool or a block is given half a degree.
+        constexpr float radians = 0.01745329251994329577F;
+        const GunStats *gun = selected_gun();
+        // Retail's opening (spread over its 73-degree camera) at the default
+        // field of view, and the same cone of the world at any other: the
+        // opening follows the picture's scale (view::reticle_fraction).
+        state.reticle_fraction = view::reticle_fraction(
+            gun != nullptr ? gun->inaccuracy : 0.5F * radians, settings_.vertical_fov);
+        state.inaccuracy = 0.0F;
+
+        if (online_gameplay_active())
+        {
+            for (const OnlineChatLine &line : online_chat_lines_)
+            {
+                // ConsoleElement.Message: ten seconds, then a three-second fade.
+                // Only 1.9.9.8's ConsoleElement has ShowAll (every line solid
+                // while the chat entry is open); 1.6.3.8 keeps fading.
+                const float age = elapsed_ - line.received_at;
+                state.console.push_back(
+                    {line.message, chat_editing_ && hud_style() == UiStyle::modern
+                                       ? 1.0F
+                                                 : (age < 10.0F ? 1.0F
+                                                                : std::clamp(1.0F - (age - 10.0F) / 3.0F,
+                                                                             0.0F, 1.0F))});
+            }
+            state.show_players = settings_.hud_roster && player_roster_visible_;
+            state.players_word = std::string{retail(RetailString::Players)};
+            state.player_word = std::string{retail(RetailString::Player)};
+            state.roster.push_back({online_persona_name_.empty() ? std::string{"OpenMinerZ"}
+                                                                 : online_persona_name_,
+                                    true});
+            for (const auto &[gid, remote] : online_remote_players_)
+                state.roster.push_back({remote.gamer_tag.empty()
+                                            ? std::format("PLAYER {}", static_cast<int>(gid))
+                                            : remote.gamer_tag,
+                                        false});
+            state.max_players = std::max(host_settings_.maximum_players,
+                                         static_cast<int>(state.roster.size()));
         }
 
-        const float center_y = static_cast<float>(metrics_.output_height) * 0.5F;
-        const InventoryItemId held_item = inventory_.selected_item();
-        const bool scoped_weapon = held_item == InventoryItemId::rocket_launcher ||
-                                   held_item == InventoryItemId::guided_rocket_launcher ||
-                                   held_item == InventoryItemId::iron_space_bolt_action_rifle ||
-                                   held_item == InventoryItemId::copper_space_bolt_action_rifle ||
-                                   held_item == InventoryItemId::gold_space_bolt_action_rifle ||
-                                   held_item == InventoryItemId::diamond_space_bolt_action_rifle;
-        const bool preview_scoped_aim = options_.preview_viewmodel.has_value() &&
-                                        (*options_.preview_viewmodel == "aim-idle" ||
-                                         *options_.preview_viewmodel == "aim-fire" ||
-                                         (*options_.preview_viewmodel == "aim" &&
-                                          options_.preview_viewmodel_progress >= 0.999F));
-        const bool scoped_aim =
-            scoped_weapon && (gun_aim_progress_ >= 0.999F || preview_scoped_aim);
-        // InGameHUD sizes the reticle opening directly from Innaccuracy times
-        // display height, clamped to eleven pixels. It disappears for every
-        // shouldered weapon, not only scoped families.
-        float crosshair_gap = 11.0F;
-        if (const GunStats *stats = selected_gun(); stats != nullptr)
-            crosshair_gap = std::max(11.0F, stats->inaccuracy * metrics_.output_height);
-        constexpr float arm = 9.0F;
-        constexpr float thick = 3.0F;
-        const bool preview_shouldering =
-            options_.preview_viewmodel.has_value() &&
-            (*options_.preview_viewmodel == "aim" || *options_.preview_viewmodel == "aim-idle" ||
-             *options_.preview_viewmodel == "aim-fire");
-        if (!shouldering_ && !preview_shouldering)
+        state.show_vitals = settings_.vitals_style != VitalsStyle::none;
+        state.show_oxygen = settings_.hud_oxygen;
+        state.show_tray = settings_.hud_hotbar;
+        state.show_item_text = settings_.hud_item_name;
+        state.show_block_name = settings_.hud_target;
+        state.show_distance = settings_.hud_distance;
+        state.show_crosshair = settings_.hud_crosshair;
+        state.show_damage = settings_.hud_damage;
+        state.show_scope = settings_.hud_scope;
+        state.show_console = settings_.hud_chat;
+        return state;
+    }
+
+    void draw_retail_hud(bool scoped_aim, bool shouldering)
+    {
+        draw_retail_hud(hud_state(scoped_aim, shouldering));
+    }
+
+    // Also used by the 1.9.9.8 inventory and crate screens, which call
+    // InGameHUD.DrawPlayerStats and DrawDistanceStr themselves: they pass a
+    // state with everything but the meters and the distance switched off.
+    void draw_retail_hud(const hud::State &state)
+    {
+        const UiStyle style = hud_style();
+        const HudArt &art = style == UiStyle::modern ? modern_hud_art_ : classic_hud_art_;
+        RetailFonts *fonts = retail_fonts();
+        if (fonts == nullptr)
+            return;
+        const HudMetrics metrics{*fonts};
+        const hud::Frame frame =
+            hud::layout(style, state, metrics_.output_width, metrics_.output_height, metrics);
+        const float scale = hud::window_scale(frame);
+        const float window_width = static_cast<float>(metrics_.output_width);
+        const float window_height = static_cast<float>(metrics_.output_height);
+        const std::size_t next_tray = 1U - inventory_.current_tray_index();
+        for (const hud::Draw &draw : frame.draws)
         {
-            const SDL_Color crosshair_color = has_melee_target()
-                                                  ? SDL_Color{255U, 0U, 0U, 255U}
-                                                  : SDL_Color{255U, 255U, 255U, 255U};
-            fill({center_x - crosshair_gap - arm, center_y - thick * 0.5F, arm, thick},
-                 crosshair_color);
-            fill({center_x + crosshair_gap, center_y - thick * 0.5F, arm, thick}, crosshair_color);
-            fill({center_x - thick * 0.5F, center_y - crosshair_gap - arm, thick, arm},
-                 crosshair_color);
-            fill({center_x - thick * 0.5F, center_y + crosshair_gap, thick, arm}, crosshair_color);
+            if (draw.kind == hud::Draw::Kind::text)
+            {
+                // The list holds XNA's premultiplied colours; RetailFonts takes
+                // a straight colour and alpha.
+                const auto straight = [&](std::uint8_t channel) {
+                    return draw.color.a == 0U
+                               ? Uint8{0U}
+                               : static_cast<Uint8>(std::min(
+                                     255, (static_cast<int>(channel) * 255 + draw.color.a / 2) /
+                                              draw.color.a));
+                };
+                const hud::Rect origin = hud::to_window(frame, {draw.x, draw.y, 0.0F, 0.0F});
+                fonts->draw(HudMetrics::retail_font(draw.font), draw.text, origin.x, origin.y,
+                            {straight(draw.color.r), straight(draw.color.g),
+                             straight(draw.color.b), draw.color.a},
+                            draw.scale * scale);
+                continue;
+            }
+            hud::Rect target = hud::to_window(frame, draw.destination);
+            if (draw.fills_canvas)
+            {
+                // The original's picture ends where its 16:9 buffer ends; ours
+                // fills the window, so a wash that reaches the buffer's edge
+                // is carried on to the window's.
+                const float right = target.x + target.width;
+                const float bottom = target.y + target.height;
+                const float left =
+                    draw.destination.x <= 0.0F ? 0.0F : target.x;
+                const float top = draw.destination.y <= 0.0F ? 0.0F : target.y;
+                target = {left, top,
+                          (draw.destination.x + draw.destination.width >=
+                                   static_cast<float>(frame.canvas_width)
+                               ? window_width
+                               : right) -
+                              left,
+                          (draw.destination.y + draw.destination.height >=
+                                   static_cast<float>(frame.canvas_height)
+                               ? window_height
+                               : bottom) -
+                              top};
+            }
+            const SDL_FRect destination{target.x, target.y, target.width, target.height};
+            if (draw.sprite == hud::Sprite::solid)
+            {
+                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+                SDL_SetRenderDrawColor(renderer_, draw.color.r, draw.color.g, draw.color.b,
+                                       draw.color.a);
+                SDL_RenderFillRect(renderer_, &destination);
+                SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+                continue;
+            }
+            if (draw.sprite == hud::Sprite::item_icon)
+            {
+                const PlayerInventory::Tray &tray =
+                    draw.tray == 0 ? inventory_.tray() : inventory_.tray(next_tray);
+                const auto slot = static_cast<std::size_t>(draw.slot);
+                if (slot < tray.size() && tray[slot].has_value())
+                    draw_item_icon(*tray[slot], {target.x, target.y, target.width, target.height});
+                continue;
+            }
+            SDL_Texture *texture = art.textures[static_cast<std::size_t>(draw.sprite)];
+            if (texture == nullptr)
+                continue;
+            SDL_SetTextureColorMod(texture, draw.color.r, draw.color.g, draw.color.b);
+            SDL_SetTextureAlphaMod(texture, draw.color.a);
+            const SDL_FRect source{static_cast<float>(draw.source.x),
+                                   static_cast<float>(draw.source.y),
+                                   static_cast<float>(draw.source.width),
+                                   static_cast<float>(draw.source.height)};
+            if (draw.rotation == 0.0F)
+            {
+                SDL_RenderTexture(renderer_, texture, &source, &destination);
+                continue;
+            }
+            // SpriteBatch.Draw with an origin: {x, y} is where the origin
+            // lands and the sprite turns about it.
+            const float pixel = draw.source.width > 0
+                                    ? target.width / static_cast<float>(draw.source.width)
+                                    : scale;
+            const SDL_FPoint pivot{draw.origin_x * pixel, draw.origin_y * pixel};
+            const SDL_FRect turned{target.x - pivot.x, target.y - pivot.y, target.width,
+                                   target.height};
+            SDL_RenderTextureRotated(renderer_, texture, &source, &turned,
+                                     static_cast<double>(draw.rotation) * 57.29577951308232,
+                                     &pivot, SDL_FLIP_NONE);
+        }
+    }
+
+    // The HUD of the interface style in effect: Remastered (OpenMinerZ's own,
+    // app_remastered.inc) or one of the two exact retail copies. A retail
+    // style whose sprites or fonts were never imported falls back to
+    // Remastered, which needs none of them.
+    void draw_world_hud()
+    {
+        if (!settings_.hud_visible)
+            return;
+        if (retail_hud_ready())
+        {
+            rm_caption_bottom_ = -1.0F;
+            draw_retail_world_hud();
+        }
+        else
+        {
+            if (is_retail_style(interface_style()) && !hud_art_warning_shown_)
+            {
+                hud_art_warning_shown_ = true;
+                SDL_Log("The %s HUD sprites or fonts are not in the content pack; drawing the "
+                        "Remastered HUD. Re-run the content import to get the original HUD.",
+                        interface_style() == UiStyle::modern ? "Modern" : "Classic");
+            }
+            draw_remastered_hud();
+        }
+        draw_hud_debug_panel();
+    }
+
+    // The Classic or Modern HUD: InGameHUD.OnDraw of that release
+    // (draw_retail_hud), preceded by the session cards OpenMinerZ offers in
+    // every style (server and coordinates, both off unless asked for). The
+    // compass, the clock and notices are not drawn here: no retail HUD has
+    // them, and these two styles are exact copies.
+    void draw_retail_world_hud()
+    {
+        const auto colors = palette(settings_.high_contrast);
+        const auto &player = player_.state();
+        const float s = std::min(metrics_.scale, metrics_.safe.width / 1450.0F);
+        const float safe_left = metrics_.safe.x + 26.0F * s;
+        const float safe_top = metrics_.safe.y + 22.0F * s;
+
+        float info_y = safe_top;
+        if (settings_.hud_server)
+        {
+            const std::string name =
+                online_gameplay_active()
+                    ? (online_client_ != nullptr ? online_join_server_name_
+                                                 : host_settings_.server_name)
+                    : (active_world_path_.empty() ? "Single player"
+                                                  : active_world_path_.stem().string());
+            fill({safe_left, info_y, 330.0F * s, 70.0F * s}, {5U, 8U, 9U, 190U});
+            world_text(name, safe_left + 13.0F * s, info_y + 13.0F * s, 15.0F, 304.0F * s,
+                       colors.text);
+            world_text(online_gameplay_active()
+                           ? std::format("{} · {} players",
+                                         net::protocol_label(online_gameplay_protocol()),
+                                         online_remote_visuals_.size() + 1U)
+                           : std::format("{} · {}", game_mode_label(game_mode_),
+                                         game_difficulty_label(difficulty_)),
+                       safe_left + 13.0F * s, info_y + 42.0F * s, 12.0F, 304.0F * s,
+                       colors.secondary);
+            info_y += 76.0F * s;
+        }
+        if (settings_.hud_coordinates)
+        {
+            fill({safe_left, info_y, 330.0F * s, 32.0F * s}, {5U, 8U, 9U, 190U});
+            text(std::format("X {}   Y {}   Z {}", static_cast<int>(std::floor(player.position.x)),
+                             static_cast<int>(std::floor(player.position.y)),
+                             static_cast<int>(std::floor(player.position.z))),
+                 safe_left + 13.0F * s, info_y + 9.0F * s, 12.0F, colors.text);
         }
 
-        if (guided_lock_required_ > 0.0F && dragon_.visible() && scoped_aim)
+        // The guided launcher's lock box, then InGameHUD itself.
+        const bool scoped_aim = hud_scoped_aim();
+        if (settings_.hud_scope)
+            draw_missile_lock(scoped_aim);
+        draw_retail_hud(scoped_aim, hud_shouldering());
+    }
+
+    // The guided rocket launcher's box on the dragon it is locking on to, the
+    // original's sprite at the original's size in every interface style.
+    void draw_missile_lock(bool scoped_aim)
+    {
+        // CheckIfLocked puts the box on the dragon with FPSCamera's own view and
+        // projection. Here that is the camera this frame's world was drawn with
+        // (eye, angles and the presented field of view), so the box stays on
+        // the dragon at every field of view and through the launcher's zoom.
+        const NametagCamera lock_camera =
+            world_preview_ != nullptr ? world_preview_->overlay_camera() : NametagCamera{};
+        if (guided_lock_required_ > 0.0F && dragon_.visible() && scoped_aim && lock_camera.valid)
         {
-            const world::Vec3 eye{player.position.x,
-                                  player.position.y + world::PlayerSimulation::eye_height,
-                                  player.position.z};
+            const world::Vec3 eye = lock_camera.eye;
             const world::Vec3 delta{dragon_.dragon().position.x - eye.x,
                                     dragon_.dragon().position.y - eye.y,
                                     dragon_.dragon().position.z - eye.z};
-            const world::Vec3 forward = player_.view_direction();
-            const world::Vec3 right{std::cos(player.yaw), 0.0F, std::sin(player.yaw)};
-            const world::Vec3 up{right.y * forward.z - right.z * forward.y,
-                                 right.z * forward.x - right.x * forward.z,
-                                 right.x * forward.y - right.y * forward.x};
+            const float sine_yaw = std::sin(lock_camera.yaw);
+            const float cosine_yaw = std::cos(lock_camera.yaw);
+            const float sine_pitch = std::sin(lock_camera.pitch);
+            const float cosine_pitch = std::cos(lock_camera.pitch);
+            const world::Vec3 forward{sine_yaw * cosine_pitch, sine_pitch,
+                                      -cosine_yaw * cosine_pitch};
+            const world::Vec3 right{cosine_yaw, 0.0F, sine_yaw};
+            const world::Vec3 up{-sine_yaw * sine_pitch, cosine_pitch, cosine_yaw * sine_pitch};
             const float depth = delta.x * forward.x + delta.y * forward.y + delta.z * forward.z;
             if (depth > 0.01F)
             {
-                const GunStats *stats = selected_gun();
-                const float magnification = stats != nullptr ? stats->shoulder_magnification : 2.0F;
-                const float vertical_fov =
-                    std::lerp(settings_.vertical_fov, settings_.vertical_fov / magnification,
-                              gun_aim_progress_) *
-                    0.01745329251994329577F;
-                const float tangent_vertical = std::tan(vertical_fov * 0.5F);
+                const float tangent_vertical =
+                    view::half_tangent(lock_camera.vertical_fov_degrees);
                 const float aspect = static_cast<float>(metrics_.output_width) /
                                      static_cast<float>(metrics_.output_height);
                 const float tangent_horizontal = tangent_vertical * aspect;
@@ -14392,444 +20002,95 @@ class Application::Impl final
             }
         }
 
-        if (scoped_aim && sniper_scope_texture_ != nullptr)
-        {
-            float scope_width{};
-            float scope_height{};
-            if (SDL_GetTextureSize(sniper_scope_texture_, &scope_width, &scope_height))
-            {
-                const SDL_FRect scope{center_x - scope_width * 0.5F, center_y - scope_height * 0.5F,
-                                      scope_width, scope_height};
-                SDL_SetTextureColorMod(sniper_scope_texture_, 255U, 255U, 255U);
-                SDL_SetTextureAlphaMod(sniper_scope_texture_, 255U);
-                SDL_RenderTexture(renderer_, sniper_scope_texture_, nullptr, &scope);
-                fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
-                      std::max(0.0F, scope.y)},
-                     {0U, 0U, 0U, 255U});
-                fill({0.0F, scope.y + scope.h, static_cast<float>(metrics_.output_width),
-                      std::max(0.0F,
-                               static_cast<float>(metrics_.output_height) - scope.y - scope.h)},
-                     {0U, 0U, 0U, 255U});
-                fill({0.0F, scope.y, std::max(0.0F, scope.x), scope.h}, {0U, 0U, 0U, 255U});
-                fill({scope.x + scope.w, scope.y,
-                      std::max(0.0F, static_cast<float>(metrics_.output_width) - scope.x - scope.w),
-                      scope.h},
-                     {0U, 0U, 0U, 255U});
-            }
-        }
-
-        const bool modern_inventory = inventory_.profile() == InventoryProfile::modern;
-        const float vitals_height = modern_inventory ? 116.0F : 70.0F;
-        Rect vitals{safe_left, safe_bottom - vitals_height * s, 310.0F * s, vitals_height * s};
-        fill(vitals, {5U, 8U, 9U, 204U});
-        stroke(vitals, {129U, 143U, 145U, 100U});
-        text("VITALS", vitals.x + 17.0F * s, vitals.y + 12.0F * s, 11.0F, colors.secondary);
-        text(std::format("{:.0f}", player.health), vitals.x + vitals.width - 17.0F * s,
-             vitals.y + 10.0F * s, 14.0F, colors.text, TextAlign::right);
-        fill({vitals.x + 17.0F * s, vitals.y + 38.0F * s, vitals.width - 34.0F * s, 18.0F * s},
-             {35U, 12U, 14U, 230U});
-        fill({vitals.x + 17.0F * s, vitals.y + 38.0F * s,
-              (vitals.width - 34.0F * s) * std::clamp(player.health / 100.0F, 0.0F, 1.0F),
-              18.0F * s},
-             colors.accent);
-        if (modern_inventory)
-        {
-            text("STAMINA", vitals.x + 17.0F * s, vitals.y + 68.0F * s, 10.0F, colors.secondary);
-            fill({vitals.x + 17.0F * s, vitals.y + 91.0F * s, vitals.width - 34.0F * s, 8.0F * s},
-                 {20U, 30U, 31U, 230U});
-            fill({vitals.x + 17.0F * s, vitals.y + 91.0F * s,
-                  (vitals.width - 34.0F * s) * std::clamp(player.stamina / 100.0F, 0.0F, 1.0F),
-                  8.0F * s},
-                 {196U, 210U, 201U, 255U});
-        }
-
-        const float slot = 60.0F * s;
-        const float gap = 7.0F * s;
-        const float hotbar_width =
-            slot * PlayerInventory::tray_size + gap * (PlayerInventory::tray_size - 1U);
-        const float hotbar_x = center_x - hotbar_width * 0.5F;
-        const float hotbar_y = safe_bottom - slot;
-        for (std::size_t index = 0; index < PlayerInventory::tray_size; ++index)
-        {
-            Rect cell{hotbar_x + static_cast<float>(index) * (slot + gap), hotbar_y, slot, slot};
-            const bool selected = index == inventory_.selected_index();
-            const bool filled = inventory_.tray()[index].has_value();
-            fill(cell, selected ? SDL_Color{47U, 24U, 26U, 240U}
-                                : (filled ? SDL_Color{36U, 40U, 42U, 226U}
-                                          : SDL_Color{5U, 8U, 9U, 210U}));
-            if (filled)
-                fill({cell.x, cell.y, cell.width, cell.height * 0.45F}, {255U, 255U, 255U, 13U});
-            stroke(cell, selected ? colors.accent : SDL_Color{129U, 143U, 145U, 115U},
-                   selected ? 2.0F * s : 1.0F);
-            if (filled)
-            {
-                const bool has_count = inventory_.tray()[index]->count > 1U;
-                const Rect icon{cell.x + 5.0F * s, cell.y + 4.0F * s, 50.0F * s,
-                                (has_count ? 38.0F : 50.0F) * s};
-                draw_item_icon(*inventory_.tray()[index], icon);
-                draw_item_durability(*inventory_.tray()[index], icon);
-            }
-            text(std::format("{}", index + 1U), cell.x + 6.0F * s, cell.y + 5.0F * s, 9.0F,
-                 colors.secondary);
-            if (filled && inventory_.tray()[index]->count > 1U)
-            {
-                const std::string count_label = std::format("{}", inventory_.tray()[index]->count);
-                fill({cell.x + 3.0F * s, cell.y + 42.0F * s, cell.width - 6.0F * s, 15.0F * s},
-                     {8U, 10U, 11U, 224U});
-                text(count_label, cell.x + cell.width - 6.0F * s, cell.y + 43.0F * s, 9.0F,
-                     colors.text, TextAlign::right);
-            }
-        }
-        std::string selected_label{item_name(inventory_.selected_item())};
-        if (const GunStats *stats = selected_gun();
-            stats != nullptr && inventory_.selected().has_value())
-            selected_label = std::format("{}  {}/{}", item_name(inventory_.selected_item()),
-                                         inventory_.selected()->rounds_in_clip,
-                                         inventory_.count(stats->ammo_item));
-        else if ((inventory_.selected_item() == InventoryItemId::gps ||
-                  inventory_.selected_item() == InventoryItemId::teleport_gps) &&
-                 inventory_.selected().has_value())
-        {
-            const InventoryStack &navigation = *inventory_.selected();
-            if (navigation.waypoint_valid)
-            {
-                const float dx = navigation.waypoint[0] - player.position.x;
-                const float dy = navigation.waypoint[1] - player.position.y;
-                const float dz = navigation.waypoint[2] - player.position.z;
-                selected_label = std::format(
-                    "{}: {} - DISTANCE: {}", item_name(navigation.item), navigation.waypoint_name,
-                    static_cast<int>(std::sqrt(dx * dx + dy * dy + dz * dz)));
-            }
-            else
-                selected_label = std::format("{}: UNSET", item_name(navigation.item));
-        }
-        text(selected_label, center_x, hotbar_y - 24.0F * s, 12.0F, colors.text, TextAlign::center,
-             true);
-        if (modern_inventory)
-            text(std::format("QUICK TRAY {} / 2   ·   G SWITCH",
-                             inventory_.current_tray_index() + 1U),
-                 center_x, hotbar_y - 45.0F * s, 9.0F, colors.secondary, TextAlign::center);
-
-        Rect telemetry{safe_right - 330.0F * s, safe_bottom - 139.0F * s, 330.0F * s, 139.0F * s};
-        fill(telemetry, {5U, 8U, 9U, 204U});
-        stroke(telemetry, {129U, 143U, 145U, 100U});
-        text("WORLD TELEMETRY", telemetry.x + 17.0F * s, telemetry.y + 13.0F * s, 11.0F,
-             colors.accent);
-        text(std::format("X  {}     Y  {}     Z  {}",
-                         static_cast<int>(std::floor(player.position.x)),
-                         static_cast<int>(std::floor(player.position.y)),
-                         static_cast<int>(std::floor(player.position.z))),
-             telemetry.x + 17.0F * s, telemetry.y + 39.0F * s, 15.0F, colors.text);
-        text(player.target.has_value()
-                 ? std::format("TARGET {}  /  {:.1f}M", world::block_name(player.target->block),
-                               player.target->distance)
-                 : std::format("{} CHUNKS  /  {} FACES", world_preview_->stats().chunk_count,
-                               world_preview_->stats().visible_face_count),
-             telemetry.x + 17.0F * s, telemetry.y + 68.0F * s, 11.0F, colors.secondary);
-        const bool imported = world_preview_->stats().original_atlas_loaded;
-        text(world_preview_->stats().depth_buffered
-                 ? std::format("D3D11 + {} + SUN {} + ART",
-                               settings_.ambient_occlusion ? "AO" : "NO AO",
-                               uppercase(to_string(settings_.shadow_quality)))
-                 : (imported && world_preview_->stats().original_skies_loaded
-                        ? "ORIGINAL ATLAS + SKY ACTIVE"
-                        : (imported ? "ORIGINAL 8×8 ATLAS ACTIVE" : "ORIGINAL ATLAS NOT IMPORTED")),
-             telemetry.x + 17.0F * s, telemetry.y + 92.0F * s, 11.0F,
-             imported ? SDL_Color{102U, 211U, 143U, 255U} : colors.accent);
-        text(inspector_view_ ? std::format("S{}   F1 PLAY   Q/E TIME   B BIOME",
-                                           world_preview_->stats().stream_serial)
-                             : (online_gameplay_active()
-                                    ? std::format("S{}   WASD   T CHAT   TAB PLAYERS",
-                                                  world_preview_->stats().stream_serial)
-                                    : std::format("S{}   WASD   SPACE   T CYCLE   F1 VIEW",
-                                                  world_preview_->stats().stream_serial)),
-             telemetry.x + 17.0F * s, telemetry.y + 116.0F * s, 10.0F, colors.secondary);
     }
 
-    [[nodiscard]] Rect inventory_panel() const noexcept
+    // The F3 debug panel, bottom right, in every interface style.
+    void draw_hud_debug_panel()
     {
-        const float s = metrics_.scale;
-        // Wide enough for the slot grid on the right and the cookbook on the left.
-        const float width = 1180.0F * s;
-        const float height = 680.0F * s;
-        return {(static_cast<float>(metrics_.output_width) - width) * 0.5F,
-                (static_cast<float>(metrics_.output_height) - height) * 0.5F, width, height};
+        if (!settings_.hud_debug || world_preview_ == nullptr)
+            return;
+        const auto colors = palette(settings_.high_contrast);
+        const float s = std::min(metrics_.scale, metrics_.safe.width / 1450.0F);
+        const float safe_right = metrics_.safe.x + metrics_.safe.width - 26.0F * s;
+        const float safe_bottom = metrics_.safe.y + metrics_.safe.height - 24.0F * s;
+        const float line = std::max(24.0F * s, 16.0F);
+        const float padding = 12.0F * s;
+        Rect panel{safe_right - 330.0F * s, safe_bottom - line * 5.0F - padding * 2.0F,
+                   330.0F * s, line * 5.0F + padding * 2.0F};
+        fill(panel, {5U, 8U, 9U, 220U});
+        stroke(panel, colors.line);
+        const std::array lines{
+            std::string{"DEBUG"},
+            std::format("Chunks: {}", world_preview_->stats().chunk_count),
+            std::format("Faces: {:L}", world_preview_->stats().visible_face_count),
+            std::string{world_preview_->stats().depth_buffered ? "D3D11" : "Software"},
+            std::string{"F3  Hide debug"}};
+        for (std::size_t index = 0; index < lines.size(); ++index)
+            world_text(lines[index], panel.x + padding,
+                       panel.y + padding + line * static_cast<float>(index), 12.0F,
+                       panel.width - padding * 2.0F, index == 0 ? colors.accent : colors.text);
     }
 
-    // Every storage surface uses the same 8-wide cell geometry. Keeping crate,
-    // backpack, and tray dimensions identical makes transfers visually stable.
-    static constexpr float inventory_slot_pitch = 66.0F;
-    static constexpr float inventory_slot_gap = 2.0F;
-
-    [[nodiscard]] std::size_t visible_inventory_slot_count() const noexcept
+    // Which crafting screen this world has. It follows the generation, never a
+    // preference: 1.6.3.8 has CraftingUIScreen (one flat list of discovered
+    // recipes), 1.9.9.8 has CraftingScreen (a fixed tree of recipe types).
+    [[nodiscard]] bool crafting_modern() const noexcept
     {
-        return crate_slot_base + (active_crate_.has_value() ? crate_slot_count : 0U);
+        return inventory_.profile() == InventoryProfile::modern;
     }
 
-    [[nodiscard]] Rect crate_slot_rect(std::size_t crate_index) const noexcept
+    // PlayerInventory.CanCraft. Only 1.9.9.8 begins with `if (GameMode ==
+    // GameModeTypes.Creative) return true;`. 1.6.3.8 has no bypass at all: its
+    // Creative is Survival plus InfiniteResourceMode, where Craft() skips the
+    // ingredient removal but the screen still refuses a recipe whose
+    // ingredients are not in the bag. Exploration likewise needs them.
+    [[nodiscard]] bool can_craft_recipe(const CraftingRecipe &recipe) const noexcept
     {
-        if (!active_crate_.has_value() || crate_index >= crate_slot_count)
-            return {};
-        const Rect panel = inventory_panel();
-        const float s = metrics_.scale;
-        const float size = inventory_slot_pitch * s;
-        const float gap = inventory_slot_gap * s;
-        const std::size_t row = crate_index / 8U;
-        const std::size_t column = crate_index % 8U;
-        return {panel.x + 36.0F * s + static_cast<float>(column) * (size + gap),
-                panel.y + 218.0F * s + static_cast<float>(row) * (size + gap), size, size};
-    }
-
-    [[nodiscard]] Rect inventory_slot_rect(std::size_t linear_index) const noexcept
-    {
-        if (linear_index >= crate_slot_base)
-            return crate_slot_rect(linear_index - crate_slot_base);
-        const Rect panel = inventory_panel();
-        const float s = metrics_.scale;
-        const float size = inventory_slot_pitch * s;
-        const float gap = inventory_slot_gap * s;
-        const float grid_width = size * 8.0F + gap * 7.0F;
-        const float x = panel.x + panel.width - grid_width - 36.0F * s;
-        if (linear_index < PlayerInventory::storage_size)
-        {
-            const std::size_t row = linear_index / 8U;
-            const std::size_t column = linear_index % 8U;
-            return {x + static_cast<float>(column) * (size + gap),
-                    panel.y + 218.0F * s + static_cast<float>(row) * (size + gap), size, size};
-        }
-        // The tray row: 14 px below the backpack block, like the original.
-        const float tray_y = panel.y + 218.0F * s + 4.0F * (size + gap) - gap + 14.0F * s;
-        const std::size_t column = linear_index - PlayerInventory::storage_size;
-        return {x + static_cast<float>(column) * (size + gap), tray_y, size, size};
-    }
-
-    void move_inventory_focus(int horizontal, int vertical) noexcept
-    {
-        const bool crate = active_crate_.has_value() && inventory_focus_ >= crate_slot_base;
-        const std::size_t base = crate ? crate_slot_base : 0U;
-        const std::size_t rows = crate ? 4U : 5U;
-        const std::size_t local = inventory_focus_ - base;
-        const int row = static_cast<int>(local / 8U);
-        const int column = static_cast<int>(local % 8U);
-        const int next_row = (row + vertical + static_cast<int>(rows)) % static_cast<int>(rows);
-        const int next_column = (column + horizontal + 8) % 8;
-        inventory_focus_ = base + static_cast<std::size_t>(next_row * 8 + next_column);
-    }
-
-    [[nodiscard]] Rect crafting_pane() const noexcept
-    {
-        const Rect panel = inventory_panel();
-        const float s = metrics_.scale;
-        const float grid_width = inventory_slot_pitch * s * 8.0F + inventory_slot_gap * s * 7.0F;
-        return {panel.x + 36.0F * s, panel.y + 148.0F * s, panel.width - grid_width - 108.0F * s,
-                panel.height - 178.0F * s};
-    }
-
-    static constexpr int modern_grid_columns = 6;
-
-    // PlayerInventory.Discovered: a recipe becomes visible in the classic pane
-    // once you hold its result, one of its ingredients, or a gun fed by its
-    // result.
-    [[nodiscard]] bool recipe_discovered(const CraftingRecipe &recipe) const noexcept
-    {
-        // InfiniteResourceMode: everything is discovered and craftable.
-        if (infinite_resources_)
-            return true;
-        const auto slot_matches = [&](const PlayerInventory::Slot &slot) {
-            if (!slot.has_value())
-                return false;
-            if (slot->item == recipe.result)
-                return true;
-            if (const GunStats *stats = gun_stats(slot->item);
-                stats != nullptr && stats->ammo_item == recipe.result)
-                return true;
-            for (const CraftingIngredient &ingredient : recipe.ingredients)
-                if (ingredient.count != 0U && ingredient.item == slot->item)
-                    return true;
+        if (!recipe_listed(recipe))
             return false;
-        };
-        for (const auto &slot : inventory_.storage())
-            if (slot_matches(slot))
-                return true;
-        for (const auto &slot : inventory_.tray())
-            if (slot_matches(slot))
-                return true;
-        return false;
+        // (Polish) A mod recipe: what the server will check, item for item.
+        if (recipe.mod_recipe != 0U)
+            return mod_gameplay_craftable_times(recipe) > 0U;
+        // Modding, gameplay area: recipes.remove switched it off.
+        if (mod_gameplay_recipe_disabled(recipe))
+            return false;
+        if (crafting_modern() && game_mode_ == GameMode::creative)
+            return true;
+        return inventory_.can_craft(recipe);
     }
 
-    [[nodiscard]] bool recipe_in_category(const CraftingRecipe &recipe) const noexcept
+    // `announce` false: the retail screens (screens::Session) play the
+    // original's own cue and show nothing else, so only the rules run here.
+    void craft_recipe(std::size_t recipe_index, bool craft_all = false, bool announce = true)
     {
-        return craft_category_ == -1 || item_category(recipe.result) == craft_category_;
-    }
-
-    // PlayerInventory.DiscoverRecipies: craftable discoveries first, then
-    // discovered-but-missing ones, then every recipe producing an ingredient of
-    // a listed recipe, with CookBook[0] as the never-empty fallback.
-    [[nodiscard]] std::vector<std::size_t> classic_recipe_list() const
-    {
-        const auto &book = crafting_recipes();
-        std::vector<std::size_t> list;
-        std::vector<bool> listed(book.size(), false);
-        for (const bool wants_craftable : {true, false})
-            for (std::size_t index = 0; index < book.size(); ++index)
-                if (!listed[index] && recipe_in_category(book[index]) &&
-                    recipe_discovered(book[index]) &&
-                    inventory_.can_craft(book[index]) == wants_craftable)
-                {
-                    listed[index] = true;
-                    list.push_back(index);
-                }
-        for (std::size_t cursor = 0; cursor < list.size(); ++cursor)
-            for (const CraftingIngredient &ingredient : book[list[cursor]].ingredients)
-            {
-                if (ingredient.count == 0U)
-                    continue;
-                for (std::size_t index = 0; index < book.size(); ++index)
-                    if (!listed[index] && book[index].result == ingredient.item &&
-                        recipe_in_category(book[index]))
-                    {
-                        listed[index] = true;
-                        list.push_back(index);
-                    }
-            }
-        if (list.empty())
-            list.push_back(0U);
-        return list;
-    }
-
-    // The modern browser lists the whole cookbook for the active tab.
-    [[nodiscard]] std::vector<std::size_t> modern_recipe_list() const
-    {
-        const auto &book = crafting_recipes();
-        std::vector<std::size_t> list;
-        for (std::size_t index = 0; index < book.size(); ++index)
-            if (recipe_in_category(book[index]))
-                list.push_back(index);
-        return list;
-    }
-
-    [[nodiscard]] std::vector<std::size_t> active_recipe_list() const
-    {
-        return craft_modern_ ? modern_recipe_list() : classic_recipe_list();
-    }
-
-    [[nodiscard]] static const char *category_label(int category) noexcept
-    {
-        for (const CraftCategoryEntry &entry : craft_categories)
-            if (entry.id == category)
-                return entry.label;
-        return "ALL";
-    }
-
-    void cycle_craft_category(int direction)
-    {
-        const int count = static_cast<int>(craft_categories.size());
-        int position = 0;
-        for (int index = 0; index < count; ++index)
-            if (craft_categories[static_cast<std::size_t>(index)].id == craft_category_)
-                position = index;
-        position = ((position + direction) % count + count) % count;
-        craft_category_ = craft_categories[static_cast<std::size_t>(position)].id;
-        craft_scroll_ = 0;
-        craft_selected_.reset();
-        sound_bank_->play_click();
-    }
-
-    // Clicking a component jumps to the recipe that produces it, exactly like
-    // the original ingredient hit test.
-    void jump_to_ingredient_recipe(const CraftingIngredient &ingredient)
-    {
-        const auto list = active_recipe_list();
-        const auto &book = crafting_recipes();
-        for (std::size_t position = 0; position < list.size(); ++position)
-            if (book[list[position]].result == ingredient.item)
-            {
-                craft_selected_ = list[position];
-                craft_scroll_ = craft_modern_ ? static_cast<int>(position) / modern_grid_columns
-                                              : static_cast<int>(position);
-                sound_bank_->play_click();
-                return;
-            }
-    }
-
-    void handle_craft_hit(const CraftHit &hit, Uint8 button)
-    {
-        const bool shift = (SDL_GetModState() & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT)) != 0U;
-        const auto &book = crafting_recipes();
-        switch (hit.kind)
-        {
-        case CraftHitKind::mode_classic:
-        case CraftHitKind::mode_modern: {
-            const bool modern = hit.kind == CraftHitKind::mode_modern;
-            if (craft_modern_ != modern)
-            {
-                craft_modern_ = modern;
-                craft_scroll_ = 0;
-                settings_.crafting_menu_modern = modern;
-                dirty_ = true;
-            }
-            sound_bank_->play_click();
-            return;
-        }
-        case CraftHitKind::tab:
-            if (hit.index < craft_categories.size())
-            {
-                craft_category_ = craft_categories[hit.index].id;
-                craft_scroll_ = 0;
-                craft_selected_.reset();
-            }
-            sound_bank_->play_click();
-            return;
-        case CraftHitKind::category_cycle:
-            cycle_craft_category(button == SDL_BUTTON_RIGHT ? -1 : 1);
-            return;
-        case CraftHitKind::recipe:
-            if (button != SDL_BUTTON_LEFT || hit.index >= book.size())
-                return;
-            // Hovering already selected the recipe (the ingredient strip below
-            // follows the pointer); a click crafts it outright.
-            craft_selected_ = hit.index;
-            craft_recipe(hit.index, shift);
-            return;
-        case CraftHitKind::create:
-            if (button == SDL_BUTTON_LEFT && craft_selected_.has_value())
-                craft_recipe(*craft_selected_, shift);
-            return;
-        case CraftHitKind::ingredient:
-            if (button != SDL_BUTTON_LEFT || !craft_selected_.has_value() ||
-                *craft_selected_ >= book.size())
-                return;
-            if (hit.index < book[*craft_selected_].ingredients.size())
-            {
-                const CraftingIngredient ingredient = book[*craft_selected_].ingredients[hit.index];
-                if (ingredient.count != 0U)
-                    jump_to_ingredient_recipe(ingredient);
-            }
-            return;
-        }
-    }
-
-    void craft_recipe(std::size_t recipe_index, bool craft_all = false)
-    {
-        const auto &book = crafting_recipes();
+        // (Polish) The screens' cookbook: the retail one, then mod recipes.
+        const auto &book = mod_gameplay_recipe_book();
         if (recipe_index >= book.size())
             return;
         const CraftingRecipe &recipe = book[recipe_index];
-        if (!infinite_resources_ && !inventory_.can_craft(recipe))
+        if (!can_craft_recipe(recipe))
         {
+            if (!announce)
+                return;
             // The original plays "Error" when a craft can't complete.
             sound_bank_->play_cue("Error");
-            toast("MISSING MATERIALS", std::string{item_name(recipe.result)});
+            toast("MISSING MATERIALS", mod_item_label(recipe_result_stack(recipe), item_name(recipe.result)));
+            return;
+        }
+        if (recipe.mod_recipe != 0U)
+        {
+            mod_gameplay_craft(recipe, craft_all, announce);
             return;
         }
         std::uint32_t crafted = 0U;
         if (infinite_resources_)
         {
-            // Creative crafting consumes nothing; shift makes a full stack.
-            const auto amount = static_cast<std::uint16_t>(
-                craft_all ? std::max<std::uint16_t>(recipe.result_count,
-                                                    PlayerInventory::block_stack_limit)
-                          : recipe.result_count);
+            // PlayerInventory.Craft in InfiniteResourceMode adds one result and
+            // removes nothing. Shift never multiplies it: 1.9.9.8 ignores Shift
+            // in Creative (Tier2Item.CheckInput), and the `while (CanCraft)
+            // Craft()` loop the other infinite-resource cases would enter can
+            // never end in the original, so one craft is all a player ever got.
+            const std::uint16_t amount = recipe.result_count;
             const std::uint16_t remainder = inventory_.add_item(recipe.result, amount);
             if (remainder != 0U)
                 drop_stack(InventoryStack{recipe.result, remainder});
@@ -14843,89 +20104,83 @@ class Application::Impl final
                 if (remainder != 0U)
                     drop_stack(InventoryStack{recipe.result, remainder});
                 crafted += recipe.result_count;
-            } while (craft_all && inventory_.can_craft(recipe));
+            } while (craft_all && can_craft_recipe(recipe));
         }
         // CraftingUIScreen plays the dedicated "craft" cue on success.
-        sound_bank_->play_cue("craft");
+        // ItemStats.Crafted and (Endurance) TotalItemsCrafted: 1.9.9.8's
+        // Tier2Item.CheckInput counts inside its Shift loop, once per Craft();
+        // 1.6.3.8's CraftingUIScreen counts ONCE after the loop, however many
+        // times the Shift-click crafted.
+        progress_.record_craft(game_mode_, recipe.result,
+                               stock_crafted_count(
+                                   crafting_modern(),
+                                   (crafted + recipe.result_count - 1U) / recipe.result_count));
         caption("[ ITEM CRAFTED ]", 1.2F);
-        toast("CRAFTED", std::format("{} ×{}", item_name(recipe.result), crafted));
+        if (announce)
+        {
+            sound_bank_->play_cue("craft");
+            toast("CRAFTED", std::format("{} ×{}", item_name(recipe.result), crafted));
+        }
         sync_selected_item();
+        mod_gameplay_crafted(recipe, crafted); // Modding, gameplay area: item.crafted
     }
 
-    [[nodiscard]] std::optional<std::size_t> inventory_slot_at(float x, float y) const noexcept
+    // CrateFocusMessage.Send. The original sends it at fixed moments only
+    // (screens::CrateFocusCause), and its receiver stores it on the sender's
+    // Player, the sender's own included (the echo): `last_crate_focus_` is
+    // that Player.FocusCrate / FocusCrateItem of the local player.
+    //
+    // It used to be re-derived every frame from the slot under the selector
+    // and sent whenever that changed, so opening a crate locked its first slot
+    // and every slot the mouse crossed was locked for the other players (and
+    // skipped by Crate.EjectContents when the crate was destroyed), which a
+    // 1.6.3.8 client's mouse never does.
+    void send_local_crate_focus(const net::CrateFocusPayload &focus)
     {
-        for (std::size_t index = 0; index < visible_inventory_slot_count(); ++index)
-            if (inventory_slot_rect(index).contains(x, y))
-                return index;
-        return std::nullopt;
+        last_crate_focus_ = focus;
+        if (!online_gameplay_active())
+            return;
+        net::PayloadError payload_error{};
+        const auto payload = net::encode_crate_focus_payload(focus, payload_error);
+        std::string error;
+        if (!payload.has_value() ||
+            !publish_online_broadcast("CrateFocusMessage", *payload,
+                                      net::MessageDeliveryPolicy::reliable_ordered, error))
+            std::cerr << "network.local.crate-focus.failure=" << error << '\n';
     }
 
-    [[nodiscard]] PlayerInventory::Slot &visible_inventory_slot(std::size_t index)
-    {
-        if (index < crate_slot_base)
-            return inventory_.slot(index);
-        return crate_inventories_[*active_crate_][index - crate_slot_base];
-    }
-
-    [[nodiscard]] const PlayerInventory::Slot &visible_inventory_slot(std::size_t index) const
-    {
-        if (index < crate_slot_base)
-            return inventory_.slot(index);
-        return crate_inventories_.at(*active_crate_)[index - crate_slot_base];
-    }
-
-    [[nodiscard]] static std::uint16_t add_stack_to_crate(CrateSlots &slots,
-                                                          const InventoryStack &source)
-    {
-        std::uint16_t remaining = source.count;
-        const std::uint16_t limit = item_stack_limit(source.item);
-        for (auto &slot : slots)
-        {
-            if (!slot.has_value() || slot->item != source.item || slot->count >= limit)
-                continue;
-            const std::uint16_t moved =
-                std::min<std::uint16_t>(remaining, static_cast<std::uint16_t>(limit - slot->count));
-            slot->count = static_cast<std::uint16_t>(slot->count + moved);
-            remaining = static_cast<std::uint16_t>(remaining - moved);
-            if (remaining == 0U)
-                return 0U;
-        }
-        for (auto &slot : slots)
-        {
-            if (slot.has_value())
-                continue;
-            const std::uint16_t moved = std::min(remaining, limit);
-            slot = source.with_count(moved);
-            remaining = static_cast<std::uint16_t>(remaining - moved);
-            if (remaining == 0U)
-                return 0U;
-        }
-        return remaining;
-    }
-
-    [[nodiscard]] bool quick_move_inventory_slot(std::size_t index)
+    // The crate screen reached a moment the original announces its selector.
+    void announce_crate_focus(screens::CrateFocusCause cause, std::size_t selected)
     {
         if (!active_crate_.has_value())
-            return index < crate_slot_base && inventory_.move_to_other_section(index);
-        const CrateKey crate_location = *active_crate_;
-        const CrateSlots crate_before = crate_inventories_[crate_location];
-        auto &source = visible_inventory_slot(index);
-        if (!source.has_value())
-            return false;
-        const std::uint16_t original = source->count;
-        const std::uint16_t remainder =
-            index >= crate_slot_base
-                ? inventory_.add_stack(*source)
-                : add_stack_to_crate(crate_inventories_[*active_crate_], *source);
-        if (remainder == original)
-            return false;
-        if (remainder == 0U)
-            source.reset();
-        else
-            source->count = remainder;
-        sync_selected_item();
-        publish_crate_differences(crate_location, crate_before);
-        return true;
+            return;
+        const auto focus = screens::crate_focus_announcement(cause, selected, crafting_modern());
+        if (!focus.has_value())
+            return;
+        net::CrateFocusPayload payload;
+        if (focus->in_crate)
+            payload.location = {(*active_crate_)[0], (*active_crate_)[1], (*active_crate_)[2]};
+        payload.item_x = focus->x;
+        payload.item_y = focus->y;
+        send_local_crate_focus(payload);
+    }
+
+    // CastleMinerZGame._processPlayerExistsMessage: a player who has just
+    // appeared is sent the local player's CURRENT focus.
+    void resend_local_crate_focus()
+    {
+        send_local_crate_focus(last_crate_focus_.value_or(net::CrateFocusPayload{}));
+    }
+
+    [[nodiscard]] bool inventory_slot_locked(std::size_t index) const noexcept
+    {
+        // CrateScreen.IsSlotLocked walks RemoteGamers and reads the focus as a
+        // point of its OWN grid: 8 columns in 1.6.3.8, 4 in 1.9.9.8.
+        return active_crate_ && index >= crate_slot_base &&
+               crate_focus_.locked({(*active_crate_)[0], (*active_crate_)[1], (*active_crate_)[2]},
+                                   index - crate_slot_base,
+                                   online_host_ != nullptr ? std::uint8_t{0} : online_local_gid_,
+                                   crafting_modern() ? 4 : 8);
     }
 
     void close_inventory()
@@ -14934,195 +20189,49 @@ class Application::Impl final
         {
             // add_stack preserves the held stack's per-instance state; rebuilding it
             // from the item id refilled a spent gun clip on every overlay close.
+            // BlockPickerScreen and CraftingScreen close through
+            // PlayerInventory.AddInventoryItem(_holdingItem): whatever does not
+            // fit is thrown at the player's feet (CreatePickup, dropped: true)
+            // and the screen closes regardless.
             const std::uint16_t remainder = inventory_.add_stack(*held_stack_);
-            if (remainder != 0U)
-            {
-                held_stack_->count = remainder;
-                toast("INVENTORY FULL", "Place or drop the held stack before closing.");
-                inventory_open_ = true;
-                SDL_SetWindowRelativeMouseMode(window_, false);
-                return;
-            }
+            if (remainder != 0U && world_preview_ != nullptr)
+                drop_stack(held_stack_->with_count(remainder));
             held_stack_.reset();
         }
+        // A crate screen the session itself closed (Escape) has already
+        // announced it (screens::CrateFocusCause::closed). One closed from
+        // outside is CrateScreen.ForceClose, which sends the same message.
+        // Death is neither: KillPlayer sends its own and CrateScreen.Update
+        // then pops the screen without a word.
+        const bool forced_crate_close = active_crate_.has_value() && screens_.is_open() &&
+                                        screens_.screen() == screens::ScreenId::crate &&
+                                        player_life_ == PlayerLife::alive;
         inventory_open_ = false;
         active_crate_.reset();
-        SDL_SetWindowRelativeMouseMode(window_, !inspector_view_);
+        screens_.abandon();
+        // Death closes the inventory too, possibly behind a pause overlay.
+        SDL_SetWindowRelativeMouseMode(window_,
+                                       pointer_capture_allowed(world_overlay()) && !inspector_view_);
         sync_selected_item();
+        if (forced_crate_close)
+            send_local_crate_focus({});
     }
 
+    // A mouse button or the wheel over the inventory, crate or crafting
+    // screen. Every interface style's screen is screens::Session, which is the
+    // only place a click becomes an inventory operation.
     void inventory_pointer(float x, float y, Uint8 button)
     {
         mouse_x_ = x;
         mouse_y_ = y;
-        const Rect panel = inventory_panel();
-        const float s = metrics_.scale;
-        const Rect close{panel.x + panel.width - 48.0F * s, panel.y + 17.0F * s, 28.0F * s,
-                         28.0F * s};
-        if (button == SDL_BUTTON_LEFT && close.contains(x, y))
-        {
-            sound_bank_->play_click();
-            close_inventory();
-            return;
-        }
-        if (!active_crate_.has_value() && (button == SDL_BUTTON_LEFT || button == SDL_BUTTON_RIGHT))
-        {
-            for (const CraftHit &craft_hit : craft_hits_)
-                if (craft_hit.rect.contains(x, y))
-                {
-                    handle_craft_hit(craft_hit, button);
-                    return;
-                }
-        }
-        const auto hit = inventory_slot_at(x, y);
-        if (inventory_pointer_route(hit.has_value()) == InventoryPointerRoute::ignore)
-        {
-            // Do not turn an imprecise UI click into an irreversible world action.
-            // The old path dropped the cursor stack whenever the pointer landed a
-            // single pixel outside the panel, which was especially easy just after
-            // relative mouse mode released. Q remains the explicit, documented drop
-            // command for either the cursor stack or the focused slot.
-            return;
-        }
-        inventory_focus_ = *hit;
-        if (button == SDL_BUTTON_LEFT &&
-            (SDL_GetModState() & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT)) != 0U)
-        {
-            if (quick_move_inventory_slot(*hit))
-                sound_bank_->play_click();
-            return;
-        }
-
-        const std::optional<CrateKey> crate_location = active_crate_;
-        std::optional<CrateSlots> crate_before;
-        if (crate_location.has_value())
-            crate_before = crate_inventories_[*crate_location];
-        auto &target = visible_inventory_slot(*hit);
-        if (button == SDL_BUTTON_LEFT)
-        {
-            if (!held_stack_.has_value())
-            {
-                held_stack_ = target;
-                target.reset();
-            }
-            else if (!target.has_value())
-            {
-                target = held_stack_;
-                held_stack_.reset();
-            }
-            else if (target->item == held_stack_->item &&
-                     target->count < item_stack_limit(target->item))
-            {
-                const auto available =
-                    static_cast<std::uint16_t>(item_stack_limit(target->item) - target->count);
-                const auto moved = std::min(available, held_stack_->count);
-                target->count = static_cast<std::uint16_t>(target->count + moved);
-                held_stack_->count = static_cast<std::uint16_t>(held_stack_->count - moved);
-                if (held_stack_->count == 0U)
-                    held_stack_.reset();
-            }
-            else
-            {
-                std::swap(target, held_stack_);
-            }
-        }
-        else if (button == SDL_BUTTON_RIGHT)
-        {
-            if (!held_stack_.has_value() && target.has_value())
-            {
-                if (target->count == 1U)
-                {
-                    held_stack_ = target;
-                    target.reset();
-                }
-                else
-                {
-                    const auto split = static_cast<std::uint16_t>(target->count / 2U);
-                    held_stack_ = target->with_count(split);
-                    target->count = static_cast<std::uint16_t>(target->count - split);
-                }
-            }
-            else if (held_stack_.has_value() && !target.has_value())
-            {
-                target = held_stack_->with_count(1U);
-                held_stack_->count--;
-                if (held_stack_->count == 0U)
-                    held_stack_.reset();
-            }
-            else if (held_stack_.has_value() && target.has_value() &&
-                     target->item == held_stack_->item &&
-                     target->count < item_stack_limit(target->item))
-            {
-                target->count++;
-                held_stack_->count--;
-                if (held_stack_->count == 0U)
-                    held_stack_.reset();
-            }
-        }
-        sound_bank_->play_click();
-        sync_selected_item();
-        if (crate_location.has_value() && crate_before.has_value())
-            publish_crate_differences(*crate_location, *crate_before);
+        screens_button(x, y, button, true);
     }
 
     void inventory_wheel(float amount)
     {
         if (amount == 0.0F)
             return;
-        if (!active_crate_.has_value() && crafting_pane().contains(mouse_x_, mouse_y_))
-        {
-            // The upper bound depends on the active list; the draw pass clamps.
-            craft_scroll_ = std::max(0, craft_scroll_ + (amount > 0.0F ? -1 : 1));
-            return;
-        }
-        const auto hit = inventory_slot_at(mouse_x_, mouse_y_);
-        if (!hit.has_value())
-            return;
-        inventory_focus_ = *hit;
-        const std::optional<CrateKey> crate_location = active_crate_;
-        std::optional<CrateSlots> crate_before;
-        if (crate_location.has_value())
-            crate_before = crate_inventories_[*crate_location];
-        auto &target = visible_inventory_slot(*hit);
-        bool changed{};
-        if (amount > 0.0F)
-        {
-            // Original ItemCountUp: move one item from the selected stack to
-            // the hand, combining only with a compatible held stack.
-            if (target.has_value() && (!held_stack_.has_value() ||
-                                       (held_stack_->item == target->item &&
-                                        held_stack_->count < item_stack_limit(held_stack_->item))))
-            {
-                if (!held_stack_.has_value())
-                    held_stack_ = target->with_count(1U);
-                else
-                    held_stack_->count++;
-                target->count--;
-                if (target->count == 0U)
-                    target.reset();
-                changed = true;
-            }
-        }
-        else if (held_stack_.has_value() &&
-                 (!target.has_value() || (target->item == held_stack_->item &&
-                                          target->count < item_stack_limit(target->item))))
-        {
-            if (!target.has_value())
-                target = held_stack_->with_count(1U);
-            else
-                target->count++;
-            held_stack_->count--;
-            if (held_stack_->count == 0U)
-                held_stack_.reset();
-            changed = true;
-        }
-        if (changed)
-        {
-            sound_bank_->play_click();
-            sync_selected_item();
-            if (crate_location.has_value() && crate_before.has_value())
-                publish_crate_differences(*crate_location, *crate_before);
-        }
+        with_screens([&](ScreenHost &host) { screens_.wheel(host, amount > 0.0F ? 1 : -1); });
     }
 
     void drop_stack(const InventoryStack &stack)
@@ -15141,46 +20250,45 @@ class Application::Impl final
         const world::Vec3 center{static_cast<float>(location[0]) + 0.5F,
                                  static_cast<float>(location[1]) + 0.5F,
                                  static_cast<float>(location[2]) + 0.5F};
-        for (const auto &slot : crate->second)
-            if (slot.has_value())
-                world_preview_->spawn_dropped_stack_at(*slot, center, 3.0F);
-        publish_local_crate_destroy(location);
+        // Crate.EjectContents runs only after DestroyCrateMessage has gone out.
+        // Ejecting first and failing to publish leaves every other peer holding
+        // the crate as well as the pickups it just spawned.
+        if (!publish_local_crate_destroy(location))
+            return;
+        // Crate.EjectContents: `Inventory[i] != null && !IsSlotLocked(i)`, and
+        // Crate.IsSlotLocked walks AllGamers, so a slot ANY player has focused
+        // (the destroyer included) is skipped. Its stack is never turned into a
+        // pickup and is lost with the crate. Ejecting it anyway hands every
+        // peer a pickup the original never creates.
+        const net::IntVector3 crate_cell{location[0], location[1], location[2]};
+        // The destroyer's own entry in AllGamers is the focus it last
+        // ANNOUNCED (the echo of its own CrateFocusMessage), not where its
+        // mouse is. Crate.IsSlotLocked reads every focus as X + Y * 8, in
+        // 1.9.9.8 as well, where the crate screen itself counts in fours.
+        const auto own_focus_slot = [&]() -> std::optional<std::int64_t> {
+            if (!last_crate_focus_.has_value() || !(last_crate_focus_->location == crate_cell))
+                return std::nullopt;
+            return static_cast<std::int64_t>(last_crate_focus_->item_x) +
+                   static_cast<std::int64_t>(last_crate_focus_->item_y) * 8;
+        }();
+        for (std::size_t index = 0U; index < crate->second.size(); ++index)
+        {
+            auto &slot = crate->second[index];
+            if (!slot.has_value() || own_focus_slot == static_cast<std::int64_t>(index) ||
+                crate_focus_.locked(crate_cell, index))
+                continue;
+            world_preview_->spawn_dropped_stack_at(*slot, center, 3.0F);
+            slot.reset(); // `Inventory[i] = null`
+        }
+        // The destroyer's own echo closes its own crate screen the same way
+        // (a charge it set off, a fireball it owns): what EjectContents left
+        // under its selector is thrown out by ForceClose.
+        const std::optional<InventoryStack> selected_stack = crate_screen_selected_stack(location);
+        const bool open_here = active_crate_.has_value() && *active_crate_ == location;
         crate_inventories_.erase(crate);
-        if (active_crate_.has_value() && *active_crate_ == location)
-        {
-            active_crate_.reset();
-            inventory_open_ = false;
-            held_stack_.reset();
-            SDL_SetWindowRelativeMouseMode(window_, !inspector_view_);
-        }
-    }
-
-    void drop_inventory_selection()
-    {
-        if (held_stack_.has_value())
-        {
-            sound_bank_->play_click();
-            drop_stack(*held_stack_);
-            held_stack_.reset();
-        }
-        else
-        {
-            const std::optional<CrateKey> crate_location = active_crate_;
-            std::optional<CrateSlots> crate_before;
-            if (crate_location.has_value())
-                crate_before = crate_inventories_[*crate_location];
-            const auto hovered = inventory_slot_at(mouse_x_, mouse_y_);
-            const std::size_t index = hovered.value_or(inventory_focus_);
-            auto &target = visible_inventory_slot(index);
-            if (!target.has_value())
-                return;
-            sound_bank_->play_click();
-            drop_stack(*target);
-            target.reset();
-            if (crate_location.has_value() && crate_before.has_value())
-                publish_crate_differences(*crate_location, *crate_before);
-        }
-        sync_selected_item();
+        mod_gameplay_crate_gone(location); // Modding (Integration)
+        if (open_here)
+            force_close_crate_screen(selected_stack);
     }
 
     void draw_block_icon(world::BlockType block, Rect rect)
@@ -15282,6 +20390,19 @@ class Application::Impl final
 
     void draw_item_icon(const InventoryStack &stack, Rect rect)
     {
+        // The game's own rendering of the item, when its icon atlas has been
+        // imported: the HUD tray, the inventory screens and every other 2D
+        // icon then show exactly what the original shows. (1.9.9.8 switches
+        // to its 128 px atlas for an icon drawn wider than 64 * 1.1.)
+        // Modding, visuals area: a mod item's own icon (app_mod_graphics_items.inc).
+        if (stack.mod_item != 0U &&
+            draw_mod_item_icon(stack.mod_item, SDL_FRect{rect.x, rect.y, rect.width, rect.height},
+                               {}, rect.width / 64.0F > 1.1F))
+            return;
+        if (draw_retail_item_icon(stack.item, hud_style(),
+                                  SDL_FRect{rect.x, rect.y, rect.width, rect.height}, {},
+                                  rect.width / 64.0F > 1.1F))
+            return;
         if (draw_original_item_icon(stack.item, rect))
             return;
         if (stack.block != world::BlockType::empty)
@@ -15375,26 +20496,6 @@ class Application::Impl final
                  {134U, 139U, 139U, 255U});
             break;
         }
-    }
-
-    void draw_item_durability(const InventoryStack &stack, Rect rect)
-    {
-        if (item_self_damage_per_use(stack.item) <= 0.0F || stack.durability >= 1.0F)
-            return;
-        const float health = std::clamp(stack.durability, 0.0F, 1.0F);
-        const auto channel = [&](float broken, float healthy) {
-            return static_cast<Uint8>(std::lerp(broken, healthy, health));
-        };
-        const SDL_Color color{channel(255.0F, 67.0F), channel(69.0F, 188.0F), channel(0.0F, 0.0F),
-                              255U};
-        const float margin = rect.width * 0.14F;
-        const float height = std::max(4.0F, rect.height * 0.10F);
-        const Rect background{rect.x + margin, rect.y + rect.height - height - margin * 0.35F,
-                              rect.width - margin * 2.0F, height};
-        fill(background, {0U, 0U, 0U, 230U});
-        fill({background.x + 1.0F, background.y + 1.0F, (background.width - 2.0F) * health,
-              background.height - 2.0F},
-             color);
     }
 
     [[nodiscard]] StaticModelAsset *item_art(InventoryItemId item) const noexcept
@@ -15564,7 +20665,7 @@ class Application::Impl final
             rotation_x = -pi * 0.5F;
             rotation_z = -pi * 0.25F;
         }
-        else if (tool_shaped || item_stack_limit(item) == 5000U)
+        else if (tool_shaped || item_stack_limit(item, inventory_.profile()) == 5000U)
             rotation_z = -pi * 0.25F;
         const float sine_x = std::sin(rotation_x);
         const float cosine_x = std::cos(rotation_x);
@@ -15731,1667 +20832,869 @@ class Application::Impl final
         return true;
     }
 
-    // A uniform icon cell shared by every part of the crafting pane: a bright
-    // plate so the model art pops off the dark panel, dimmed to a silhouette
-    // when the recipe or component is out of reach (the original grays the
-    // sprite the same way).
-    void draw_craft_cell(Rect rect, InventoryItemId item, bool available, bool selected, bool hover)
-    {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        fill(rect, available ? SDL_Color{64U, 70U, 73U, 255U} : SDL_Color{20U, 23U, 24U, 255U});
-        fill({rect.x, rect.y, rect.width, rect.height * 0.45F},
-             {255U, 255U, 255U, available ? 28U : 7U});
-        const float inset = rect.width * 0.10F;
-        draw_item_icon(InventoryStack{item, 1U},
-                       {rect.x + inset, rect.y + inset, rect.width - inset * 2.0F,
-                        rect.height - inset * 2.0F});
-        if (!available)
-            fill(rect, {8U, 10U, 11U, 140U});
-        SDL_Color line = available ? SDL_Color{150U, 159U, 161U, 170U} : colors.line;
-        if (hover)
-            line = colors.text;
-        stroke(rect, selected ? colors.accent : line, selected ? 2.0F * s : 1.0F);
-    }
+    // The retail inventory, crate and crafting screens (screens::Session):
+    // their art, their host and their renderer.
+#include "app_screens.inc"
 
-    void draw_create_button(Rect rect, bool craftable)
-    {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const bool hover = rect.contains(mouse_x_, mouse_y_);
-        if (craftable)
-        {
-            fill(rect, with_alpha(colors.accent, hover ? 1.0F : 0.82F));
-            stroke(rect, colors.text, hover ? 2.0F * s : 1.0F);
-        }
-        else
-        {
-            fill(rect, {24U, 27U, 28U, 255U});
-            stroke(rect, colors.line);
-        }
-        text("CREATE ITEM", rect.x + rect.width * 0.5F, rect.y + rect.height * 0.5F - 8.0F * s,
-             11.0F, craftable ? colors.text : SDL_Color{95U, 101U, 102U, 255U}, TextAlign::center,
-             craftable);
-        craft_hits_.push_back({rect, CraftHitKind::create, 0U});
-    }
+    // The menus' lettering, backdrop and screens (CastleMiner Z's front-end
+    // look applied to OpenMinerZ's own screens).
+#include "app_menus.inc"
 
-    // COMPONENTS strip for a recipe: icon plates with have/need badges; a click
-    // jumps to the component's own recipe like the original hit test.
-    void draw_components_row(const CraftingRecipe &recipe, float x, float y, float cell)
-    {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const float gap = 10.0F * s;
-        std::size_t drawn = 0;
-        for (std::size_t index = 0; index < recipe.ingredients.size(); ++index)
-        {
-            const CraftingIngredient &ingredient = recipe.ingredients[index];
-            if (ingredient.count == 0U)
-                continue;
-            const Rect rect{x + static_cast<float>(drawn) * (cell + gap), y, cell, cell};
-            const std::uint32_t have = inventory_.count(ingredient.item);
-            const bool enough = have >= ingredient.count;
-            draw_craft_cell(rect, ingredient.item, enough, false,
-                            rect.contains(mouse_x_, mouse_y_));
-            text(std::format("{}/{}", std::min<std::uint32_t>(have, 9999U), ingredient.count),
-                 rect.x + rect.width * 0.5F, rect.y + rect.height + 4.0F * s, 8.0F,
-                 enough ? SDL_Color{102U, 211U, 143U, 255U} : colors.accent, TextAlign::center);
-            craft_hits_.push_back({rect, CraftHitKind::ingredient, index});
-            ++drawn;
-        }
-    }
+    // The Remastered interface: OpenMinerZ's own HUD and inventory, crate and
+    // crafting screens, set in the menus' lettering (it follows app_menus.inc
+    // for that reason) and drawn from the same screens::Session.
+#include "app_remastered.inc"
 
-    // Port of the original CraftingUIScreen: the discovery-gated icon strip,
-    // category cycle button, component icons and CREATE ITEM, restyled.
-    void draw_classic_craft(Rect body, const std::vector<std::size_t> &list)
-    {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const auto &book = crafting_recipes();
-        const float cell = 58.0F * s;
-        const float pitch = cell + 8.0F * s;
-        const float strip_top = body.y + 20.0F * s;
-        const int visible =
-            std::max(1, static_cast<int>((body.y + body.height - strip_top) / pitch));
-        craft_scroll_ =
-            std::clamp(craft_scroll_, 0, std::max(0, static_cast<int>(list.size()) - visible));
-        text(std::format("RECIPES {}", list.size()), body.x, body.y, 8.0F, colors.secondary);
-        for (int row = 0; row < visible; ++row)
-        {
-            const std::size_t entry = static_cast<std::size_t>(craft_scroll_ + row);
-            if (entry >= list.size())
-                break;
-            const std::size_t recipe_index = list[entry];
-            const CraftingRecipe &recipe = book[recipe_index];
-            const Rect rect{body.x, strip_top + static_cast<float>(row) * pitch, cell, cell};
-            // The original CraftingUIScreen: hovering a row selects it (the
-            // ingredient strip follows the pointer); clicking crafts.
-            if (rect.contains(mouse_x_, mouse_y_) && !held_stack_.has_value())
-                craft_selected_ = recipe_index;
-            draw_craft_cell(rect, recipe.result, inventory_.can_craft(recipe),
-                            craft_selected_ == recipe_index, rect.contains(mouse_x_, mouse_y_));
-            if (recipe.result_count > 1U)
-                text(std::format("{}", recipe.result_count), rect.x + rect.width - 4.0F * s,
-                     rect.y + rect.height - 15.0F * s, 8.0F, colors.text, TextAlign::right, true);
-            craft_hits_.push_back({rect, CraftHitKind::recipe, recipe_index});
-        }
-        if (craft_scroll_ > 0)
-            text("^", body.x + cell + 6.0F * s, strip_top, 10.0F, colors.secondary);
-        if (craft_scroll_ + visible < static_cast<int>(list.size()))
-            text("v", body.x + cell + 6.0F * s, body.y + body.height - 16.0F * s, 10.0F,
-                 colors.secondary);
+    // The "Xbox Avatars" add-on: which skin each player wears, its switches,
+    // and its exchange over the session (presentation only).
+#include "app_xbox_avatar.inc"
 
-        const float dx = body.x + cell + 24.0F * s;
-        const CraftingRecipe &recipe = book[*craft_selected_];
-        text(item_name(recipe.result), dx, body.y, 16.0F, colors.text, TextAlign::left, true);
-        if (recipe.result_count > 1U)
-            text(std::format("MAKES ×{}", recipe.result_count), body.x + body.width,
-                 body.y + 6.0F * s, 9.0F, colors.secondary, TextAlign::right);
-        text(item_description(recipe.result), dx, body.y + 30.0F * s, 9.0F, colors.secondary);
-        if (const GunStats *stats = gun_stats(recipe.result); stats != nullptr)
-            text(std::format("USES {}", item_name(stats->ammo_item)), dx, body.y + 47.0F * s, 9.0F,
-                 colors.secondary);
+    // Modding graphics area: packs, models, lights, effects, atmosphere,
+    // sounds and camera effects for mods (presentation only).
+#include "app_mod_graphics.inc"
 
-        const Rect create{dx, body.y + 74.0F * s, 150.0F * s, 32.0F * s};
-        draw_create_button(create, inventory_.can_craft(recipe));
-        const Rect category{create.x + create.width + 10.0F * s, create.y, 172.0F * s, 32.0F * s};
-        const bool category_hover = category.contains(mouse_x_, mouse_y_);
-        fill(category,
-             category_hover ? SDL_Color{31U, 35U, 36U, 255U} : SDL_Color{18U, 21U, 22U, 255U});
-        stroke(category, category_hover ? colors.text : colors.line);
-        text(std::format("CATEGORY: {}", category_label(craft_category_)),
-             category.x + category.width * 0.5F, category.y + 10.0F * s, 9.0F, colors.text,
-             TextAlign::center);
-        craft_hits_.push_back({category, CraftHitKind::category_cycle, 0U});
-        text("SHIFT+CLICK CRAFTS ALL   RMB CATEGORY BACK", dx, create.y + create.height + 9.0F * s,
-             8.0F, with_alpha(colors.secondary, 0.7F));
+    // Modding UI area: themes, widgets, screens, the mod HUD and story UI on
+    // the game's renderer, and the hooks that let a theme restyle the game's
+    // own interface (inert without mod UI). Before the runtime, so the
+    // service outlives the VMs that call it.
+#include "app_mod_ui.inc"
 
-        text("COMPONENTS", dx, body.y + 152.0F * s, 9.0F, colors.secondary);
-        draw_components_row(recipe, dx, body.y + 170.0F * s, cell);
-    }
+    // mod-world: world generators from server and core mods - chunks, far
+    // terrain, saves, the host's choice and each mod biome's atmosphere and
+    // music (all inert unless a mod defines a world). Before the runtime, so
+    // the service outlives the VMs that call it.
+#include "app_mod_world.inc"
 
-    // The reworked original's category browser: tabs, a full icon grid of the
-    // cookbook and a detail card, in our own styling.
-    void draw_modern_craft(Rect body, const std::vector<std::size_t> &list)
-    {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const auto &book = crafting_recipes();
+    // Mod runtime area: the mod script VMs, their session hooks, the /mods
+    // console and register_mod_apis (every area's script library).
+#include "app_mod_runtime.inc"
 
-        const float tab_width = 104.0F * s;
-        const float tab_height = 30.0F * s;
-        for (std::size_t index = 0; index < craft_categories.size(); ++index)
-        {
-            const Rect rect{body.x, body.y + static_cast<float>(index) * (tab_height + 6.0F * s),
-                            tab_width, tab_height};
-            const bool hover = rect.contains(mouse_x_, mouse_y_);
-            // Categories activate on mouse-over, the way the user remembers
-            // the original browser behaving.
-            if (hover && !held_stack_.has_value() && craft_categories[index].id != craft_category_)
-            {
-                craft_category_ = craft_categories[index].id;
-                craft_scroll_ = 0;
-                sound_bank_->play_click();
-            }
-            const bool active = craft_categories[index].id == craft_category_;
-            fill(rect, active ? colors.panel_selected
-                              : (hover ? SDL_Color{26U, 30U, 31U, 255U}
-                                       : SDL_Color{13U, 16U, 17U, 255U}));
-            stroke(rect, active ? colors.accent : colors.line, active ? 2.0F * s : 1.0F);
-            if (active)
-                fill({rect.x, rect.y, 4.0F * s, rect.height}, colors.accent);
-            text(craft_categories[index].label, rect.x + 12.0F * s, rect.y + 9.0F * s, 9.0F,
-                 active ? colors.text : colors.secondary);
-            craft_hits_.push_back({rect, CraftHitKind::tab, index});
-        }
+    // Add-Ons: every installed mod, which of them are on, the catalog of those
+    // the rest of the game uses, and the prompt for a world whose generator
+    // mod is off.
+#include "app_mod_addons.inc"
 
-        const float detail_height = 168.0F * s;
-        const Rect grid{body.x + tab_width + 16.0F * s, body.y, body.width - tab_width - 16.0F * s,
-                        body.height - detail_height - 12.0F * s};
-        const float pitch = 66.0F * s;
-        const float cell = 58.0F * s;
-        const int columns = modern_grid_columns;
-        const int rows_visible = std::max(1, static_cast<int>(grid.height / pitch));
-        const int total_rows = (static_cast<int>(list.size()) + columns - 1) / columns;
-        craft_scroll_ = std::clamp(craft_scroll_, 0, std::max(0, total_rows - rows_visible));
-        for (int row = 0; row < rows_visible; ++row)
-            for (int column = 0; column < columns; ++column)
-            {
-                const std::size_t entry =
-                    static_cast<std::size_t>((craft_scroll_ + row) * columns + column);
-                if (entry >= list.size())
-                    break;
-                const std::size_t recipe_index = list[entry];
-                const CraftingRecipe &recipe = book[recipe_index];
-                const Rect rect{grid.x + static_cast<float>(column) * pitch,
-                                grid.y + static_cast<float>(row) * pitch, cell, cell};
-                // Hover selects; click crafts.
-                if (rect.contains(mouse_x_, mouse_y_) && !held_stack_.has_value())
-                    craft_selected_ = recipe_index;
-                draw_craft_cell(rect, recipe.result, inventory_.can_craft(recipe),
-                                craft_selected_ == recipe_index, rect.contains(mouse_x_, mouse_y_));
-                if (recipe.result_count > 1U)
-                    text(std::format("{}", recipe.result_count), rect.x + rect.width - 4.0F * s,
-                         rect.y + rect.height - 15.0F * s, 8.0F, colors.text, TextAlign::right,
-                         true);
-                craft_hits_.push_back({rect, CraftHitKind::recipe, recipe_index});
-            }
-        if (craft_scroll_ > 0)
-            text("^", grid.x + grid.width - 10.0F * s, grid.y, 10.0F, colors.secondary);
-        if (craft_scroll_ + rows_visible < total_rows)
-            text("v", grid.x + grid.width - 10.0F * s, grid.y + grid.height - 14.0F * s, 10.0F,
-                 colors.secondary);
+    // Modding, gameplay area: the gameplay service's backend onto the game and
+    // the hooks below call (all inert without a mod VM).
+#include "app_mod_gameplay.inc"
 
-        const float dy = body.y + body.height - detail_height;
-        fill({body.x, dy - 8.0F * s, body.width, std::max(1.0F, 1.0F * s)}, colors.line);
-        const CraftingRecipe &recipe = book[*craft_selected_];
-        const Rect portrait{body.x, dy + 4.0F * s, 84.0F * s, 84.0F * s};
-        draw_craft_cell(portrait, recipe.result, inventory_.can_craft(recipe), false, false);
-        const float info_x = portrait.x + portrait.width + 16.0F * s;
-        text(item_name(recipe.result), info_x, dy + 2.0F * s, 14.0F, colors.text, TextAlign::left,
-             true);
-        std::string flavor{item_description(recipe.result)};
-        if (recipe.result_count > 1U)
-            flavor = flavor.empty() ? std::format("Makes ×{}", recipe.result_count)
-                                    : std::format("{} — makes ×{}", flavor, recipe.result_count);
-        text(flavor, info_x, dy + 26.0F * s, 8.0F, colors.secondary);
-        if (const GunStats *stats = gun_stats(recipe.result); stats != nullptr)
-            text(std::format("USES {}", item_name(stats->ammo_item)), info_x, dy + 41.0F * s, 8.0F,
-                 colors.secondary);
-        const Rect create{body.x + body.width - 146.0F * s, dy + 2.0F * s, 146.0F * s, 30.0F * s};
-        draw_create_button(create, inventory_.can_craft(recipe));
-        text("SHIFT = ALL", create.x + create.width * 0.5F, create.y + create.height + 5.0F * s,
-             7.0F, with_alpha(colors.secondary, 0.7F), TextAlign::center);
-        text("COMPONENTS", info_x, dy + 60.0F * s, 8.0F, colors.secondary);
-        draw_components_row(recipe, info_x, dy + 76.0F * s, 46.0F * s);
-    }
+    // Modding, network area: the mod channel's server/client, mod download on
+    // join and the hooks the online pumps call (all inert without server mods).
+#include "app_mod_net.inc"
 
-    void draw_crafting_pane()
-    {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const Rect pane = crafting_pane();
-        craft_hits_.clear();
+    // Authority: the host decides health, damage, items, edits and movement in
+    // sessions only OpenMinerZ players can join (inert in every other one).
+#include "app_mod_auth.inc"
 
-        text("CRAFTING", pane.x, pane.y + 2.0F * s, 13.0F, colors.accent);
-        text(craft_modern_ ? "FULL CATALOG BY CATEGORY" : "DISCOVER RECIPES AS YOU PLAY", pane.x,
-             pane.y + 22.0F * s, 8.0F, colors.secondary);
-        const float seg_width = 96.0F * s;
-        for (int segment = 0; segment < 2; ++segment)
-        {
-            const bool modern = segment == 1;
-            const Rect rect{pane.x + pane.width - seg_width * (2.0F - static_cast<float>(segment)) -
-                                (modern ? 0.0F : 2.0F * s),
-                            pane.y, seg_width, 30.0F * s};
-            const bool active = craft_modern_ == modern;
-            const bool hover = rect.contains(mouse_x_, mouse_y_);
-            fill(rect, active ? colors.panel_selected
-                              : (hover ? SDL_Color{26U, 30U, 31U, 255U}
-                                       : SDL_Color{13U, 16U, 17U, 255U}));
-            stroke(rect, active ? colors.accent : colors.line, active ? 2.0F * s : 1.0F);
-            text(modern ? "MODERN" : "CLASSIC", rect.x + rect.width * 0.5F, rect.y + 9.0F * s,
-                 10.0F, active ? colors.text : colors.secondary, TextAlign::center);
-            craft_hits_.push_back(
-                {rect, modern ? CraftHitKind::mode_modern : CraftHitKind::mode_classic, 0U});
-        }
+    // (Items) Held and dropped mod items - models, hold styles, the item's own
+    // clips on every player - and mod weapons on the swing and the host's
+    // authority (all inert without a server mod).
+#include "app_mod_items.inc"
 
-        const Rect body{pane.x, pane.y + 44.0F * s, pane.width, pane.height - 44.0F * s};
-        const auto list = active_recipe_list();
-        if (list.empty())
-            return;
-        if (!craft_selected_.has_value() ||
-            std::find(list.begin(), list.end(), *craft_selected_) == list.end())
-            craft_selected_ = list.front();
-        if (craft_modern_)
-            draw_modern_craft(body, list);
-        else
-            draw_classic_craft(body, list);
-    }
+    // mod-ai: creature AI on screen (projectiles, boss bars and music,
+    // impacts) and a server mod's retail enemy rules on every spawn path (all
+    // inert without a server mod).
+#include "app_mod_ai.inc"
 
+    // mod-liquid: liquid mod blocks (`liquid = true`) - the table collision,
+    // the mesher and the host's checks read, and the local player's view
+    // into and from inside them (all inert without a server mod's liquid).
+#include "app_mod_liquid.inc"
+
+    // (Wave 5, survival) A capture aid that presses the use button once in a
+    // --world run (inert without OPENMINERZ_DIAGNOSTIC_USE_HELD).
+#include "app_mod_survival.inc"
+
+    // (GunFX) client mods' weapon effects: reload cues a pack mutes, the
+    // empty-magazine reload variant, other players' reload clips scaled to
+    // their guns (all inert without a mod calling gunfx.*).
+#include "app_mod_gunfx.inc"
+
+    // The inventory, crate or crafting screen of the interface style.
     void draw_inventory_overlay()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const Rect panel = inventory_panel();
-        fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
-              static_cast<float>(metrics_.output_height)},
-             {0U, 0U, 0U, 156U});
-        fill(panel, {10U, 13U, 14U, 248U});
-        stroke(panel, {156U, 164U, 164U, 210U}, std::max(1.0F, 2.0F * s));
-        fill({panel.x, panel.y, panel.width, 6.0F * s}, colors.accent);
-        text(active_crate_.has_value() ? "STORAGE CRATE" : "INVENTORY", panel.x + 34.0F * s,
-             panel.y + 28.0F * s, 28.0F, colors.text, TextAlign::left, true);
-        const std::string inventory_subtitle =
-            active_crate_.has_value()
-                ? "32 CRATE SLOTS  /  PLAYER INVENTORY"
-                : (inventory_.profile() == InventoryProfile::modern
-                       ? std::format("32 STORAGE SLOTS  /  16 QUICK SLOTS  /  TRAY {} OF 2",
-                                     inventory_.current_tray_index() + 1U)
-                       : "32 STORAGE SLOTS  /  8 QUICK TRAY");
-        text(inventory_subtitle, panel.x + 36.0F * s, panel.y + 70.0F * s, 11.0F, colors.secondary);
-        text(active_crate_.has_value() ? "LMB GRAB / PLACE   RMB SPLIT / ONE   TAB SWITCH GRID   "
-                                         "SHIFT+LMB OR Y TRANSFER   Q DROP"
-                                       : "LMB GRAB / PLACE   RMB SPLIT / ONE   WHEEL MOVE ONE   "
-                                         "SHIFT+LMB QUICK MOVE   Q DROP",
-             panel.x + 36.0F * s, panel.y + 108.0F * s, 10.0F, colors.secondary);
-        if (!active_crate_.has_value())
-            draw_crafting_pane();
-        const Rect close{panel.x + panel.width - 48.0F * s, panel.y + 17.0F * s, 28.0F * s,
-                         28.0F * s};
-        fill(close, close.contains(mouse_x_, mouse_y_) ? SDL_Color{78U, 82U, 82U, 255U}
-                                                       : SDL_Color{42U, 46U, 47U, 255U});
-        stroke(close, colors.line);
-        text("X", close.x + close.width * 0.5F, close.y + 4.0F * s, 13.0F, colors.text,
-             TextAlign::center, true);
-
-        const auto hovered = inventory_slot_at(mouse_x_, mouse_y_);
-        for (std::size_t index = 0; index < visible_inventory_slot_count(); ++index)
+        if (screens_style() == UiStyle::remastered)
         {
-            const Rect slot_rect = inventory_slot_rect(index);
-            const bool selected =
-                index >= PlayerInventory::storage_size &&
-                index - PlayerInventory::storage_size == inventory_.selected_index();
-            const bool hover = (hovered.has_value() && *hovered == index) ||
-                               (!hovered.has_value() && inventory_focus_ == index);
-            const auto &stack = visible_inventory_slot(index);
-            const bool filled = stack.has_value();
-            // Occupied slots sit on a bright plate so the art pops off the
-            // panel; empty slots stay recessed and dark.
-            fill(slot_rect,
-                 filled
-                     ? (hover ? SDL_Color{82U, 89U, 92U, 255U} : SDL_Color{65U, 71U, 74U, 255U})
-                     : (hover ? SDL_Color{26U, 30U, 31U, 255U} : SDL_Color{13U, 16U, 17U, 255U}));
-            if (filled)
-            {
-                fill({slot_rect.x + 2.0F * s, slot_rect.y + 2.0F * s, slot_rect.width - 4.0F * s,
-                      slot_rect.height * 0.50F},
-                     {255U, 255U, 255U, 29U});
-                fill({slot_rect.x + 7.0F * s, slot_rect.y + 8.0F * s, slot_rect.width - 14.0F * s,
-                      slot_rect.height - 16.0F * s},
-                     {220U, 237U, 241U, 10U});
-            }
-            // The original's Selector: white around the hovered slot, RED while
-            // carrying a stack; the active tray slot keeps the accent.
-            stroke(slot_rect,
-                   selected ? colors.accent
-                            : (hover ? (held_stack_.has_value() ? SDL_Color{214U, 40U, 46U, 255U}
-                                                                : SDL_Color{255U, 255U, 255U, 255U})
-                                     : (filled ? SDL_Color{150U, 159U, 161U, 150U} : colors.line)),
-                   selected ? 3.0F * s : (hover ? 2.0F * s : 1.0F * s));
-            if (filled)
-            {
-                const float footer_height = stack->count > 1U ? 18.0F * s : 0.0F;
-                const Rect icon_rect{slot_rect.x + 5.0F * s, slot_rect.y + 4.0F * s,
-                                     slot_rect.width - 10.0F * s,
-                                     slot_rect.height - 8.0F * s - footer_height};
-                draw_item_icon(*stack, icon_rect);
-                draw_item_durability(*stack, icon_rect);
-                if (stack->count > 1U)
-                {
-                    const Rect footer{slot_rect.x + 2.0F * s,
-                                      slot_rect.y + slot_rect.height - footer_height - 2.0F * s,
-                                      slot_rect.width - 4.0F * s, footer_height};
-                    fill(footer, {9U, 13U, 15U, 226U});
-                    text(std::format("{}", stack->count), footer.x + footer.width - 5.0F * s,
-                         footer.y + 2.0F * s, 10.0F, {255U, 255U, 255U, 255U}, TextAlign::right,
-                         true);
-                }
-            }
+            draw_remastered_screens();
+            return;
         }
-        // Label the tray row above its right-aligned grid, clear of the cookbook.
-        const std::string tray_label = inventory_.profile() == InventoryProfile::modern
-                                           ? std::format("QUICK TRAY {} / 2   ·   G SWITCH",
-                                                         inventory_.current_tray_index() + 1U)
-                                           : "QUICK TRAY";
-        text(tray_label, inventory_slot_rect(PlayerInventory::storage_size).x,
-             inventory_slot_rect(PlayerInventory::storage_size).y - 20.0F * s, 11.0F,
-             colors.secondary);
-        if (active_crate_.has_value())
-            text("CRATE CONTENTS", crate_slot_rect(0U).x, crate_slot_rect(0U).y - 20.0F * s, 11.0F,
-                 colors.secondary);
-        if (hovered.has_value() && visible_inventory_slot(*hovered).has_value())
-        {
-            const auto &stack = *visible_inventory_slot(*hovered);
-            text(item_name(stack.item), panel.x + panel.width - 36.0F * s, panel.y + 151.0F * s,
-                 18.0F, colors.text, TextAlign::right, true);
-            text(std::format("{}  /  STACK {}/{}", is_block_item(stack.item) ? "BLOCK" : "ITEM",
-                             stack.count, item_stack_limit(stack.item, inventory_.profile())),
-                 panel.x + panel.width - 36.0F * s, panel.y + 183.0F * s, 10.0F, colors.secondary,
-                 TextAlign::right);
-        }
-        if (held_stack_.has_value())
-        {
-            const Rect held{mouse_x_ - 29.0F * s, mouse_y_ - 29.0F * s, 58.0F * s, 58.0F * s};
-            draw_item_icon(*held_stack_, held);
-            draw_item_durability(*held_stack_, held);
-            text(std::format("{}", held_stack_->count), held.x + held.width,
-                 held.y + held.height - 13.0F * s, 10.0F, colors.text, TextAlign::right, true);
-        }
+        draw_retail_screens();
     }
 
+    // The two dialogs that take a line of text (app_menus.inc draws them the
+    // way the originals' PCKeyboardInputScreen is drawn).
     void draw_locator_name_dialog()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
-              static_cast<float>(metrics_.output_height)},
-             {0U, 0U, 0U, 168U});
-        const float width = std::min(620.0F * s, metrics_.safe.width - 48.0F * s);
-        const float height = 270.0F * s;
-        const Rect panel{metrics_.safe.x + (metrics_.safe.width - width) * 0.5F,
-                         metrics_.safe.y + (metrics_.safe.height - height) * 0.5F, width, height};
-        fill(panel, {13U, 17U, 18U, 248U});
-        stroke(panel, {154U, 166U, 168U, 210U}, 2.0F * s);
-        fill({panel.x, panel.y, 7.0F * s, panel.height}, colors.accent);
-        text("NAME", panel.x + 31.0F * s, panel.y + 25.0F * s, 24.0F, colors.text, TextAlign::left,
-             true);
-        text("ENTER A NAME FOR THIS LOCATOR", panel.x + 31.0F * s, panel.y + 68.0F * s, 12.0F,
-             colors.secondary);
-        const Rect input{panel.x + 31.0F * s, panel.y + 107.0F * s, panel.width - 62.0F * s,
-                         64.0F * s};
-        fill(input, {3U, 6U, 7U, 245U});
-        stroke(input, colors.accent, 2.0F * s);
-        text(locator_name_draft_ + "|", input.x + 19.0F * s, input.y + 17.0F * s, 22.0F,
-             colors.text, TextAlign::left, true);
-        text(std::format("{}/10", locator_name_characters(locator_name_draft_)),
-             input.x + input.width - 14.0F * s, input.y + 23.0F * s, 10.0F, colors.secondary,
-             TextAlign::right);
-        text("ENTER  ACCEPT     ESC  CANCEL", panel.x + 31.0F * s,
-             panel.y + panel.height - 45.0F * s, 11.0F, colors.secondary);
+        draw_menu_text_dialog("Name", "Enter a name for this locator:", locator_name_draft_,
+                              locator_name_characters(locator_name_draft_), 10U);
     }
 
     void draw_host_text_dialog()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
-              static_cast<float>(metrics_.output_height)},
-             {0U, 0U, 0U, 184U});
-        const float width = std::min(760.0F * s, metrics_.safe.width - 48.0F * s);
-        const float height = 286.0F * s;
-        const Rect panel{metrics_.safe.x + (metrics_.safe.width - width) * 0.5F,
-                         metrics_.safe.y + (metrics_.safe.height - height) * 0.5F, width, height};
-        fill(panel, {10U, 14U, 15U, 252U});
-        stroke(panel, {154U, 166U, 168U, 220U}, 2.0F * s);
-        fill({panel.x, panel.y, 7.0F * s, panel.height}, colors.accent);
         const bool password = host_text_field_ == HostTextField::password ||
                               host_text_field_ == HostTextField::join_password;
         const bool direct = host_text_field_ == HostTextField::direct_address;
-        const std::string_view title = direct ? "DIRECT CONNECT ADDRESS"
-                                       : host_text_field_ == HostTextField::join_password
-                                           ? "JOIN PASSWORD"
-                                       : password ? "SESSION PASSWORD"
-                                                  : "SERVER NAME";
-        text(title, panel.x + 31.0F * s, panel.y + 25.0F * s, 24.0F, colors.text, TextAlign::left,
-             true);
-        text(direct ? "HOST[:PORT] OR [IPV6]:PORT  •  DEFAULT PORT 25343"
-             : host_text_field_ == HostTextField::join_password
-                 ? "SENT ONLY TO THE SELECTED HOST ADMISSION GATE"
-             : password ? "LEAVE EMPTY TO ALLOW PASSWORD-FREE JOINING"
-                        : "SHOWN IN FRIEND, PUBLIC, AND LAN DISCOVERY",
-             panel.x + 31.0F * s, panel.y + 69.0F * s, 12.0F, colors.secondary);
-        const Rect input{panel.x + 31.0F * s, panel.y + 110.0F * s, panel.width - 62.0F * s,
-                         66.0F * s};
-        fill(input, {3U, 6U, 7U, 245U});
-        stroke(input, colors.accent, 2.0F * s);
+        // While hosting these are HostOptions' two PCKeyboardInputScreens, with
+        // the original's own title and prompt (Strings.Server_Password /
+        // Enter_a_password_for_this_server, Server_Message /
+        // Enter_a_server_message).
+        const bool live_host = online_host_ != nullptr && online_host_->running() &&
+                               (host_text_field_ == HostTextField::password ||
+                                host_text_field_ == HostTextField::server_name);
         const std::size_t character_count = locator_name_characters(host_text_draft_);
-        const std::string visible = password ? std::string(character_count, '*') : host_text_draft_;
-        text(visible + "|", input.x + 19.0F * s, input.y + 17.0F * s, 22.0F, colors.text,
-             TextAlign::left, true);
-        text(std::format("{}/{}", character_count, direct ? 320 : (password ? 64 : 40)),
-             input.x + input.width - 14.0F * s, input.y + 23.0F * s, 10.0F, colors.secondary,
-             TextAlign::right);
-        text("ENTER  ACCEPT     ESC  CANCEL", panel.x + 31.0F * s,
-             panel.y + panel.height - 48.0F * s, 11.0F, colors.secondary);
+        draw_menu_text_dialog(
+            direct                                               ? "Direct Connect"
+            : host_text_field_ == HostTextField::join_password   ? "Password"
+            : live_host ? (password ? "Server Password" : "Server Message")
+            : password  ? "Server Password"
+                        : "Server Name",
+            direct                                               ? "Enter an address, such as 192.168.1.10:25343."
+            : host_text_field_ == HostTextField::join_password   ? "Enter this server's password."
+            : live_host ? (password ? "Enter a password for this server:" : "Enter a server message:")
+            : password  ? "Leave it empty to let players join without a password."
+                        : "The name players see in the server list.",
+            password ? std::string(character_count, '*') : host_text_draft_, character_count,
+            direct ? 320U : (password ? 64U : 40U));
     }
 
     void draw_start_hub()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const auto &entries = menu_.entries();
-        if (entries.size() < 2U)
+        draw_menu_title_screen();
+    }
+
+    [[nodiscard]] static std::string world_playtime(double seconds)
+    {
+        const auto minutes = static_cast<std::uint64_t>(std::max(0.0, seconds) / 60.0);
+        if (minutes == 0U)
+            return "< 1 min";
+        return minutes >= 60U ? std::format("{}h {:02}m", minutes / 60U, minutes % 60U)
+                              : std::format("{} min", minutes);
+    }
+
+    void world_text(std::string value, float x, float y, float size, float width, SDL_Color color,
+                    TextAlign align = TextAlign::left)
+    {
+        const int pixels = metrics_.font_pixels(size * (settings_.larger_text ? 1.12F : 1.0F));
+        if (width < font_->measure("...", pixels).width)
             return;
-
-        const bool multiplayer = menu_.screen() == ui::MenuScreen::multiplayer;
-        const float slide = (1.0F - smoothstep(transition_)) * -34.0F * s;
-        const float x = metrics_.safe.x + 36.0F * s + slide;
-        const float top = metrics_.safe.y + 184.0F * s;
-        const float content_width = metrics_.safe.width - 72.0F * s;
-        text(multiplayer ? "MULTIPLAYER" : "START", x, top, 14.0F, colors.accent);
-        text(multiplayer ? "CREATE A LOBBY OR FIND PEOPLE ALREADY PLAYING."
-                         : "CHOOSE HOW YOU WANT TO PLAY.",
-             x, top + 27.0F * s, 13.0F, colors.secondary);
-
-        const float primary_top = top + 60.0F * s;
-        const float primary_gap = 18.0F * s;
-        const float primary_width = (content_width - primary_gap) * 0.5F;
-        const float primary_height = 194.0F * s;
-        for (std::size_t index = 0U; index < 2U; ++index)
+        if (font_->measure(value, pixels).width > width)
         {
-            const float focus = index < focus_.size() ? focus_[index] : 0.0F;
-            Rect card{x + static_cast<float>(index) * (primary_width + primary_gap), primary_top,
-                      primary_width, primary_height};
-            card.y -= focus * 5.0F * s;
-            const bool selected = index == menu_.selection();
-            fill(card, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                  selected ? 0.98F : 0.84F));
-            stroke(card, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            fill({card.x, card.y, selected ? 8.0F * s : 3.0F * s, card.height},
-                 selected ? colors.accent : colors.line);
-            text(multiplayer ? (index == 0U ? "CREATE" : "DISCOVER")
-                             : (index == 0U ? "LOCAL PLAY" : "ONLINE PLAY"),
-                 card.x + 28.0F * s, card.y + 25.0F * s, 11.0F, colors.accent);
-            std::string badge{entries[index].badge};
-            if (!multiplayer && index == 1U)
+            do
             {
-                badge = steam_identity_verified_                             ? "STEAM READY"
-                        : join_browser_state_ == JoinBrowserState::searching ? "CONNECTING"
-                                                                             : "STEAM";
-            }
-            text(badge, card.x + card.width - 25.0F * s, card.y + 25.0F * s, 11.0F,
-                 selected ? colors.accent : colors.secondary, TextAlign::right);
-            text(entries[index].label, card.x + 28.0F * s, card.y + 64.0F * s, 38.0F,
-                 entries[index].enabled ? colors.text : colors.secondary, TextAlign::left, true);
-            text(entries[index].description, card.x + 28.0F * s, card.y + 119.0F * s, 14.0F,
-                 colors.secondary);
-            if (selected)
-                text("ENTER  SELECT", card.x + 28.0F * s, card.y + card.height - 34.0F * s, 10.0F,
-                     colors.accent);
-            if (entries[index].enabled)
-                hits_.push_back({card, HitKind::menu_item, index});
+                if (value.empty())
+                    break;
+                std::size_t last = value.size() - 1U;
+                while (last > 0U && (static_cast<unsigned char>(value[last]) & 0xC0U) == 0x80U)
+                    --last;
+                value.resize(last);
+            } while (font_->measure(value + "...", pixels).width > width);
+            value += "...";
         }
+        text(value, x, y, size, color, align);
+    }
 
-        const float utility_top = primary_top + primary_height + 22.0F * s;
-        const float utility_height = 78.0F * s;
-        if (!multiplayer)
+    void text_in(std::string_view value, Rect bounds, float size, SDL_Color color,
+                 TextAlign align = TextAlign::left)
+    {
+        const int pixels = metrics_.font_pixels(size * (settings_.larger_text ? 1.12F : 1.0F));
+        const float height = font_->measure(value, pixels).height;
+        const float x = align == TextAlign::right    ? bounds.x + bounds.width
+                        : align == TextAlign::center ? bounds.x + bounds.width * 0.5F
+                                                     : bounds.x;
+        world_text(std::string{value}, x,
+                   bounds.y + std::max(0.0F, (bounds.height - height) * 0.5F), size, bounds.width,
+                   color, align);
+    }
+
+    void wrapped_text(std::string_view value, Rect bounds, float size, SDL_Color color)
+    {
+        const int pixels = metrics_.font_pixels(size * (settings_.larger_text ? 1.12F : 1.0F));
+        const float line_height = std::max(font_->measure("Ag", pixels).height, float(pixels)) +
+                                  std::max(4.0F, 6.0F * metrics_.scale);
+        std::string remaining{value};
+        for (float y = bounds.y;
+             y + line_height <= bounds.y + bounds.height + 1.0F && !remaining.empty();
+             y += line_height)
         {
-            const std::size_t utility_count = entries.size() - 2U;
-            const float utility_gap = 12.0F * s;
-            const float utility_width =
-                (content_width - utility_gap * static_cast<float>(utility_count - 1U)) /
-                static_cast<float>(utility_count);
-            for (std::size_t index = 2U; index < entries.size(); ++index)
+            if (font_->measure(remaining, pixels).width <= bounds.width ||
+                y + line_height * 2.0F > bounds.y + bounds.height + 1.0F)
             {
-                const float focus = index < focus_.size() ? focus_[index] : 0.0F;
-                Rect card{x + static_cast<float>(index - 2U) * (utility_width + utility_gap),
-                          utility_top - focus * 3.0F * s, utility_width, utility_height};
-                const bool selected = index == menu_.selection();
-                fill(card, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                      selected ? 0.98F : 0.76F));
-                stroke(card, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-                if (selected)
-                    fill({card.x, card.y, 6.0F * s, card.height}, colors.accent);
-                text(entries[index].label, card.x + 20.0F * s, card.y + 19.0F * s, 19.0F,
-                     colors.text, TextAlign::left, selected);
-                text(entries[index].badge, card.x + 20.0F * s, card.y + 49.0F * s, 9.0F,
-                     selected ? colors.accent : colors.secondary);
-                hits_.push_back({card, HitKind::menu_item, index});
+                world_text(remaining, bounds.x, y, size, bounds.width, color);
+                break;
             }
-        }
-        else
-        {
-            const std::size_t back_index = 2U;
-            const bool selected = menu_.selection() == back_index;
-            Rect back{x, utility_top, 230.0F * s, utility_height};
-            fill(back, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                  selected ? 0.98F : 0.76F));
-            stroke(back, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            if (selected)
-                fill({back.x, back.y, 6.0F * s, back.height}, colors.accent);
-            text("BACK", back.x + 20.0F * s, back.y + 25.0F * s, 20.0F, colors.text,
-                 TextAlign::left, selected);
-            hits_.push_back({back, HitKind::menu_item, back_index});
-
-            Rect status{back.x + back.width + 14.0F * s, utility_top,
-                        content_width - back.width - 14.0F * s, utility_height};
-            fill(status, with_alpha(colors.panel, 0.62F));
-            stroke(status, colors.line);
-            text("STEAM STATUS", status.x + 20.0F * s, status.y + 15.0F * s, 9.0F,
-                 colors.secondary);
-            const std::string identity = steam_identity_verified_ && !online_persona_name_.empty()
-                                             ? std::format("READY  /  {}", online_persona_name_)
-                                         : join_browser_state_ == JoinBrowserState::searching
-                                             ? "CONNECTING TO STEAM"
-                                             : "STEAM WILL CONNECT WHEN THE FRONTEND STARTS";
-            text(identity, status.x + 20.0F * s, status.y + 39.0F * s, 15.0F,
-                 steam_identity_verified_ ? colors.text : colors.secondary);
+            std::size_t split = remaining.rfind(' ');
+            while (split != std::string::npos &&
+                   font_->measure(remaining.substr(0, split), pixels).width > bounds.width)
+                split = split == 0U ? std::string::npos : remaining.rfind(' ', split - 1U);
+            if (split == std::string::npos)
+            {
+                world_text(remaining, bounds.x, y, size, bounds.width, color);
+                break;
+            }
+            text(remaining.substr(0, split), bounds.x, y, size, color);
+            remaining.erase(0, split + 1U);
         }
     }
 
+    // The picture taken when a world was last left, or a plain illustration
+    // (the library says in words when there is no picture yet).
+    void draw_world_picture(WorldSlot *slot, Rect area)
+    {
+        if (slot && !slot->preview_checked)
+        {
+            slot->preview_checked = true;
+            if (SDL_Texture *texture = load_bmp_texture(renderer_, world_preview_path(slot->path)))
+            {
+                SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_LINEAR);
+                slot->preview = std::shared_ptr<SDL_Texture>{texture, SDL_DestroyTexture};
+            }
+        }
+        if (slot && slot->preview)
+        {
+            float width{}, height{};
+            SDL_GetTextureSize(slot->preview.get(), &width, &height);
+            SDL_FRect source{0.0F, 0.0F, width, height};
+            const float aspect = area.width / area.height;
+            if (width / height > aspect)
+            {
+                source.w = height * aspect;
+                source.x = (width - source.w) * 0.5F;
+            }
+            else
+            {
+                source.h = width / aspect;
+                source.y = (height - source.h) * 0.5F;
+            }
+            const SDL_FRect destination{area.x, area.y, area.width, area.height};
+            SDL_RenderTexture(renderer_, slot->preview.get(), &source, &destination);
+            return;
+        }
+        // An illustrated placeholder, explicitly labelled; never a fabricated screenshot.
+        fill(area, {19U, 29U, 32U, 255U});
+        const float cell = area.width / 24.0F;
+        for (int x = 0; x < 24; ++x)
+        {
+            const float height =
+                area.height * (0.20F + 0.035F * static_cast<float>((x * 7 + 3) % 9));
+            fill({area.x + cell * static_cast<float>(x), area.y + area.height - height, cell + 1.0F,
+                  height},
+                 {28U, 48U, 43U, 255U});
+        }
+        const float tower_x = area.x + area.width * 0.73F;
+        const float tower_y = area.y + area.height * 0.22F;
+        fill({tower_x, tower_y, area.width * 0.08F, area.height * 0.60F}, {43U, 61U, 56U, 255U});
+        for (int step = 0; step < 3; ++step)
+            fill({tower_x + area.width * 0.032F * static_cast<float>(step),
+                  tower_y - area.height * 0.05F, area.width * 0.016F, area.height * 0.06F},
+                 {43U, 61U, 56U, 255U});
+    }
+
+    // The saved-world library (app_menus.inc).
     void draw_world_picker()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const auto &entries = menu_.entries();
-        if (entries.size() < 2U)
-            return;
-        constexpr std::size_t page_size = 6U;
-        constexpr std::size_t columns = 3U;
-        const std::size_t back_index = entries.size() - 1U;
-        const std::size_t content_count = back_index;
-        const std::size_t selected_content =
-            menu_.selection() == back_index ? content_count - 1U : menu_.selection();
-        const std::size_t page = selected_content / page_size;
-        const std::size_t first = page * page_size;
-        const std::size_t last = std::min(content_count, first + page_size);
-        const std::size_t pages = (content_count + page_size - 1U) / page_size;
-        const float slide = (1.0F - smoothstep(transition_)) * -34.0F * s;
-        const float x = metrics_.safe.x + 36.0F * s + slide;
-        const float top = metrics_.safe.y + 174.0F * s;
-        const float content_width = metrics_.safe.width - 72.0F * s;
-        text("YOUR WORLDS", x, top, 14.0F, colors.accent);
-        text("THUMBNAILS ARE CAPTURED WHEN YOU PAUSE BEFORE LEAVING.", x, top + 25.0F * s, 11.0F,
-             colors.secondary);
-        text(std::format("PAGE {} / {}", page + 1U, pages), x + content_width, top + 4.0F * s,
-             10.0F, colors.secondary, TextAlign::right);
-
-        const float gap = 13.0F * s;
-        const float card_width = (content_width - gap * 2.0F) / 3.0F;
-        const float card_height = 218.0F * s;
-        const float cards_top = top + 54.0F * s;
-        const auto clipped = [](std::string_view value, std::size_t maximum) {
-            if (value.size() <= maximum)
-                return std::string{value};
-            return std::string{value.substr(0U, maximum - 3U)} + "...";
-        };
-        for (std::size_t index = first; index < last; ++index)
-        {
-            const std::size_t offset = index - first;
-            const std::size_t column = offset % columns;
-            const std::size_t row = offset / columns;
-            const float focus = index < focus_.size() ? focus_[index] : 0.0F;
-            Rect card{x + static_cast<float>(column) * (card_width + gap),
-                      cards_top + static_cast<float>(row) * (card_height + gap) - focus * 3.0F * s,
-                      card_width, card_height};
-            const bool selected = menu_.selection() == index;
-            fill(card, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                  selected ? 0.98F : 0.86F));
-            stroke(card, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            Rect preview{card.x + 2.0F * s, card.y + 2.0F * s, card.width - 4.0F * s, 118.0F * s};
-            if (index == 0U)
-            {
-                fill(preview, {8U, 15U, 15U, 255U});
-                fill({preview.x, preview.y + preview.height * 0.58F, preview.width,
-                      preview.height * 0.42F},
-                     {18U, 39U, 29U, 255U});
-                fill({preview.x + preview.width * 0.60F, preview.y + preview.height * 0.27F,
-                      4.0F * s, preview.height * 0.31F},
-                     colors.accent);
-                text("+", preview.x + preview.width * 0.5F, preview.y + 25.0F * s, 46.0F,
-                     colors.accent, TextAlign::center, true);
-            }
-            else
-            {
-                const WorldSlot &slot = world_slots_[index - 1U];
-                if (slot.preview != nullptr)
-                {
-                    SDL_FRect destination{preview.x, preview.y, preview.width, preview.height};
-                    SDL_RenderTexture(renderer_, slot.preview.get(), nullptr, &destination);
-                    fill({preview.x, preview.y + preview.height - 28.0F * s, preview.width,
-                          28.0F * s},
-                         {2U, 4U, 5U, 170U});
-                }
-                else
-                {
-                    fill(preview, {8U, 12U, 13U, 255U});
-                    fill({preview.x, preview.y + preview.height * 0.64F, preview.width,
-                          preview.height * 0.36F},
-                         {17U, 31U, 24U, 255U});
-                    text("NO PREVIEW YET", preview.x + preview.width * 0.5F,
-                         preview.y + preview.height * 0.47F, 10.0F, colors.secondary,
-                         TextAlign::center);
-                }
-            }
-            if (selected)
-                fill({card.x, card.y, 6.0F * s, card.height}, colors.accent);
-            text(clipped(entries[index].label, 28U), card.x + 17.0F * s, card.y + 134.0F * s, 18.0F,
-                 colors.text, TextAlign::left, selected);
-            if (index == 0U)
-            {
-                text("GENERATE A FRESH FRONTIER", card.x + 17.0F * s, card.y + 171.0F * s, 10.0F,
-                     colors.secondary);
-                text("NEW RANDOM SEED", card.x + 17.0F * s, card.y + 193.0F * s, 9.0F,
-                     selected ? colors.accent : colors.secondary);
-            }
-            else
-            {
-                const WorldSlot &slot = world_slots_[index - 1U];
-                text(std::format("{}  /  {}", clipped(slot.owner, 18U), slot.mode),
-                     card.x + 17.0F * s, card.y + 166.0F * s, 10.0F, colors.secondary);
-                text(std::format("{}  /  SEED {}", slot.saved_at, slot.seed), card.x + 17.0F * s,
-                     card.y + 190.0F * s, 9.0F, selected ? colors.accent : colors.secondary);
-            }
-            hits_.push_back({card, HitKind::menu_item, index});
-        }
-
-        const float back_top = cards_top + card_height * 2.0F + gap + 14.0F * s;
-        Rect back{x, back_top, 220.0F * s, 55.0F * s};
-        const bool back_selected = menu_.selection() == back_index;
-        fill(back, with_alpha(back_selected ? colors.panel_selected : colors.panel,
-                              back_selected ? 0.98F : 0.78F));
-        stroke(back, back_selected ? colors.accent : colors.line, back_selected ? 2.0F * s : 1.0F);
-        if (back_selected)
-            fill({back.x, back.y, 6.0F * s, back.height}, colors.accent);
-        text("BACK", back.x + 20.0F * s, back.y + 16.0F * s, 18.0F, colors.text, TextAlign::left,
-             back_selected);
-        hits_.push_back({back, HitKind::menu_item, back_index});
-        text("LEFT / RIGHT  CHOOSE    UP / DOWN  ROW    ENTER  OPEN", x + content_width,
-             back.y + 19.0F * s, 10.0F, colors.secondary, TextAlign::right);
+        draw_world_library();
     }
 
+    // The host overview: OpenMinerZ's own screen, laid out as the originals'
+    // menus are, with what each row leads to beside it.
     void draw_host_setup_hub()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const auto &entries = menu_.entries();
-        if (entries.size() != 6U)
-            return;
-        const float slide = (1.0F - smoothstep(transition_)) * -34.0F * s;
-        const float x = metrics_.safe.x + 36.0F * s + slide;
-        const float top = metrics_.safe.y + 166.0F * s;
-        const float content_width = metrics_.safe.width - 72.0F * s;
-        text("SERVER SETTINGS", x, top, 15.0F, colors.accent);
-        text("Build the lobby in four clear sections, then choose the world you want to host.", x,
-             top + 29.0F * s, 11.0F, colors.secondary);
-        text(steam_identity_verified_ && !online_persona_name_.empty()
-                 ? std::format("STEAM READY  /  {}", online_persona_name_)
-                 : std::string{"STEAM SIGN-IN IN PROGRESS"},
-             x + content_width, top + 4.0F * s, 10.0F, colors.secondary, TextAlign::right);
-
-        const float gap = 14.0F * s;
-        const float card_width = (content_width - gap) * 0.5F;
-        const float card_height = 124.0F * s;
-        const float grid_top = top + 65.0F * s;
-        for (std::size_t index{}; index < 4U; ++index)
-        {
-            const float column = static_cast<float>(index % 2U);
-            const float row = static_cast<float>(index / 2U);
-            Rect card{x + column * (card_width + gap), grid_top + row * (card_height + gap),
-                      card_width, card_height};
-            const bool selected = menu_.selection() == index;
-            fill(card, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                  selected ? 0.98F : 0.80F));
-            stroke(card, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            if (selected)
-                fill({card.x, card.y, 6.0F * s, card.height}, colors.accent);
-            text(entries[index].label, card.x + 22.0F * s, card.y + 17.0F * s, 20.0F, colors.text,
-                 TextAlign::left, selected);
-            text(entries[index].description, card.x + 22.0F * s, card.y + 51.0F * s, 9.0F,
-                 colors.secondary);
-            const std::string summary =
-                index == 0U   ? std::format("{}  /  {}  /  {} SLOTS", host_settings_.server_name,
-                                            net::protocol_label(host_settings_.protocol),
-                                            host_settings_.maximum_players)
-                : index == 1U ? std::format("{}  /  PASSWORD {}",
-                                            net::visibility_label(host_settings_.visibility),
-                                            host_settings_.password.empty() ? "OPEN" : "SET")
-                : index == 2U
-                    ? std::format("PVP {}  /  ANTI-CHEAT {}  /  SAFE JOIN {}",
-                                  net::pvp_label(host_settings_.player_versus_player),
-                                  host_settings_.anti_cheat ? "STRICT" : "OFF",
-                                  host_settings_.dedicated_join_safety ? "ON" : "SOURCE EXACT")
-                    : host_setting_value(ui::MenuCommand::review_host_mods);
-            text(summary, card.x + 22.0F * s, card.y + 91.0F * s, 10.0F,
-                 selected ? colors.accent : colors.secondary);
-            hits_.push_back({card, HitKind::menu_item, index});
-        }
-
-        const float action_top = grid_top + 2.0F * (card_height + gap) + 8.0F * s;
-        Rect next{x, action_top, content_width * 0.72F, 62.0F * s};
-        Rect back{next.x + next.width + gap, action_top, content_width - next.width - gap,
-                  next.height};
-        for (const auto [rect, index] :
-             std::array<std::pair<Rect, std::size_t>, 2>{{{next, 4U}, {back, 5U}}})
-        {
-            const bool selected = menu_.selection() == index;
-            fill(rect, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                  selected ? 0.98F : 0.80F));
-            stroke(rect, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            if (selected)
-                fill({rect.x, rect.y, 6.0F * s, rect.height}, colors.accent);
-            text(entries[index].label, rect.x + 22.0F * s, rect.y + 18.0F * s, 20.0F, colors.text,
-                 TextAlign::left, selected);
-            text(entries[index].badge, rect.x + rect.width - 20.0F * s, rect.y + 23.0F * s, 9.0F,
-                 selected ? colors.accent : colors.secondary, TextAlign::right);
-            hits_.push_back({rect, HitKind::menu_item, index});
-        }
-        text("ARROWS  NAVIGATE    ENTER  OPEN", x + content_width, action_top + 79.0F * s, 10.0F,
-             colors.secondary, TextAlign::right);
+        draw_menu_choice_screen(
+            retail_text(RetailString::Host_Online, menu_generation()),
+            std::format("{}  -  {}  -  up to {} players  -  {}", host_settings_.server_name,
+                        net::protocol_label(host_settings_.protocol), host_settings_.maximum_players,
+                        menu_value_case(std::string{net::visibility_label(host_settings_.visibility)})));
     }
 
+    // Server details, access and game rules; the server list; one server
+    // (app_menus.inc).
     void draw_host_settings_panel()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const auto &entries = menu_.entries();
-        const ui::MenuScreen screen = menu_.screen();
-        const std::string_view title = screen == ui::MenuScreen::host_details  ? "SERVER DETAILS"
-                                       : screen == ui::MenuScreen::host_access ? "ACCESS & PRIVACY"
-                                                                               : "RULES & SAFETY";
-        const std::string_view subtitle = screen == ui::MenuScreen::host_details
-                                              ? "Identity, compatibility, and total capacity."
-                                          : screen == ui::MenuScreen::host_access
-                                              ? "Discovery and admission controls for this lobby."
-                                              : "World authority and player protection controls.";
-        const float slide = (1.0F - smoothstep(transition_)) * -34.0F * s;
-        const float x = metrics_.safe.x + 36.0F * s + slide;
-        const float top = metrics_.safe.y + 166.0F * s;
-        const float content_width = metrics_.safe.width - 72.0F * s;
-        text("SERVER SETTINGS  /  " + std::string{title}, x, top, 15.0F, colors.accent);
-        text(subtitle, x, top + 30.0F * s, 11.0F, colors.secondary);
-
-        const float panel_top = top + 70.0F * s;
-        const float gap = 18.0F * s;
-        const float left_width = content_width * 0.62F;
-        const float right_x = x + left_width + gap;
-        const float right_width = content_width - left_width - gap;
-        const float row_height = 72.0F * s;
-        const float row_gap = 8.0F * s;
-        for (std::size_t index{}; index < entries.size(); ++index)
-        {
-            Rect row{x, panel_top + static_cast<float>(index) * (row_height + row_gap), left_width,
-                     row_height};
-            const bool selected = menu_.selection() == index;
-            fill(row, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                 selected ? 0.98F : 0.80F));
-            stroke(row, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            if (selected)
-                fill({row.x, row.y, 6.0F * s, row.height}, colors.accent);
-            text(entries[index].label, row.x + 21.0F * s, row.y + 11.0F * s, 17.0F, colors.text,
-                 TextAlign::left, selected);
-            text(entries[index].description, row.x + 21.0F * s, row.y + 41.0F * s, 9.0F,
-                 colors.secondary);
-            const std::string current = host_setting_value(entries[index].command);
-            if (!current.empty())
-                text(current, row.x + row.width - 19.0F * s, row.y + 24.0F * s, 11.0F,
-                     selected ? colors.accent : colors.secondary, TextAlign::right);
-            hits_.push_back({row, HitKind::menu_item, index});
-        }
-
-        Rect summary{right_x, panel_top, right_width,
-                     static_cast<float>(entries.size()) * (row_height + row_gap) - row_gap};
-        fill(summary, with_alpha(colors.panel, 0.76F));
-        stroke(summary, colors.line);
-        text("CURRENT SESSION", summary.x + 24.0F * s, summary.y + 24.0F * s, 10.0F, colors.accent);
-        text(host_settings_.server_name, summary.x + 24.0F * s, summary.y + 56.0F * s, 24.0F,
-             colors.text, TextAlign::left, true);
-        fill({summary.x + 24.0F * s, summary.y + 101.0F * s, summary.width - 48.0F * s, 1.0F},
-             colors.line);
-        text(std::format("{}  /  {} PLAYERS", net::protocol_label(host_settings_.protocol),
-                         host_settings_.maximum_players),
-             summary.x + 24.0F * s, summary.y + 129.0F * s, 14.0F, colors.text);
-        text(net::visibility_label(host_settings_.visibility), summary.x + 24.0F * s,
-             summary.y + 165.0F * s, 12.0F, colors.secondary);
-        text(std::format("PASSWORD {}", host_settings_.password.empty() ? "OPEN" : "SET"),
-             summary.x + 24.0F * s, summary.y + 194.0F * s, 12.0F, colors.secondary);
-        text(std::format("PVP {}", net::pvp_label(host_settings_.player_versus_player)),
-             summary.x + 24.0F * s, summary.y + 223.0F * s, 12.0F, colors.secondary);
-        text(std::format("ANTI-CHEAT {}  /  SAFE JOIN {}",
-                         host_settings_.anti_cheat ? "STRICT" : "OFF",
-                         host_settings_.dedicated_join_safety ? "ON" : "SOURCE EXACT"),
-             summary.x + 24.0F * s, summary.y + 252.0F * s, 10.0F, colors.secondary);
-        text("LEFT / RIGHT  CHANGE    ENTER  EDIT OR SELECT", x + content_width,
-             summary.y + summary.height + 22.0F * s, 9.0F, colors.secondary, TextAlign::right);
+        draw_host_rows();
     }
 
     void draw_server_browser()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const auto &entries = menu_.entries();
-        const std::size_t session_rows = join_row_sessions_.size();
-        if (entries.size() < session_rows + 4U)
-            return;
-        const std::size_t refresh_index = session_rows;
-        const std::size_t filter_index = session_rows + 1U;
-        const std::size_t direct_index = session_rows + 2U;
-        const std::size_t back_index = session_rows + 3U;
-        const float slide = (1.0F - smoothstep(transition_)) * -34.0F * s;
-        const float x = metrics_.safe.x + 36.0F * s + slide;
-        const float top = metrics_.safe.y + 170.0F * s;
-        const float content_width = metrics_.safe.width - 72.0F * s;
-        text("LIVE SERVERS", x, top, 15.0F, colors.accent);
-        fill({x, top + 31.0F * s, 8.0F * s, 8.0F * s},
-             join_browser_state_ == JoinBrowserState::failed ? colors.accent
-             : join_browser_state_ == JoinBrowserState::searching
-                 ? SDL_Color{238U, 176U, 54U, 255U}
-                 : SDL_Color{75U, 201U, 120U, 255U});
-        text(join_browser_status_, x + 18.0F * s, top + 27.0F * s, 11.0F, colors.secondary);
-        text(steam_identity_verified_ && !online_persona_name_.empty()
-                 ? std::format("SIGNED IN AS {}", online_persona_name_)
-                 : std::string{"STEAM IDENTITY PENDING"},
-             x + content_width, top + 4.0F * s, 10.0F, colors.secondary, TextAlign::right);
+        draw_server_list();
+    }
 
-        const float toolbar_top = top + 55.0F * s;
-        const float toolbar_gap = 10.0F * s;
-        const std::array<float, 4> toolbar_widths{170.0F * s, 180.0F * s, 210.0F * s, 120.0F * s};
-        const std::array<std::size_t, 4> toolbar_indices{refresh_index, filter_index, direct_index,
-                                                         back_index};
-        float toolbar_x = x;
-        for (std::size_t button{}; button < toolbar_indices.size(); ++button)
-        {
-            const std::size_t index = toolbar_indices[button];
-            Rect rect{toolbar_x, toolbar_top, toolbar_widths[button], 48.0F * s};
-            const bool selected = menu_.selection() == index;
-            fill(rect, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                  selected ? 0.98F : 0.80F));
-            stroke(rect, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            if (selected)
-                fill({rect.x, rect.y, 5.0F * s, rect.height}, colors.accent);
-            text(entries[index].label, rect.x + 15.0F * s, rect.y + 13.0F * s, 15.0F, colors.text,
-                 TextAlign::left, selected);
-            std::string badge{entries[index].badge};
-            if (index == refresh_index)
-                badge = std::format("AUTO {:02}", static_cast<int>(std::ceil(join_refresh_timer_)));
-            text(badge, rect.x + rect.width - 13.0F * s, rect.y + 17.0F * s, 8.0F,
-                 selected ? colors.accent : colors.secondary, TextAlign::right);
-            hits_.push_back({rect, HitKind::menu_item, index});
-            toolbar_x += rect.width + toolbar_gap;
-        }
-
-        const float list_top = toolbar_top + 66.0F * s;
-        const float panel_bottom = metrics_.safe.y + metrics_.safe.height - 72.0F * s;
-        const float left_width = content_width * 0.61F;
-        const float panel_gap = 18.0F * s;
-        const float right_x = x + left_width + panel_gap;
-        const float right_width = content_width - left_width - panel_gap;
-        const float row_height = 72.0F * s;
-        const float row_gap = 8.0F * s;
-        const std::size_t visible_rows = std::max<std::size_t>(
-            1U, static_cast<std::size_t>((panel_bottom - list_top) / (row_height + row_gap)));
-        std::size_t first{};
-        if (menu_.selection() < session_rows && menu_.selection() >= visible_rows)
-            first = menu_.selection() - visible_rows + 1U;
-        if (session_rows > visible_rows)
-            first = std::min(first, session_rows - visible_rows);
-
-        fill({x, list_top, left_width, panel_bottom - list_top}, with_alpha(colors.panel, 0.42F));
-        stroke({x, list_top, left_width, panel_bottom - list_top}, colors.line);
-        if (session_rows == 0U)
-        {
-            text(join_browser_state_ == JoinBrowserState::searching ? "SEARCHING STEAM..."
-                                                                    : "NO LIVE SERVERS ONLINE",
-                 x + left_width * 0.5F, list_top + 92.0F * s, 22.0F, colors.text, TextAlign::center,
-                 true);
-            text("USE REFRESH, CHANGE THE FILTER, OR TRY DIRECT CONNECT.", x + left_width * 0.5F,
-                 list_top + 135.0F * s, 10.0F, colors.secondary, TextAlign::center);
-        }
-        for (std::size_t index = first; index < session_rows && index < first + visible_rows;
-             ++index)
-        {
-            const std::size_t visible_index = index - first;
-            Rect row{x + 10.0F * s,
-                     list_top + 10.0F * s +
-                         static_cast<float>(visible_index) * (row_height + row_gap),
-                     left_width - 20.0F * s, row_height};
-            const bool selected = menu_.selection() == index;
-            fill(row, with_alpha(selected ? colors.panel_selected : colors.panel,
-                                 selected ? 0.98F : 0.78F));
-            stroke(row, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            if (selected)
-                fill({row.x, row.y, 6.0F * s, row.height}, colors.accent);
-            text(join_labels_[index], row.x + 20.0F * s, row.y + 11.0F * s, 19.0F, colors.text,
-                 TextAlign::left, selected);
-            text(join_descriptions_[index], row.x + 20.0F * s, row.y + 42.0F * s, 9.0F,
-                 colors.secondary);
-            text(join_badges_[index], row.x + row.width - 16.0F * s, row.y + 18.0F * s, 9.0F,
-                 selected ? colors.accent : colors.secondary, TextAlign::right);
-            hits_.push_back({row, HitKind::menu_item, index});
-        }
-        if (session_rows > visible_rows)
-        {
-            const float track_height = panel_bottom - list_top - 20.0F * s;
-            const float thumb_height =
-                track_height * static_cast<float>(visible_rows) / static_cast<float>(session_rows);
-            const float travel = track_height - thumb_height;
-            const float progress =
-                static_cast<float>(first) / static_cast<float>(session_rows - visible_rows);
-            fill({x + left_width - 6.0F * s, list_top + 10.0F * s, 2.0F * s, track_height},
-                 colors.line);
-            fill({x + left_width - 8.0F * s, list_top + 10.0F * s + travel * progress, 6.0F * s,
-                  thumb_height},
-                 colors.accent);
-        }
-
-        Rect details{right_x, list_top, right_width, panel_bottom - list_top};
-        fill(details, with_alpha(colors.panel, 0.76F));
-        stroke(details, colors.line);
-        const bool session_selected = menu_.selection() < session_rows;
-        text(session_selected ? "SERVER DETAILS" : "DISCOVERY", details.x + 24.0F * s,
-             details.y + 24.0F * s, 11.0F, colors.accent);
-        if (session_selected)
-        {
-            const std::size_t session_index = join_row_sessions_[menu_.selection()];
-            const net::DiscoveredSession &session = join_browser_.sessions()[session_index];
-            const net::JoinAssessment assessment = browser_join_assessment(session_index);
-            text(session.server_name, details.x + 24.0F * s, details.y + 54.0F * s, 27.0F,
-                 colors.text, TextAlign::left, true);
-            text(std::format("HOSTED BY {}", session.host_name), details.x + 24.0F * s,
-                 details.y + 99.0F * s, 11.0F, colors.secondary);
-            fill({details.x + 24.0F * s, details.y + 126.0F * s, details.width - 48.0F * s, 1.0F},
-                 colors.line);
-            text("PLAYERS", details.x + 24.0F * s, details.y + 151.0F * s, 9.0F, colors.secondary);
-            text(std::format("{} / {}", session.current_players, session.maximum_players),
-                 details.x + 24.0F * s, details.y + 172.0F * s, 20.0F, colors.text);
-            text("COMPATIBILITY", details.x + details.width * 0.52F, details.y + 151.0F * s, 9.0F,
-                 colors.secondary);
-            text(net::join_compatibility_label(assessment.status),
-                 details.x + details.width * 0.52F, details.y + 172.0F * s, 16.0F,
-                 assessment.joinable() ? colors.text : colors.accent);
-            text(std::format("{}  /  {}", net::protocol_label(assessment.protocol),
-                             net::discovery_source_label(session.source)),
-                 details.x + 24.0F * s, details.y + 222.0F * s, 11.0F, colors.secondary);
-            text(session.password_required ? "PASSWORD REQUIRED" : "OPEN SESSION",
-                 details.x + 24.0F * s, details.y + 250.0F * s, 11.0F,
-                 session.password_required ? colors.accent : colors.secondary);
-            text("ENTER  VIEW & JOIN", details.x + 24.0F * s,
-                 details.y + details.height - 36.0F * s, 10.0F, colors.accent);
-        }
-        else
-        {
-            text(join_browser_state_ == JoinBrowserState::searching ? "REFRESHING"
-                                                                    : "LIVE QUERY READY",
-                 details.x + 24.0F * s, details.y + 58.0F * s, 25.0F, colors.text, TextAlign::left,
-                 true);
-            text(std::format("{} SERVER{} IN THIS FILTER", session_rows,
-                             session_rows == 1U ? "" : "S"),
-                 details.x + 24.0F * s, details.y + 108.0F * s, 13.0F, colors.secondary);
-            text("FRIENDS + PUBLIC STEAM LOBBIES", details.x + 24.0F * s, details.y + 142.0F * s,
-                 10.0F, colors.secondary);
-        }
+    void draw_join_details()
+    {
+        draw_server_details();
     }
 
     void draw_main_menu()
     {
-        if (menu_.screen() == ui::MenuScreen::main || menu_.screen() == ui::MenuScreen::multiplayer)
+        switch (menu_.screen())
         {
+        case ui::MenuScreen::main:
+        case ui::MenuScreen::multiplayer:
             draw_start_hub();
             return;
-        }
-        if (menu_.screen() == ui::MenuScreen::world_select)
-        {
+        case ui::MenuScreen::world_select:
             draw_world_picker();
             return;
-        }
-        if (menu_.screen() == ui::MenuScreen::host_setup)
-        {
+        case ui::MenuScreen::host_setup:
             draw_host_setup_hub();
             return;
-        }
-        if (menu_.screen() == ui::MenuScreen::host_details ||
-            menu_.screen() == ui::MenuScreen::host_access ||
-            menu_.screen() == ui::MenuScreen::host_gameplay)
-        {
+        case ui::MenuScreen::host_details:
+        case ui::MenuScreen::host_access:
+        case ui::MenuScreen::host_gameplay:
             draw_host_settings_panel();
             return;
-        }
-        if (menu_.screen() == ui::MenuScreen::join_browser)
-        {
+        case ui::MenuScreen::join_browser:
             draw_server_browser();
             return;
+        case ui::MenuScreen::join_details:
+            draw_join_details();
+            return;
+        default:
+            break;
         }
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const auto &entries = menu_.entries();
-        const float x = metrics_.safe.x + 36.0F * s;
-        const bool join_browser_screen = menu_.screen() == ui::MenuScreen::join_browser;
-        const float y = metrics_.safe.y + (join_browser_screen ? 230.0F : 205.0F) * s;
-        const float width = std::min(700.0F * s, metrics_.safe.width * 0.53F);
-        const float row_height = 62.0F * s;
-        const float gap = 7.0F * s;
-        const float slide = (1.0F - smoothstep(transition_)) * -42.0F * s;
-
-        const std::string_view menu_title =
-            menu_.screen() == ui::MenuScreen::host_setup     ? "HOST SESSION SETUP"
-            : menu_.screen() == ui::MenuScreen::join_browser ? "JOIN ONLINE"
-            : menu_.screen() == ui::MenuScreen::join_details ? "SESSION DETAILS"
-            : menu_.screen() == ui::MenuScreen::game_mode    ? "CHOOSE A GAME MODE"
-            : menu_.screen() == ui::MenuScreen::difficulty   ? "CHOOSE A DIFFICULTY LEVEL"
-            : menu_.screen() == ui::MenuScreen::world_select ? "CHOOSE A WORLD"
-                                                             : "MAIN MENU";
-        text(menu_title, x + slide, y - 44.0F * s, 17.0F, colors.accent);
-        if (join_browser_screen)
-            text(join_browser_status_, x + slide, y - 20.0F * s, 11.0F,
-                 join_browser_state_ == JoinBrowserState::failed ? colors.accent
-                                                                 : colors.secondary);
-        // The world list can hold any number of saves: rows window around the
-        // keyboard selection so the menu never runs off the safe area.
-        const float safe_bottom = metrics_.safe.y + metrics_.safe.height - 34.0F * s;
-        const std::size_t visible_rows = std::max<std::size_t>(
-            3U, static_cast<std::size_t>(std::max(1.0F, (safe_bottom - y) / (row_height + gap))));
-        std::size_t first_row = 0U;
-        if (entries.size() > visible_rows && menu_.selection() >= visible_rows)
-            first_row =
-                std::min(menu_.selection() - visible_rows + 1U, entries.size() - visible_rows);
-        const std::size_t last_row = std::min(entries.size(), first_row + visible_rows);
-        if (first_row > 0U)
-            text("^  MORE ABOVE", x + slide, y - 20.0F * s, 10.0F, colors.secondary);
-        if (last_row < entries.size())
-            text("v  MORE BELOW", x + slide,
-                 y + static_cast<float>(visible_rows) * (row_height + gap) + 2.0F * s, 10.0F,
-                 colors.secondary);
-        for (std::size_t index = first_row; index < last_row; ++index)
-        {
-            const float focus = index < focus_.size() ? focus_[index] : 0.0F;
-            const bool action_group_visible = join_browser_screen &&
-                                              first_row <= join_row_sessions_.size() &&
-                                              join_row_sessions_.size() < last_row;
-            const bool action_row = action_group_visible && index >= join_row_sessions_.size();
-            const float action_gap = action_row ? 20.0F * s : 0.0F;
-            Rect row{x + slide + focus * 13.0F * s,
-                     y + static_cast<float>(index - first_row) * (row_height + gap) + action_gap,
-                     width, row_height};
-            if (action_group_visible && index == join_row_sessions_.size())
-                text("BROWSER ACTIONS", row.x, row.y - 16.0F * s, 10.0F, colors.secondary);
-            const bool selected = index == menu_.selection();
-            const SDL_Color background = selected ? colors.panel_selected : colors.panel;
-            fill(row, with_alpha(background, selected ? 0.97F : 0.76F));
-            stroke(row, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            if (selected)
-            {
-                fill({row.x, row.y, 6.0F * s, row.height}, colors.accent);
-            }
-            const SDL_Color label_color =
-                entries[index].enabled ? colors.text : with_alpha(colors.secondary, 0.46F);
-            text(entries[index].label, row.x + 24.0F * s, row.y + 13.0F * s, 25.0F, label_color);
-            std::string dynamic_value;
-            if (menu_.screen() == ui::MenuScreen::join_details &&
-                entries[index].command == ui::MenuCommand::edit_join_password)
-                dynamic_value = join_password_.empty() ? "NOT SET" : "SET";
-            const std::string_view badge =
-                dynamic_value.empty() ? entries[index].badge : std::string_view{dynamic_value};
-            if (!badge.empty())
-            {
-                text(badge, row.x + row.width - 20.0F * s, row.y + 18.0F * s, 12.0F,
-                     selected ? colors.accent : colors.secondary, TextAlign::right);
-            }
-            if (entries[index].enabled)
-            {
-                hits_.push_back({row, HitKind::menu_item, index});
-            }
-        }
-
-        if (!entries.empty() && menu_.selection() < entries.size())
-        {
-            const float detail_x = x + width + 62.0F * s;
-            const float detail_y = y + 76.0F * s;
-            const float detail_width =
-                std::max(300.0F * s, metrics_.safe.x + metrics_.safe.width - detail_x - 28.0F * s);
-            const net::DiscoveredSession *detail_session = nullptr;
-            std::optional<std::size_t> detail_session_index;
-            if (menu_.screen() == ui::MenuScreen::join_browser &&
-                menu_.selection() < join_row_sessions_.size())
-            {
-                detail_session_index = join_row_sessions_[menu_.selection()];
-                detail_session = &join_browser_.sessions()[*detail_session_index];
-            }
-            else if (menu_.screen() == ui::MenuScreen::join_details)
-            {
-                detail_session = selected_join_session();
-                detail_session_index = selected_join_session_;
-            }
-            text("SELECTED", detail_x, detail_y, 13.0F, colors.accent);
-            text(detail_session != nullptr ? std::string_view{detail_session->server_name}
-                                           : entries[menu_.selection()].label,
-                 detail_x, detail_y + 30.0F * s, 34.0F,
-                 entries[menu_.selection()].enabled ? colors.text : colors.secondary);
-            fill({detail_x, detail_y + 82.0F * s, detail_width, 1.0F}, colors.line);
-            text(detail_session != nullptr
-                     ? std::string{std::format("HOST {}  •  {}", detail_session->host_name,
-                                               detail_session->server_message)}
-                     : std::string{entries[menu_.selection()].description},
-                 detail_x, detail_y + 104.0F * s, 18.0F, colors.secondary);
-
-            if (menu_.screen() == ui::MenuScreen::host_setup)
-            {
-                const std::string current = host_setting_value(entries[menu_.selection()].command);
-                if (!current.empty())
-                    text("CURRENT  " + current, detail_x, detail_y + 150.0F * s, 14.0F,
-                         colors.accent);
-            }
-
-            fill({detail_x, detail_y + 190.0F * s, detail_width, 146.0F * s}, colors.panel);
-            stroke({detail_x, detail_y + 190.0F * s, detail_width, 146.0F * s}, colors.line);
-            text(menu_.screen() == ui::MenuScreen::host_setup     ? "SESSION CONTRACT"
-                 : detail_session != nullptr                      ? "DISCOVERED CONTRACT"
-                 : menu_.screen() == ui::MenuScreen::join_browser ? "DISCOVERY STATUS"
-                                                                  : "FRONTEND STATUS",
-                 detail_x + 22.0F * s, detail_y + 212.0F * s, 13.0F, colors.accent);
-            if (menu_.screen() == ui::MenuScreen::host_setup)
-            {
-                text(std::format("{}  •  {} SLOTS  •  {}",
-                                 net::protocol_label(host_settings_.protocol),
-                                 host_settings_.maximum_players,
-                                 net::visibility_label(host_settings_.visibility)),
-                     detail_x + 22.0F * s, detail_y + 246.0F * s, 17.0F, colors.text);
-                text(std::format("PASSWORD {}  •  MODS {}  •  PACKET BOUNDS ALWAYS ON",
-                                 host_settings_.password.empty() ? "OPEN" : "SET",
-                                 host_settings_.mod_manifest.mods.empty() ? "VANILLA" : "SYNCED"),
-                     detail_x + 22.0F * s, detail_y + 277.0F * s, 13.0F, colors.secondary);
-            }
-            else if (detail_session != nullptr && detail_session_index.has_value())
-            {
-                const net::JoinAssessment assessment =
-                    browser_join_assessment(*detail_session_index);
-                text(std::format("{}  •  {}  •  {}/{} PLAYERS",
-                                 net::protocol_label(assessment.protocol),
-                                 net::discovery_source_label(detail_session->source),
-                                 detail_session->current_players, detail_session->maximum_players),
-                     detail_x + 22.0F * s, detail_y + 246.0F * s, 17.0F, colors.text);
-                text(std::format("{}  •  PASSWORD {}  •  MODS {}",
-                                 net::join_compatibility_label(assessment.status),
-                                 detail_session->password_required ? "REQUIRED" : "OPEN",
-                                 detail_session->required_manifest.has_value() ? "SYNCED"
-                                                                               : "VANILLA"),
-                     detail_x + 22.0F * s, detail_y + 277.0F * s, 13.0F,
-                     assessment.joinable() ? colors.secondary : colors.accent);
-            }
-            else if (menu_.screen() == ui::MenuScreen::join_browser)
-            {
-                const std::string_view state =
-                    join_browser_state_ == JoinBrowserState::searching    ? "CONNECTING TO STEAM"
-                    : join_browser_state_ == JoinBrowserState::failed     ? "DISCOVERY FAILED"
-                    : join_browser_state_ == JoinBrowserState::diagnostic ? "DIAGNOSTIC FIXTURES"
-                    : join_browser_.visible_indices().empty()             ? "NO LIVE SERVERS ONLINE"
-                                                                          : "LIVE SERVERS READY";
-                text(state, detail_x + 22.0F * s, detail_y + 246.0F * s, 17.0F,
-                     join_browser_state_ == JoinBrowserState::failed ? colors.accent : colors.text);
-                text(join_browser_status_, detail_x + 22.0F * s, detail_y + 277.0F * s, 11.0F,
-                     colors.secondary);
-            }
-            else
-            {
-                text("RESPONSIVE CANVAS", detail_x + 22.0F * s, detail_y + 246.0F * s, 17.0F,
-                     colors.text);
-                text("NATIVE-DENSITY TYPE  •  LIVE SETTINGS", detail_x + 22.0F * s,
-                     detail_y + 277.0F * s, 14.0F, colors.secondary);
-            }
-            fill({detail_x + 22.0F * s, detail_y + 311.0F * s, detail_width - 44.0F * s, 3.0F * s},
-                 colors.accent);
-        }
+        // GameModeMenu and DifficultyLevelScreen, with the originals' own
+        // headings; the other two are OpenMinerZ's and worded to match.
+        const RetailGeneration generation = menu_generation();
+        draw_menu_choice_screen(
+            menu_.screen() == ui::MenuScreen::game_profile ? std::string_view{"Choose a Game"}
+            : menu_.screen() == ui::MenuScreen::travel     ? std::string_view{"Teleport Stations"}
+            : menu_.screen() == ui::MenuScreen::game_mode
+                ? retail_text(RetailString::Choose_a_Game_Mode, generation)
+                : retail_text(RetailString::Choose_a_Difficulty_Level, generation));
     }
 
-    Rect content_panel(std::string_view eyebrow, std::string_view title, std::string_view subtitle)
-    {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        Rect panel{metrics_.safe.x + 34.0F * s, metrics_.safe.y + 188.0F * s,
-                   metrics_.safe.width - 68.0F * s, metrics_.safe.height - 280.0F * s};
-        fill(panel, colors.panel);
-        stroke(panel, colors.line, 1.0F * s);
-        fill({panel.x, panel.y, 7.0F * s, panel.height}, colors.accent);
-        text(eyebrow, panel.x + 38.0F * s, panel.y + 28.0F * s, 13.0F, colors.accent);
-        text(title, panel.x + 38.0F * s, panel.y + 57.0F * s, 36.0F, colors.text);
-        text(subtitle, panel.x + 38.0F * s, panel.y + 108.0F * s, 16.0F, colors.secondary);
-        fill({panel.x + 38.0F * s, panel.y + 150.0F * s, panel.width - 76.0F * s, 1.0F},
-             colors.line);
-        Rect back{panel.x + panel.width - 150.0F * s, panel.y + 24.0F * s, 112.0F * s, 42.0F * s};
-        fill(back, colors.panel_selected);
-        stroke(back, colors.line);
-        text("BACK", back.x + back.width * 0.5F, back.y + 10.0F * s, 15.0F, colors.text,
-             TextAlign::center);
-        hits_.push_back({back, HitKind::back, 0U});
-        return panel;
-    }
-
+    // Add-ons, awards and credits (app_menus.inc).
     void draw_addons()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const Rect panel = content_panel("CONTENT", "ADD-ONS",
-                                         "Detected content is read from the installed game; "
-                                         "nothing proprietary is copied into this project.");
-        float y = panel.y + 188.0F * s;
-        if (addons_.empty())
-        {
-            text("NO ADD-ONS DETECTED", panel.x + 40.0F * s, y, 22.0F, colors.text);
-            text("The loader will watch the configured CastleMiner Z installation and OpenMinerZ "
-                 "add-on folder.",
-                 panel.x + 40.0F * s, y + 42.0F * s, 15.0F, colors.secondary);
-            return;
-        }
-        for (std::size_t index = 0U; index < addons_.size() && index < 7U; ++index)
-        {
-            Rect row{panel.x + 38.0F * s, y, panel.width - 76.0F * s, 58.0F * s};
-            fill(row, index % 2U == 0U ? colors.panel_selected : colors.panel);
-            text(addons_[index], row.x + 18.0F * s, row.y + 15.0F * s, 18.0F, colors.text);
-            text("DETECTED", row.x + row.width - 18.0F * s, row.y + 18.0F * s, 12.0F, colors.accent,
-                 TextAlign::right);
-            y += 66.0F * s;
-        }
+        draw_addons_page();
+    }
+
+    void draw_achievements()
+    {
+        draw_awards();
     }
 
     void draw_credits()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        const Rect panel = content_panel("PROJECT", "OPENMINERZ",
-                                         "A clean C++20 reconstruction informed by observable "
-                                         "behavior from a legally installed copy.");
-        const float x = panel.x + 42.0F * s;
-        float y = panel.y + 190.0F * s;
-        const std::array<std::pair<std::string_view, std::string_view>, 5U> lines{{
-            {"DIRECTION", "KikoTs and the OpenMinerZ community"},
-            {"SOURCE GAME", "CastleMiner Z by DigitalDNA Games"},
-            {"RUNTIME", "SDL3 • FreeType • CMake • C++20"},
-            {"PRINCIPLE", "Deterministic simulation, native presentation, portable content import"},
-            {"CURRENT SLICE", "Responsive animated frontend and advanced settings"},
-        }};
-        for (const auto &[label, value] : lines)
-        {
-            text(label, x, y, 12.0F, colors.accent);
-            text(value, x + 190.0F * s, y - 4.0F * s, 18.0F, colors.text);
-            y += 66.0F * s;
-        }
+        draw_credits_page();
     }
 
+    // The settings screen: its pages, grouped rows and notes (app_menus.inc).
     void draw_settings()
     {
-        const auto colors = palette(settings_.high_contrast);
+        draw_settings_screen();
+    }
+
+    // The value shown on a settings row. Usually the stored setting; where the
+    // stored number is not what is on screen, the effective value instead.
+    [[nodiscard]] std::string setting_display_value(ui::SettingId id) const
+    {
+        // As the model words it (capitals); the screen sets it in Title Case
+        // (menu_value_case) and leaves a device's own name as it is spelt.
+        const std::string stored = ui::setting_value(settings_, id);
+        switch (id)
+        {
+        case ui::SettingId::resolution:
+            if (settings_.window_mode == WindowMode::borderless)
+                return desktop_size_.first > 0 ? std::format("DESKTOP  {} X {}",
+                                                             desktop_size_.first,
+                                                             desktop_size_.second)
+                                               : std::string{"DESKTOP"};
+            break;
+        case ui::SettingId::frame_limit:
+            if (settings_.vsync)
+                return display_refresh_rate_ > 0
+                           ? std::format("VSYNC  {} FPS", display_refresh_rate_)
+                           : std::string{"VSYNC"};
+            if (settings_.frame_limit_mode == FrameLimitMode::display)
+                return std::format("MATCH DISPLAY  {} FPS", settings_.frame_limit);
+            break;
+        case ui::SettingId::render_scale: {
+            // Mirrors the renderer's own sizing, including its pixel budget.
+            const double scale = std::clamp(settings_.render_scale, 0.5F, 2.0F);
+            const double pixels = static_cast<double>(metrics_.output_width) *
+                                  metrics_.output_height * scale * scale;
+            const double safe = pixels > 32'000'000.0 ? scale * std::sqrt(32'000'000.0 / pixels)
+                                                      : scale;
+            return std::format("{}  {} X {}", stored,
+                               std::max(1L, std::lround(metrics_.output_width * safe)),
+                               std::max(1L, std::lround(metrics_.output_height * safe)));
+        }
+        case ui::SettingId::texture_style:
+            if (settings_.texture_style != loaded_asset_style_)
+                return stored + "  AFTER RESTART";
+            break;
+        default:
+            break;
+        }
+        // A non-retail feature that is switched on but not in effect must not
+        // read as plain "ON": the session gate has it suspended.
+        if (const auto enhancement = ui::setting_enhancement(id);
+            enhancement.has_value() && enhancement_enabled(settings_, *enhancement) &&
+            !session_permits_enhancements(parity_session()))
+            return stored + "  PAUSED ONLINE";
+        return stored;
+    }
+
+    struct SettingsFooterNote final
+    {
+        std::string text;
+        bool attention{};
+    };
+
+    // The one-line note under the description: why an option is inactive, what
+    // a restart-only option is waiting for, or what the next key press does.
+    [[nodiscard]] SettingsFooterNote settings_footer_note(const ui::SettingRow &row) const
+    {
+        // Sentences, cased as sentences: the originals shout nothing.
+        if (reset_armed_seconds_ > 0.0F && reset_armed_tab_ == menu_.settings_tab())
+            return {std::format("Press {} again to restore the defaults on the {} page.",
+                                gamepad_input_active_ ? "Y" : "R",
+                                menu_title_case(ui::tab_label(menu_.settings_tab()))),
+                    true};
+        if (const std::string_view reason = ui::setting_unavailable_reason(settings_, row.id);
+            !reason.empty())
+            return {"Not in use: " + std::string{reason}, true};
+        if (display_apply_pending_)
+            return {"Applying display mode...", true};
+        if (row.id == ui::SettingId::texture_style && settings_.texture_style != loaded_asset_style_)
+        {
+            Settings loaded = settings_;
+            loaded.texture_style = loaded_asset_style_;
+            return {std::format("Restart the game to load it. On screen now: {}.",
+                                menu_value_case(
+                                    ui::setting_value(loaded, ui::SettingId::texture_style))),
+                    true};
+        }
+        if (const auto enhancement = ui::setting_enhancement(row.id); enhancement.has_value())
+        {
+            // The gate's verdict, in the player's words.
+            if (const std::string_view blocked = enhancement_blocked_reason(parity_session());
+                !blocked.empty())
+                return {std::string{blocked}, true};
+            if (*enhancement == Enhancement::lagoon_water &&
+                enhancement_enabled(settings_, *enhancement) &&
+                settings_.presentation != PresentationProfile::rebirth)
+                return {"Needs Lighting Style: Enhanced (Graphics page).", true};
+            return {"Not in the original game. Single-player only.", false};
+        }
+        if (row.requires_restart)
+            return {"A change here takes effect the next time you start the game.", false};
+        if (row.id == ui::SettingId::quality_preset &&
+            ui::detect_quality_preset(settings_) == ui::QualityPreset::custom)
+            return {"Custom: you changed an option yourself. Left / Right picks a preset again.",
+                    false};
+        // UI area (app_mod_ui.inc): add-on keys have a page of their own.
+        if (menu_.settings_tab() == ui::SettingsTab::controls && mod_ui_has_bindings())
+            return {std::format("Add-on keys: press {} to see and change them.",
+                                gamepad_input_active_ ? "X" : "K"),
+                    false};
+        return {};
+    }
+
+    // Shown after switching to an exclusive fullscreen mode. Doing nothing
+    // restores the previous mode, so a mode the monitor cannot show never
+    // strands the player in front of a black screen.
+    void draw_display_prompt()
+    {
+        const MenuInk ink = menu_ink();
+        const float unit = menu_unit();
+        const Rect box = draw_menu_dialog("Keep This Display Mode?", 600.0F, 250.0F);
+        const int seconds = std::max(1, static_cast<int>(std::ceil(display_confirm_seconds_)));
+        const float text_cap = menu_cap(14.0F);
+        const float button_height = menu_cap(40.0F);
+        const float pad = 24.0F * unit;
+        const float body_y = box.y + 16.0F * unit + menu_cap(menu_cap_text) + 28.0F * unit;
+        const float button_y = box.y + box.height - 20.0F * unit - button_height;
+        menu_paragraph(
+            std::format("Fullscreen at {} x {}. If the picture looks wrong, do nothing: the "
+                        "previous display mode comes back in {} {}.",
+                        settings_.window_width, settings_.window_height, seconds,
+                        seconds == 1 ? "second" : "seconds"),
+            {box.x + pad, body_y, box.width - pad * 2.0F, button_y - body_y - 8.0F * unit}, text_cap,
+            ink.text, MenuFace::text);
+        const float button_width = (box.width - pad * 2.0F - 12.0F * unit) * 0.5F;
+        const bool pad_prompts = gamepad_input_active_;
+        menu_plate_button({box.x + pad, button_y, button_width, button_height},
+                          pad_prompts ? "Keep  (A)" : "Keep  (Enter)", true, HitKind::display_keep, 0U,
+                          menu_cap_medium);
+        menu_plate_button({box.x + pad + button_width + 12.0F * unit, button_y, button_width,
+                           button_height},
+                          std::format("Revert  ({})  {}", pad_prompts ? "B" : "Esc", seconds), false,
+                          HitKind::display_revert, 0U, menu_cap_medium);
+    }
+
+    // Optional frame-rate read-out (Settings > Performance > FPS counter).
+    // Measures the interval between presented frames with its own clock, so it
+    // reports what reaches the screen, including any limiter or vsync wait.
+    void draw_fps_counter()
+    {
+        const auto now = Clock::now();
+        const double interval = std::chrono::duration<double>(now - fps_last_frame_).count();
+        fps_last_frame_ = now;
+        if (interval > 0.0 && interval < 1.0)
+        {
+            fps_window_seconds_ += interval;
+            fps_window_worst_ = std::max(fps_window_worst_, interval);
+            ++fps_window_frames_;
+        }
+        if (fps_window_seconds_ >= 0.5 && fps_window_frames_ > 0)
+        {
+            fps_shown_rate_ = static_cast<double>(fps_window_frames_) / fps_window_seconds_;
+            fps_shown_milliseconds_ =
+                fps_window_seconds_ * 1000.0 / static_cast<double>(fps_window_frames_);
+            fps_shown_worst_milliseconds_ = fps_window_worst_ * 1000.0;
+            fps_window_seconds_ = 0.0;
+            fps_window_worst_ = 0.0;
+            fps_window_frames_ = 0;
+        }
+        if (!settings_.show_fps || fps_shown_rate_ <= 0.0)
+            return;
         const float s = metrics_.scale;
-        Rect panel{metrics_.safe.x + 24.0F * s, metrics_.safe.y + 172.0F * s,
-                   metrics_.safe.width - 48.0F * s, metrics_.safe.height - 252.0F * s};
-        fill(panel, colors.panel);
-        stroke(panel, colors.line, 1.0F * s);
-
-        const float sidebar_width = std::min(290.0F * s, panel.width * 0.24F);
-        fill({panel.x, panel.y, sidebar_width, panel.height}, {4U, 7U, 8U, 215U});
-        text("SETTINGS", panel.x + 26.0F * s, panel.y + 25.0F * s, 28.0F, colors.text);
-        text("LIVE CONFIGURATION", panel.x + 27.0F * s, panel.y + 66.0F * s, 11.0F, colors.accent);
-
-        constexpr std::array tabs{ui::SettingsTab::display,  ui::SettingsTab::graphics,
-                                  ui::SettingsTab::gameplay, ui::SettingsTab::audio,
-                                  ui::SettingsTab::controls, ui::SettingsTab::accessibility};
-        float tab_y = panel.y + 112.0F * s;
-        for (std::size_t index = 0U; index < tabs.size(); ++index)
-        {
-            Rect tab{panel.x + 12.0F * s, tab_y, sidebar_width - 24.0F * s, 51.0F * s};
-            const bool selected = tabs[index] == menu_.settings_tab();
-            if (selected)
-            {
-                fill(tab, colors.panel_selected);
-                fill({tab.x, tab.y, 4.0F * s, tab.height}, colors.accent);
-            }
-            text(ui::tab_label(tabs[index]), tab.x + 20.0F * s, tab.y + 15.0F * s, 15.0F,
-                 selected ? colors.text : colors.secondary);
-            hits_.push_back({tab, HitKind::tab, index});
-            tab_y += 58.0F * s;
-        }
-
-        Rect back{panel.x + 18.0F * s, panel.y + panel.height - 62.0F * s,
-                  sidebar_width - 36.0F * s, 42.0F * s};
-        fill(back, colors.panel_selected);
-        stroke(back, colors.line);
-        text("SAVE & BACK", back.x + back.width * 0.5F, back.y + 11.0F * s, 14.0F, colors.text,
-             TextAlign::center);
-        hits_.push_back({back, HitKind::back, 0U});
-
-        const float content_x = panel.x + sidebar_width + 30.0F * s;
-        const float content_width = panel.width - sidebar_width - 60.0F * s;
-        text(ui::tab_label(menu_.settings_tab()), content_x, panel.y + 26.0F * s, 25.0F,
-             colors.text);
-        text("LEFT / RIGHT TO ADJUST  •  R TO RESTORE DEFAULTS", content_x, panel.y + 66.0F * s,
-             11.0F, colors.secondary);
-        fill({content_x, panel.y + 94.0F * s, content_width, 1.0F}, colors.line);
-
-        const auto &rows = ui::rows_for_tab(menu_.settings_tab());
-        const float row_height = 60.0F * s;
-        const float row_gap = 7.0F * s;
-        const float list_top = panel.y + 114.0F * s;
-        const float list_bottom = panel.y + panel.height - 96.0F * s;
-        const std::size_t visible = std::max<std::size_t>(
-            1U, static_cast<std::size_t>((list_bottom - list_top) / (row_height + row_gap)));
-        std::size_t first = 0U;
-        if (menu_.selection() >= visible)
-        {
-            first = menu_.selection() - visible + 1U;
-        }
-        first = std::min(first, rows.size() > visible ? rows.size() - visible : 0U);
-
-        float y = list_top;
-        for (std::size_t index = first; index < rows.size() && index < first + visible; ++index)
-        {
-            const bool selected = index == menu_.selection();
-            Rect row{content_x, y, content_width, row_height};
-            fill(row, selected ? colors.panel_selected : with_alpha(colors.panel, 0.68F));
-            stroke(row, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            if (selected)
-            {
-                fill({row.x, row.y, 4.0F * s, row.height}, colors.accent);
-            }
-            text(rows[index].label, row.x + 18.0F * s, row.y + 10.0F * s, 17.0F, colors.text);
-            text(rows[index].description, row.x + 18.0F * s, row.y + 34.0F * s, 11.0F,
-                 colors.secondary);
-
-            const std::string value = uppercase(ui::setting_value(settings_, rows[index].id));
-            const float value_x = row.x + row.width - 24.0F * s;
-            text("‹", row.x + row.width * 0.63F, row.y + 15.0F * s, 18.0F,
-                 selected ? colors.accent : colors.secondary, TextAlign::center);
-            text(value, value_x - 36.0F * s, row.y + 15.0F * s, 15.0F,
-                 selected ? colors.text : colors.secondary, TextAlign::right);
-            text("›", value_x, row.y + 15.0F * s, 18.0F,
-                 selected ? colors.accent : colors.secondary, TextAlign::center);
-
-            if (rows[index].kind == ui::SettingKind::slider)
-            {
-                const float bar_x = row.x + row.width * 0.64F;
-                const float bar_y = row.y + row.height - 11.0F * s;
-                const float bar_width = row.width * 0.30F;
-                fill({bar_x, bar_y, bar_width, 3.0F * s}, colors.line);
-                fill({bar_x, bar_y,
-                      bar_width * ui::setting_normalized_value(settings_, rows[index].id),
-                      3.0F * s},
-                     colors.accent);
-            }
-            hits_.push_back({row, HitKind::setting_row, index});
-            y += row_height + row_gap;
-        }
-
-        const auto &selected_row = rows[std::min(menu_.selection(), rows.size() - 1U)];
-        text(selected_row.description, content_x, panel.y + panel.height - 63.0F * s, 13.0F,
-             colors.secondary);
-        const bool asset_restart_required = settings_.texture_style != loaded_asset_style_;
-        text(asset_restart_required ? "RESTART REQUIRED" : "AUTO-SAVED", content_x + content_width,
-             panel.y + panel.height - 63.0F * s, 11.0F, colors.accent, TextAlign::right);
+        const std::string label =
+            std::format("{:.0f} FPS   {:.1f} MS   WORST {:.1f} MS", fps_shown_rate_,
+                        fps_shown_milliseconds_, fps_shown_worst_milliseconds_);
+        const int pixels = metrics_.font_pixels(13.0F * (settings_.larger_text ? 1.12F : 1.0F));
+        const auto size = font_->measure(label, pixels);
+        const float pad = std::max(8.0F * s, 5.0F);
+        // Full-output margins: menus narrow metrics_.safe on ultrawide screens.
+        const float margin_x = static_cast<float>(metrics_.output_width) *
+                               (1.0F - settings_.safe_area) * 0.5F;
+        const float margin_y = static_cast<float>(metrics_.output_height) *
+                               (1.0F - settings_.safe_area) * 0.5F;
+        const Rect box{static_cast<float>(metrics_.output_width) - margin_x - size.width -
+                           pad * 2.0F,
+                       margin_y, size.width + pad * 2.0F,
+                       std::max(size.height, static_cast<float>(pixels)) + pad * 2.0F};
+        fill(box, {0U, 0U, 0U, 150U});
+        text_in(label, {box.x + pad, box.y, box.width - pad * 2.0F, box.height}, 13.0F,
+                {235U, 240U, 241U, 255U});
     }
 
     void draw_exit_confirmation()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
-              static_cast<float>(metrics_.output_height)},
-             {0U, 0U, 0U, 178U});
-        Rect box{static_cast<float>(metrics_.output_width) * 0.5F - 320.0F * s,
-                 static_cast<float>(metrics_.output_height) * 0.5F - 170.0F * s, 640.0F * s,
-                 340.0F * s};
-        fill(box, colors.panel);
-        stroke(box, colors.accent, 2.0F * s);
-        text("EXIT OPENMINERZ?", box.x + 32.0F * s, box.y + 30.0F * s, 30.0F, colors.text);
-        text("Your settings have already been saved.", box.x + 32.0F * s, box.y + 80.0F * s, 15.0F,
-             colors.secondary);
-        const auto &entries = menu_.entries();
-        for (std::size_t index = 0U; index < entries.size(); ++index)
+        draw_exit_dialog();
+    }
+
+    // InGameHUD.DrawAcheivement: the award's name over how it is unlocked, in
+    // the System font (219, 219, 219), on a plaque built from an end cap, its
+    // mirror image and a stretched centre, with the medal circle on the left.
+    // Centred horizontally at y = 439 on the build's canvas.
+    void draw_achievement_popup()
+    {
+        if (!achievement_popup_.has_value())
+            return;
+        const AchievementDefinition &award = achievement_definitions()[*achievement_popup_];
+        RetailFonts *fonts = retail_fonts();
+        const auto &art =
+            award_art_[presentation_generation() == RetailGeneration::modern ? 1U : 0U];
+        if (fonts == nullptr || art[0] == nullptr || art[1] == nullptr || art[2] == nullptr)
         {
-            Rect row{box.x + 32.0F * s, box.y + 132.0F * s + static_cast<float>(index) * 76.0F * s,
-                     box.width - 64.0F * s, 60.0F * s};
-            const bool selected = index == menu_.selection();
-            fill(row, selected ? colors.panel_selected : colors.panel);
-            stroke(row, selected ? colors.accent : colors.line, selected ? 2.0F * s : 1.0F);
-            text(entries[index].label, row.x + 20.0F * s, row.y + 16.0F * s, 18.0F,
-                 selected ? colors.text : colors.secondary);
-            hits_.push_back({row, HitKind::menu_item, index});
+            // No imported award art: the same two lines on a plain plaque.
+            const float s = metrics_.scale;
+            const Rect plaque{static_cast<float>(metrics_.output_width) * 0.5F - 230.0F * s,
+                              static_cast<float>(metrics_.output_height) * 0.61F, 460.0F * s,
+                              70.0F * s};
+            fill(plaque, {0U, 0U, 0U, 190U});
+            text(award.name, plaque.x + plaque.width * 0.5F, plaque.y + 9.0F * s, 18.0F,
+                 {219U, 219U, 219U, 255U}, TextAlign::center);
+            text(award.description, plaque.x + plaque.width * 0.5F, plaque.y + 38.0F * s, 14.0F,
+                 {219U, 219U, 219U, 255U}, TextAlign::center);
+            return;
         }
+        float end_width{};
+        float end_height{};
+        float center_height{};
+        float circle_width{};
+        float circle_height{};
+        SDL_GetTextureSize(art[0], &end_width, &end_height);
+        SDL_GetTextureSize(art[1], nullptr, &center_height);
+        SDL_GetTextureSize(art[2], &circle_width, &circle_height);
+        // On the build's canvas: y = 439 of 720 in 1.6.3.8; in 1.9.9.8 a fixed
+        // 439 window pixels from the top at any resolution (its code never
+        // multiplies this plaque by Adjuster.ScaleFactor).
+        const RetailCanvas canvas = retail_canvas();
+        const RetailFont font = RetailFont::system;
+        const float text_x = 79.0F;
+        const float inner = std::max(fonts->measure(font, award.name).width,
+                                     fonts->measure(font, award.description).width) +
+                            (text_x - end_width);
+        const float x = std::floor(canvas.width * 0.5F) - (inner + end_width * 2.0F) * 0.5F;
+        const float y = 439.0F;
+        canvas_sprite(canvas, art[0], nullptr, x, y, end_width, end_height);
+        canvas_sprite(canvas, art[0], nullptr, x + inner + end_width, y, end_width, end_height,
+                      true);
+        canvas_sprite(canvas, art[1], nullptr, std::floor(x + end_width) - 1.0F, y,
+                      std::floor(inner + 2.0F), center_height);
+        canvas_sprite(canvas, art[2], nullptr, x, y, circle_width, circle_height);
+        const SDL_Color ink{219U, 219U, 219U, 255U};
+        canvas_text(*fonts, canvas, font, award.name, x + text_x, y + 10.0F, ink);
+        canvas_text(*fonts, canvas, font, award.description, x + text_x, y + 37.0F, ink);
     }
 
     void draw_death_overlay()
     {
         const float width = static_cast<float>(metrics_.output_width);
         const float height = static_cast<float>(metrics_.output_height);
-        // A faint red wash while the body settles — the original leaves the
-        // world visible and only prints the prompt.
-        const float settle = std::min(1.0F, death_timer_ / 0.9F);
-        fill({0.0F, 0.0F, width, height},
-             {80U, 0U, 0U, static_cast<std::uint8_t>(30.0F + settle * 40.0F)});
-        if (player_life_ == PlayerLife::dead)
+        // --diagnostic-death S previews the prompt once S passes its delay.
+        if (player_life_ == PlayerLife::dead ||
+            options_.diagnostic_death_seconds.value_or(0.0F) >= 3.0F)
         {
-            // InGameHUD: "Click To Respawn", white with a black outline,
-            // centered on the safe area.
-            text("Click To Respawn", width * 0.5F, height * 0.48F, 26.0F, {255U, 255U, 255U, 255U},
-                 TextAlign::center, true);
-            if (game_mode_ == GameMode::endurance)
+            // InGameHUD.OnDraw, three seconds after the death: MedLargeFont,
+            // white with a two-pixel black outline, drawn at scale 1 on the
+            // build's canvas and centred on it. `lead` and `prompt` are the original's
+            // `text` and `text2`; online Endurance swaps them for the
+            // countdown, the host's restart prompt or the wait for the host.
+            const RetailGeneration generation = presentation_generation();
+            using S = RetailString;
+            std::string lead;
+            std::string prompt{retail_text(S::Click_To_Respawn, generation)};
+            bool countdown = false;
+            const net::StockRespawnAction action = local_respawn_action();
+            const float waited = death_timer_ - 3.0F;
+            if (action == net::StockRespawnAction::restart_level)
+                prompt = retail_text(S::Click_To_Restart, generation);
+            else if (action == net::StockRespawnAction::wait)
             {
-                const int days = std::max(1, static_cast<int>(day_night_.day()));
-                text(std::format("Distance Traveled: {} In {} {}", max_distance_, days,
-                                 days == 1 ? "Day" : "Days"),
-                     width * 0.5F, height * 0.55F, 14.0F, {255U, 255U, 255U, 230U},
-                     TextAlign::center);
+                const bool all_dead =
+                    std::ranges::none_of(online_remote_players_, [](const auto &entry) {
+                        return !entry.second.state.dead;
+                    });
+                if (all_dead)
+                {
+                    lead = retail_text(S::Waiting_For_Host_To_Restart, generation);
+                    prompt.clear();
+                }
+                else
+                {
+                    // Strings.Respawn_In + ": ", then (int)(21 - elapsed) drawn
+                    // after it; only the lead is centred.
+                    lead = std::format("{}: ", retail_text(S::Respawn_In, generation));
+                    prompt = std::to_string(std::max(0, static_cast<int>(21.0F - waited)));
+                    countdown = true;
+                }
             }
-            else
+            const bool endurance = game_mode_ == GameMode::endurance;
+            const int days = std::max(1, static_cast<int>(day_night_.day()));
+            const std::string traveled = retail_message::distance_traveled(max_distance_, generation);
+            const std::string survived = retail_message::in_days(days, generation);
+            const SDL_Color white{255U, 255U, 255U, 255U};
+            const float center_x = width * 0.5F;
+            if (RetailFonts *fonts = retail_fonts())
             {
-                text(difficulty_ == GameDifficulty::hardcore
-                         ? "HARDCORE: EVERYTHING YOU CARRIED IS GONE"
-                         : "YOUR BACKPACK SPILLED WHERE YOU FELL",
-                     width * 0.5F, height * 0.55F, 11.0F, {220U, 200U, 200U, 200U},
-                     TextAlign::center);
+                // Laid out on the build's canvas (1280x720 in 1.6.3.8, the
+                // window in 1.9.9.8) around Rectangle.Center of it.
+                const RetailCanvas canvas = retail_canvas();
+                const RetailFont font = RetailFont::medium_large;
+                const float middle_x = std::floor(canvas.width * 0.5F);
+                const float middle_y = std::floor(canvas.height * 0.5F);
+                const TextExtent cell =
+                    fonts->measure(font, countdown ? lead : lead + prompt);
+                float x = middle_x - cell.width * 0.5F;
+                float y = middle_y - cell.height * 0.5F;
+                if (endurance)
+                {
+                    const TextExtent first = fonts->measure(font, traveled);
+                    canvas_text(*fonts, canvas, font, traveled, middle_x - first.width * 0.5F,
+                                middle_y - first.height - first.height * 0.5F, white, 2);
+                    const TextExtent second = fonts->measure(font, survived);
+                    canvas_text(*fonts, canvas, font, survived, middle_x - second.width * 0.5F,
+                                middle_y - second.height * 0.5F, white, 2);
+                    y += second.height;
+                }
+                // 1.6.3.8 nudges the line 20 px left while the online Endurance
+                // respawn timer runs; 1.9.9.8 dropped the nudge.
+                if (generation == RetailGeneration::classic && endurance && in_online_session() &&
+                    waited < net::stock_endurance_respawn_wait_seconds)
+                    x -= 20.0F;
+                canvas_text(*fonts, canvas, font, lead, x, y, white, 2);
+                x += fonts->measure(font, lead).width;
+                canvas_text(*fonts, canvas, font, prompt, x, y, white, 2);
+                return;
             }
+            // No imported sprite fonts: the same words in the UI font.
+            text(lead + prompt, center_x, height * 0.48F, 26.0F, white, TextAlign::center, true);
+            if (endurance)
+                text(traveled + survived, center_x, height * 0.55F, 14.0F, {255U, 255U, 255U, 230U},
+                     TextAlign::center);
         }
     }
 
+    // InGameMenu, TeleportMenu, HostOptions and the player picker
+    // (app_menus.inc: the originals' wash and centred rows).
     void draw_pause_menu()
     {
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        fill({0.0F, 0.0F, static_cast<float>(metrics_.output_width),
-              static_cast<float>(metrics_.output_height)},
-             {0U, 0U, 0U, 174U});
-        // The box sizes itself to the entry count (six rows since the teleport
-        // and inventory entries joined) and clamps to the safe area.
-        const auto &entries = menu_.entries();
-        const float row_pitch = 58.0F * s;
-        const float row_height = 50.0F * s;
-        const float header_height = 112.0F * s;
-        const float footer_height = 44.0F * s;
-        float box_height =
-            header_height + static_cast<float>(entries.size()) * row_pitch + footer_height;
-        box_height = std::min(box_height, metrics_.safe.height * 0.94F);
-        Rect box{static_cast<float>(metrics_.output_width) * 0.5F - 310.0F * s,
-                 static_cast<float>(metrics_.output_height) * 0.5F - box_height * 0.5F, 620.0F * s,
-                 box_height};
-        fill(box, {8U, 11U, 12U, 248U});
-        stroke(box, colors.accent, std::max(1.0F, 2.0F * s));
-        fill({box.x, box.y, box.width, 6.0F * s}, colors.accent);
-        text("GAME PAUSED", box.x + 34.0F * s, box.y + 27.0F * s, 27.0F, colors.text,
-             TextAlign::left, true);
-        text("THE WORLD IS FROZEN", box.x + 36.0F * s, box.y + 70.0F * s, 11.0F, colors.secondary);
-        for (std::size_t index = 0U; index < entries.size(); ++index)
-        {
-            Rect row{box.x + 34.0F * s,
-                     box.y + header_height + static_cast<float>(index) * row_pitch,
-                     box.width - 68.0F * s, row_height};
-            const bool selected = index == menu_.selection();
-            fill(row, selected ? colors.panel_selected : SDL_Color{13U, 17U, 18U, 238U});
-            stroke(row, selected ? colors.accent : colors.line,
-                   selected ? std::max(1.0F, 2.0F * s) : 1.0F);
-            if (selected)
-                fill({row.x, row.y, 5.0F * s, row.height}, colors.accent);
-            text(entries[index].label, row.x + 20.0F * s, row.y + 8.0F * s, 16.0F,
-                 selected ? colors.text : colors.secondary, TextAlign::left, selected);
-            text(entries[index].description, row.x + 20.0F * s, row.y + 31.0F * s, 9.0F,
-                 colors.secondary);
-            hits_.push_back({row, HitKind::menu_item, index});
-        }
-        text("ESC  RESUME", box.x + box.width - 34.0F * s, box.y + box.height - 27.0F * s, 10.0F,
-             colors.secondary, TextAlign::right);
+        draw_in_game_menu();
     }
 
     void draw_toast()
     {
         if (toast_time_ <= 0.0F)
-        {
             return;
-        }
         const auto colors = palette(settings_.high_contrast);
         const float s = metrics_.scale;
-        const float enter = std::min(1.0F, (4.2F - toast_time_) * 5.0F);
-        const float leave = std::min(1.0F, toast_time_ * 4.0F);
-        const float opacity = smoothstep(std::min(enter, leave));
-        Rect box{metrics_.safe.x + metrics_.safe.width - 530.0F * s,
-                 metrics_.safe.y + metrics_.safe.height - 154.0F * s + (1.0F - opacity) * 30.0F * s,
-                 500.0F * s, 96.0F * s};
+        const float opacity =
+            smoothstep(std::min({1.0F, (4.2F - toast_time_) * 5.0F, toast_time_ * 4.0F}));
+        const float width = std::min(std::max(500.0F * s, 320.0F), metrics_.safe.width - 40.0F * s);
+        const float height = std::max(136.0F * s, 100.0F);
+        const Rect box{metrics_.safe.x + metrics_.safe.width - width - 26.0F * s,
+                       metrics_.safe.y + metrics_.safe.height - height - 120.0F * s, width, height};
+        const float pad = std::max(20.0F * s, 12.0F);
         fill(box, with_alpha(colors.panel, opacity));
-        stroke(box, with_alpha(colors.accent, opacity), 2.0F * s);
-        text(toast_title_, box.x + 20.0F * s, box.y + 17.0F * s, 15.0F,
-             with_alpha(colors.text, opacity));
-        text(toast_body_, box.x + 20.0F * s, box.y + 50.0F * s, 11.0F,
-             with_alpha(colors.secondary, opacity));
+        stroke(box, with_alpha(colors.line, opacity));
+        fill({box.x, box.y, 3.0F * s, box.height}, with_alpha(colors.accent, opacity));
+        world_text(toast_title_, box.x + pad, box.y + pad, 18.0F, width - pad * 2.0F,
+                   with_alpha(colors.text, opacity));
+        const float body_y = box.y + pad + std::max(32.0F * s, 24.0F);
+        wrapped_text(toast_body_,
+                     {box.x + pad, body_y, width - pad * 2.0F, box.y + height - pad - body_y},
+                     15.0F, with_alpha(colors.secondary, opacity));
+    }
+
+    Rect chat_input_bounds() const noexcept
+    {
+        const float s = metrics_.scale;
+        const float width = std::min(metrics_.safe.width - 48.0F * s, std::max(820.0F * s, 400.0F));
+        const float height = std::max(96.0F * s, 72.0F);
+        return {metrics_.safe.x + 24.0F * s,
+                metrics_.safe.y + metrics_.safe.height - std::max(108.0F * s, 64.0F) - height,
+                width, height};
+    }
+
+    // ConsoleElement.Size.Y: a quarter of PresentationParameters.BackBufferHeight
+    // - the WINDOW's height in both builds, used as canvas units. (So on a
+    // 1080p window 1.6.3.8's console region is 270 of its 720 canvas rows.)
+    // The console itself sits at the canvas corner, titleSafeArea.Left/Top.
+    [[nodiscard]] float retail_console_height() const noexcept
+    {
+        return static_cast<float>(metrics_.output_height) * 0.25F;
+    }
+
+    // PlainChatInputScreen: one TextEditControl 25 px under the console, a
+    // half-transparent black frame one text line high, the draft in white, a
+    // "|" caret that blinks every half second and "Type here" while empty.
+    // 1.6.3.8: 330 px wide, MyriadSmall. 1.9.9.8: half the screen, ConsoleFont.
+    bool draw_retail_chat_entry()
+    {
+        RetailFonts *fonts = retail_fonts();
+        if (fonts == nullptr)
+            return false;
+        const RetailCanvas canvas = retail_canvas();
+        const bool modern = presentation_generation() == RetailGeneration::modern;
+        const RetailFont font = modern ? RetailFont::console : RetailFont::myriad_small;
+        const float x = 0.0F;
+        const float y = std::floor(retail_console_height() + 25.0F);
+        const float width = modern ? std::floor(canvas.width * 0.5F) : 330.0F;
+        const float line = static_cast<float>(fonts->font(font)->line_spacing());
+        canvas_fill(canvas, x, y, width, line, {0U, 0U, 0U, 128U});
+        const SDL_Color white{255U, 255U, 255U, 255U};
+        // The frame's centre region starts a few pixels inside its border.
+        const float inset = 4.0F;
+        if (chat_draft_.find_first_not_of(' ') == std::string::npos)
+            canvas_text(*fonts, canvas, RetailFont::myriad_small, retail(RetailString::Type_here),
+                        x, y, white);
+        // The original does not scroll: text past the frame simply runs on.
+        canvas_text(*fonts, canvas, font, chat_draft_, x + inset, y, white);
+        if (std::fmod(elapsed_, 0.5F) < 0.25F)
+            canvas_text(*fonts, canvas, font, "|",
+                        x + inset + std::floor(fonts->measure(font, chat_draft_).width), y - 2.0F,
+                        white);
+        return true;
     }
 
     void draw_chat_dialog()
     {
+        if (draw_retail_chat_entry())
+            return;
         const auto colors = palette(settings_.high_contrast);
         const float s = metrics_.scale;
-        const float width = std::min(metrics_.safe.width - 48.0F * s, 760.0F * s);
-        const Rect box{metrics_.safe.x + 24.0F * s,
-                       metrics_.safe.y + metrics_.safe.height - 112.0F * s, width, 72.0F * s};
+        const Rect box = chat_input_bounds();
         fill(box, {7U, 12U, 16U, 236U});
-        stroke(box, colors.accent, 2.0F * s);
-        text("NETWORK CHAT", box.x + 18.0F * s, box.y + 10.0F * s, 10.0F, colors.secondary);
-        const std::string display = chat_draft_ + (std::fmod(elapsed_, 1.0F) < 0.55F ? "_" : "");
-        text(display, box.x + 18.0F * s, box.y + 33.0F * s, 15.0F, colors.text);
-        text("ENTER SENDS  /  ESC CANCELS", box.x + box.width - 16.0F * s, box.y + 12.0F * s, 9.0F,
+        stroke(box, colors.accent, std::max(1.0F, s));
+        text("Chat", box.x + 18.0F * s, box.y + 12.0F * s, 16.0F, colors.secondary);
+        text("Enter: send    Esc: cancel", box.x + box.width - 18.0F * s, box.y + 12.0F * s, 13.0F,
              colors.secondary, TextAlign::right);
+        std::string display = chat_draft_ + (std::fmod(elapsed_, 1.0F) < 0.55F ? "_" : "");
+        const float width = box.width - 36.0F * s;
+        const int pixels = metrics_.font_pixels(18.0F * (settings_.larger_text ? 1.12F : 1.0F));
+        while (!display.empty() && font_->measure(display, pixels).width > width)
+        {
+            std::size_t next = 1U;
+            while (next < display.size() &&
+                   (static_cast<unsigned char>(display[next]) & 0xC0U) == 0x80U)
+                ++next;
+            display.erase(0, next);
+        }
+        text_in(display, {box.x + 18.0F * s, box.y + box.height * 0.45F, width, box.height * 0.45F},
+                18.0F, colors.text);
     }
 
-    void draw_online_chat_feed()
+    // GameScreen.gameScreen_AfterDraw: every other player's gamertag, white
+    // with a one-pixel black outline, centred two blocks above that player's
+    // feet. openminerz/player_nametag.hpp records exactly what the original
+    // does and does not do (no distance scale, fade, range limit or occlusion;
+    // dead players keep their tag; the local player has none).
+    void draw_remote_nametags()
     {
-        if (online_chat_lines_.empty() || !online_gameplay_active())
+        if (online_remote_visuals_.empty() || world_preview_ == nullptr || font_ == nullptr)
             return;
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        std::vector<const OnlineChatLine *> visible;
-        for (const OnlineChatLine &line : online_chat_lines_)
-            if (chat_editing_ || elapsed_ - line.received_at < 13.0F)
-                visible.push_back(&line);
-        if (visible.empty())
+        const NametagCamera &camera = world_preview_->overlay_camera();
+        if (!camera.valid)
             return;
-        if (visible.size() > 6U)
-            visible.erase(visible.begin(), visible.end() - 6);
-        const float row_height = 25.0F * s;
-        const float width = std::min(metrics_.safe.width - 48.0F * s, 820.0F * s);
-        const float bottom = metrics_.safe.y + metrics_.safe.height -
-                             (chat_editing_ ? 126.0F : 38.0F) * s;
-        const Rect panel{metrics_.safe.x + 24.0F * s,
-                         bottom - row_height * static_cast<float>(visible.size()) - 10.0F * s,
-                         width, row_height * static_cast<float>(visible.size()) + 10.0F * s};
-        fill(panel, {4U, 8U, 11U, static_cast<Uint8>(chat_editing_ ? 220U : 160U)});
-        fill({panel.x, panel.y, 4.0F * s, panel.height}, colors.accent);
-        for (std::size_t index = 0U; index < visible.size(); ++index)
+        const bool classic = online_gameplay_active() &&
+                             online_gameplay_protocol() == net::ProtocolVersion::classic_v3;
+        const NametagFontMetrics &shipped = classic ? classic_nametag_font : modern_nametag_font;
+        // Fallback for a content pack without imported fonts: the UI font,
+        // sized so its capitals are exactly as tall, in pixels.
+        NametagFontSize &size = nametag_font_sizes_[classic ? 0U : 1U];
+        if (size.pixels == 0)
         {
-            const float age = elapsed_ - visible[index]->received_at;
-            const float opacity = chat_editing_ ? 1.0F : std::clamp((13.0F - age) * 0.75F, 0.0F, 1.0F);
-            text(visible[index]->message, panel.x + 17.0F * s,
-                 panel.y + 8.0F * s + static_cast<float>(index) * row_height,
-                 11.0F, with_alpha(colors.text, opacity));
+            size.pixels = font_->pixel_size_for_cap_height(shipped.cap_height);
+            size.baseline = font_->baseline(size.pixels);
         }
-    }
-
-    void draw_player_roster()
-    {
-        if (!online_gameplay_active())
-            return;
-        const auto colors = palette(settings_.high_contrast);
-        const float s = metrics_.scale;
-        struct RosterEntry final
+        for (const RemotePlayerVisual &visual : online_remote_visuals_)
         {
-            std::uint8_t gid{};
-            std::string name;
-            std::string role;
-            bool active{};
-        };
-        std::vector<RosterEntry> entries;
-        const bool local_host = online_host_ != nullptr && online_host_->running();
-        entries.push_back({online_local_player_gid(),
-                           online_persona_name_.empty() ? std::string{"OpenMinerZ"}
-                                                        : online_persona_name_,
-                           local_host ? "HOST / YOU" : "YOU", true});
-        for (const auto &[gid, remote] : online_remote_players_)
-        {
-            entries.push_back({gid,
-                               remote.gamer_tag.empty()
-                                   ? std::format("PLAYER {}", static_cast<int>(gid))
-                                   : remote.gamer_tag,
-                               gid == 0U ? "HOST" : "PLAYER",
-                               remote.has_update && elapsed_ - remote.last_update <= 10.0F});
-        }
-        std::ranges::sort(entries, {}, &RosterEntry::gid);
-        const float width = std::min(metrics_.safe.width - 60.0F * s, 610.0F * s);
-        const float row_height = 43.0F * s;
-        const float height = 74.0F * s + row_height * static_cast<float>(entries.size());
-        const Rect panel{metrics_.safe.x + (metrics_.safe.width - width) * 0.5F,
-                         metrics_.safe.y + 42.0F * s, width, height};
-        fill(panel, {4U, 8U, 11U, 235U});
-        stroke(panel, colors.accent, 2.0F * s);
-        text("SESSION PLAYERS", panel.x + 22.0F * s, panel.y + 17.0F * s, 17.0F,
-             colors.text, TextAlign::left, true);
-        text(std::format("{} ONLINE  /  HOLD TAB", entries.size()),
-             panel.x + panel.width - 22.0F * s, panel.y + 21.0F * s, 10.0F,
-             colors.secondary, TextAlign::right);
-        fill({panel.x + 20.0F * s, panel.y + 55.0F * s, panel.width - 40.0F * s, 1.0F * s},
-             {86U, 101U, 104U, 180U});
-        for (std::size_t index = 0U; index < entries.size(); ++index)
-        {
-            const RosterEntry &entry = entries[index];
-            const float y = panel.y + 67.0F * s + static_cast<float>(index) * row_height;
-            const SDL_Color status = entry.active ? SDL_Color{91U, 218U, 148U, 255U}
-                                                  : SDL_Color{116U, 126U, 129U, 255U};
-            fill({panel.x + 22.0F * s, y + 8.0F * s, 7.0F * s, 7.0F * s}, status);
-            text(entry.name, panel.x + 44.0F * s, y, 14.0F,
-                 entry.active ? colors.text : colors.secondary, TextAlign::left, true);
-            text(std::format("{}  /  GID {}", entry.role, static_cast<int>(entry.gid)),
-                 panel.x + panel.width - 22.0F * s, y + 3.0F * s, 10.0F,
-                 entry.active ? colors.accent : colors.secondary, TextAlign::right);
+            const auto found = online_remote_players_.find(visual.gid);
+            if (found == online_remote_players_.end() || found->second.gamer_tag.empty())
+                continue;
+            // The same sampled position the body is drawn at, so the tag
+            // never slides against the player it names.
+            const auto anchor = project_nametag(camera, visual.position);
+            if (!anchor.has_value())
+                continue;
+            const std::string &tag = found->second.gamer_tag;
+            if (RetailFonts *fonts = retail_fonts())
+            {
+                // The shipped NameTagFont itself, exactly as the original
+                // draws it: size = MeasureString(Gamertag), then
+                // DrawOutlinedText(font, tag, screen - size / 2, White, Black, 1)
+                // at scale 1 ON THE BUILD'S CANVAS: 1.6.3.8 draws into its
+                // 1280x720 buffer, so its tags grow with the window; 1.9.9.8
+                // draws to the window and its tags stay the same pixel size.
+                // A character the font lacks is its default '*'.
+                const float tag_scale = retail_canvas().scale;
+                const TextExtent cell = fonts->measure(RetailFont::name_tag, tag, tag_scale);
+                if (anchor->x < -cell.width || anchor->x > camera.width + cell.width ||
+                    anchor->y < -cell.height || anchor->y > camera.height + cell.height)
+                    continue;
+                fonts->draw_outlined(RetailFont::name_tag, tag, anchor->x - cell.width * 0.5F,
+                                     anchor->y - cell.height * 0.5F, {255U, 255U, 255U, 255U},
+                                     {0U, 0U, 0U, 255U}, 1, tag_scale);
+                continue;
+            }
+            const TextExtent extent = font_->measure(tag, size.pixels);
+            if (anchor->x < -extent.width || anchor->x > camera.width + extent.width ||
+                anchor->y < -extent.height || anchor->y > camera.height + extent.height)
+                continue;
+            // Text textures carry one pixel of lead-in and three of trailing
+            // padding around the advance width the original measures.
+            const NametagAnchor origin = nametag_text_origin(*anchor, extent.width - 4.0F, 0.0F);
+            const float left = origin.x - 1.0F;
+            const float top = anchor->y + nametag_baseline_below_anchor(shipped) -
+                              static_cast<float>(size.baseline);
+            for (const NametagPass &pass : nametag_passes)
+                font_->draw(tag, left + pass.dx, top + pass.dy, size.pixels,
+                            pass.outline ? SDL_Color{0U, 0U, 0U, 255U}
+                                         : SDL_Color{255U, 255U, 255U, 255U});
         }
     }
 
@@ -17399,6 +21702,12 @@ class Application::Impl final
     {
         if (!settings_.subtitles || subtitle_time_ <= 0.0F || subtitle_text_.empty())
             return;
+        // The Remastered HUD sets captions itself, above its tray.
+        if (rm_caption_bottom_ >= 0.0F)
+        {
+            rm_draw_caption();
+            return;
+        }
         const float s = metrics_.scale;
         const float size = 14.0F * settings_.subtitle_size;
         const float width = std::min(metrics_.safe.width * 0.72F, 620.0F * s);
@@ -17461,98 +21770,125 @@ class Application::Impl final
         }
         progress = std::clamp(progress, 0.0F, 1.0F);
 
-        const float panel_width = std::min(980.0F * s, metrics_.safe.width * 0.88F);
-        const float panel_height = 438.0F * s;
+        // The original shows two screens while joining: "Connecting... Please
+        // Wait..." until the host answers, then the same world-loading bar an
+        // offline start shows. Nothing else is on them.
+        if (active_step <= 1U ? draw_retail_connecting()
+                              : draw_retail_loading_bar(
+                                    retail_message::loading_world(presentation_generation()),
+                                    progress))
+            return;
+
+        const float panel_width = std::min(780.0F * s, metrics_.safe.width * 0.88F);
+        const float panel_height = 270.0F * s;
         const Rect panel{metrics_.safe.x + (metrics_.safe.width - panel_width) * 0.5F,
-                         metrics_.safe.y + (metrics_.safe.height - panel_height) * 0.5F + 34.0F * s,
+                         metrics_.safe.y + (metrics_.safe.height - panel_height) * 0.5F,
                          panel_width, panel_height};
-        fill({panel.x + 12.0F * s, panel.y + 14.0F * s, panel.width, panel.height},
-             {0U, 0U, 0U, 105U});
-        fill(panel, {7U, 11U, 13U, 247U});
-        stroke(panel, {87U, 99U, 102U, 190U}, std::max(1.0F, s));
-        fill({panel.x, panel.y, panel.width, 5.0F * s}, colors.accent);
-
-        const float left = panel.x + 34.0F * s;
-        const float right = panel.x + panel.width - 34.0F * s;
-        text("SECURE STEAM SESSION  /  AUTHORITATIVE SYNC", left, panel.y + 28.0F * s, 10.0F,
-             colors.accent, TextAlign::left, true);
-        text("SYNCHRONIZING FRONTIER", left, panel.y + 54.0F * s, 29.0F, colors.text,
-             TextAlign::left, true);
-        const std::string server =
-            online_join_server_name_.empty() ? "CASTLEMINER Z SESSION" : online_join_server_name_;
-        text(server, left, panel.y + 101.0F * s, 14.0F, colors.text);
-        const std::string host = online_join_host_name_.empty()
-                                     ? "RESOLVING HOST IDENTITY"
-                                     : std::format("HOST  {}", online_join_host_name_);
-        text(host, left, panel.y + 126.0F * s, 10.0F, colors.secondary);
-
-        const std::string protocol = uppercase(net::protocol_label(online_client_protocol_));
-        const Rect protocol_box{right - 148.0F * s, panel.y + 42.0F * s, 148.0F * s, 46.0F * s};
-        fill(protocol_box, {21U, 27U, 29U, 255U});
-        stroke(protocol_box, colors.line, std::max(1.0F, s));
-        text(protocol, protocol_box.x + protocol_box.width * 0.5F, protocol_box.y + 13.0F * s,
-             11.0F, colors.text, TextAlign::center, true);
-
-        fill({left, panel.y + 157.0F * s, right - left, std::max(1.0F, s)}, colors.line);
-        constexpr std::array<std::string_view, 5> step_labels{
-            "STEAM LOBBY", "HOST ADMISSION", "PLAYER DATA", "WORLD DELTAS", "RENDER READY"};
-        const float steps_y = panel.y + 181.0F * s;
-        const float gap = 8.0F * s;
-        const float step_width = (right - left - gap * 4.0F) / 5.0F;
-        for (std::size_t index{}; index < step_labels.size(); ++index)
-        {
-            const bool complete = index < active_step;
-            const bool active = index == active_step;
-            const Rect step{left + static_cast<float>(index) * (step_width + gap), steps_y,
-                            step_width, 82.0F * s};
-            fill(step, active     ? SDL_Color{34U, 17U, 19U, 255U}
-                       : complete ? SDL_Color{19U, 25U, 25U, 255U}
-                                  : SDL_Color{12U, 16U, 18U, 255U});
-            stroke(step, active ? colors.accent : colors.line, active ? 2.0F * s : 1.0F * s);
-            if (complete)
-                fill({step.x, step.y, step.width, 3.0F * s}, {126U, 151U, 141U, 255U});
-            else if (active)
-                fill({step.x, step.y, step.width, 3.0F * s}, colors.accent);
-            text(std::format("{:02}", index + 1U), step.x + 13.0F * s, step.y + 13.0F * s, 10.0F,
-                 active     ? colors.accent
-                 : complete ? colors.text
-                            : colors.secondary,
-                 TextAlign::left, active);
-            text(step_labels[index], step.x + 13.0F * s, step.y + 45.0F * s, 9.0F,
-                 active || complete ? colors.text : colors.secondary, TextAlign::left, active);
-        }
-
-        const Rect track{left, panel.y + 294.0F * s, right - left, 13.0F * s};
-        fill(track, {22U, 28U, 30U, 255U});
+        fill(panel, colors.panel);
+        stroke(panel, colors.line);
+        const float left = panel.x + 32.0F * s;
+        const float right = panel.x + panel.width - 32.0F * s;
+        text("Joining game", left, panel.y + 28.0F * s, 29.0F, colors.text);
+        text(net::protocol_label(online_client_protocol_), right, panel.y + 36.0F * s, 15.0F,
+             protocol_color(online_client_protocol_), TextAlign::right);
+        world_text(online_join_server_name_.empty() ? "Server" : online_join_server_name_, left,
+                   panel.y + 85.0F * s, 18.0F, right - left, colors.text);
+        if (!online_join_host_name_.empty())
+            world_text("Hosted by " + online_join_host_name_, left, panel.y + 114.0F * s, 13.0F,
+                       right - left, colors.secondary);
+        constexpr std::array<std::string_view, 5> stages{
+            "Connecting...", "Waiting for the host...", "Loading your player...",
+            "Loading the world...", "Preparing the world..."};
+        text(stages[active_step], left, panel.y + 170.0F * s, 14.0F, colors.secondary);
+        const Rect track{left, panel.y + 207.0F * s, right - left, 8.0F * s};
+        fill(track, colors.line);
         fill({track.x, track.y, track.width * progress, track.height}, colors.accent);
-        const float pulse =
-            settings_.reduced_motion ? 1.0F : 0.70F + 0.30F * std::sin(online_join_elapsed_ * 5.0F);
-        const Uint8 pulse_alpha = static_cast<Uint8>(145.0F + 110.0F * pulse);
-        const float head_x = track.x + track.width * progress;
-        fill({std::max(track.x, head_x - 4.0F * s), track.y - 3.0F * s, 4.0F * s,
-              track.height + 6.0F * s},
-             {255U, 205U, 207U, pulse_alpha});
-        text(std::format("{:3.0F}%", progress * 100.0F), right, panel.y + 319.0F * s, 11.0F,
-             colors.text, TextAlign::right, true);
-        text(online_join_detail_, left, panel.y + 321.0F * s, 11.0F, colors.secondary);
-
-        const Rect status{left, panel.y + 365.0F * s, right - left, 43.0F * s};
-        fill(status, {11U, 17U, 18U, 255U});
-        stroke(status, colors.line, std::max(1.0F, s));
-        const std::string identity = online_persona_name_.empty()
-                                         ? "STEAM IDENTITY PENDING"
-                                         : std::format("STEAM IDENTITY  {}", online_persona_name_);
-        text(identity, status.x + 14.0F * s, status.y + 13.0F * s, 10.0F, colors.text);
-        const std::string authority =
-            online_join_lobby_id_ == 0U
-                ? "LIVE AUTHORITY  /  PACKETS VALIDATED"
-                : std::format("LOBBY {}  /  PACKETS VALIDATED", online_join_lobby_id_);
-        text(authority, status.x + status.width - 14.0F * s, status.y + 13.0F * s, 10.0F,
+        text(std::format("{:.0f}%", progress * 100.0F), right, panel.y + 233.0F * s, 12.0F,
              colors.secondary, TextAlign::right);
+        if (online_join_in_progress())
+            text(gamepad_input_active_ ? "B  Cancel" : "Esc  Cancel", left, panel.y + 233.0F * s,
+                 12.0F, colors.secondary);
+    }
+
+    // FrontEndScreen._loadingScreen_BeforeDraw / InGameWaitScreen.OnDraw: the
+    // caption in LargeFont (white, one-pixel outline, scale 1 on the build's
+    // canvas) starting at
+    // the left edge of a bar 80% of the screen wide; the bar one LargeFont line
+    // high, black inside a two-pixel white border, filled from the "Bar"
+    // sprite. Returns false without imported fonts.
+    bool draw_retail_loading_bar(std::string_view caption, float progress)
+    {
+        RetailFonts *fonts = retail_fonts();
+        if (fonts == nullptr)
+            return false;
+        const RetailCanvas canvas = retail_canvas();
+        const bool modern = presentation_generation() == RetailGeneration::modern;
+        const RetailFont font = RetailFont::large;
+        const float line = static_cast<float>(fonts->font(font)->line_spacing());
+        const float width = std::floor(canvas.width * 0.8F);
+        const float left = std::floor((canvas.width - canvas.width * 0.8F) * 0.5F);
+        const float text_y =
+            std::floor(canvas.height * 0.5F) + fonts->measure(font, caption).height;
+        canvas_text(*fonts, canvas, font, caption, left, text_y, {255U, 255U, 255U, 255U}, 1);
+        // 1.6.3.8: 10 * viewport.Height / 1080 (its viewport is the 720-row
+        // buffer); 1.9.9.8: 10 * Adjuster.ScaleFactor.Y (window height / 720).
+        const float top =
+            std::floor(text_y + line + 10.0F * canvas.height / (modern ? 720.0F : 1080.0F));
+        canvas_fill(canvas, left - 2.0F, top - 2.0F, width + 4.0F, line + 4.0F,
+                    {255U, 255U, 255U, 255U});
+        canvas_fill(canvas, left, top, width, line, {0U, 0U, 0U, 255U});
+        progress = std::clamp(progress, 0.0F, 1.0F);
+        const float filled = std::floor(width * progress);
+        if (SDL_Texture *bar = award_art_[modern ? 1U : 0U][3]; bar != nullptr)
+        {
+            // The right-hand `progress` of the sprite, stretched over the fill.
+            float sprite_width{};
+            float sprite_height{};
+            SDL_GetTextureSize(bar, &sprite_width, &sprite_height);
+            const float used = std::floor(sprite_width * progress);
+            const SDL_FRect source{sprite_width - used, 0.0F, used, sprite_height};
+            if (used >= 1.0F && filled >= 1.0F)
+                canvas_sprite(canvas, bar, &source, left, top, filled, line);
+        }
+        else
+        {
+            canvas_fill(canvas, left, top, filled, line, {178U, 34U, 34U, 255U});
+        }
+        return true;
+    }
+
+    // FrontEndScreen._connectingScreen_BeforeDraw: the caption alone, centred,
+    // pulsing from red (1.6.3.8) or green (1.9.9.8) to white every half second.
+    bool draw_retail_connecting()
+    {
+        RetailFonts *fonts = retail_fonts();
+        if (fonts == nullptr)
+            return false;
+        const RetailGeneration generation = presentation_generation();
+        const std::string caption = retail_message::connecting(generation);
+        const RetailFont font = RetailFont::large;
+        const TextExtent size = fonts->measure(font, caption);
+        const float pulse = std::fmod(elapsed_, 0.5F) / 0.5F;
+        const auto toward_white = [pulse](float start) {
+            return static_cast<Uint8>(std::lround(start + (255.0F - start) * pulse));
+        };
+        // Color.Red is (255, 0, 0); Color.Green is (0, 128, 0).
+        const SDL_Color color = generation == RetailGeneration::modern
+                                    ? SDL_Color{toward_white(0.0F), toward_white(128.0F),
+                                                toward_white(0.0F), 255U}
+                                    : SDL_Color{255U, toward_white(0.0F), toward_white(0.0F), 255U};
+        const RetailCanvas canvas = retail_canvas();
+        canvas_text(*fonts, canvas, font, caption,
+                    std::floor(canvas.width * 0.5F) - size.width * 0.5F,
+                    std::floor(canvas.height * 0.5F) + size.height, color, 1);
+        return true;
     }
 
     void draw_world_loading()
     {
+        if (draw_retail_loading_bar(retail_message::loading_world(presentation_generation()),
+                                    world_preview_->preload_progress()))
+            return;
         const auto colors = palette(settings_.high_contrast);
         const float s = metrics_.scale;
         const float progress = world_preview_->preload_progress();
@@ -17564,9 +21900,9 @@ class Application::Impl final
         fill(panel, colors.panel);
         stroke(panel, colors.line, 1.0F * s);
         fill({panel.x, panel.y, panel.width, 4.0F * s}, colors.accent);
-        text("PREPARING FRONTIER", panel.x + 34.0F * s, panel.y + 34.0F * s, 24.0F, colors.text);
-        text("GENERATING VOXELS  /  BUILDING VERTICAL CHUNK SECTIONS", panel.x + 34.0F * s,
-             panel.y + 79.0F * s, 11.0F, colors.secondary);
+        text("LOADING WORLD", panel.x + 34.0F * s, panel.y + 34.0F * s, 24.0F, colors.text);
+        text("Preparing terrain...", panel.x + 34.0F * s, panel.y + 79.0F * s, 11.0F,
+             colors.secondary);
         const Rect track{panel.x + 34.0F * s, panel.y + 125.0F * s, panel.width - 68.0F * s,
                          12.0F * s};
         fill(track, {26U, 31U, 32U, 255U});
@@ -17580,44 +21916,120 @@ class Application::Impl final
         toast_title_ = std::move(title);
         toast_body_ = std::move(body);
         toast_time_ = 4.2F;
+        // An ordinary notice; alert() marks the ones every style must show.
+        toast_urgent_ = false;
     }
 
-    void scan_addons()
+    // (Add-Ons) scan_addons, which fills mod_catalog_ with the mods that are
+    // on, lives in app_mod_addons.inc.
+
+    // Window mode plus size: the unit a display change applies or reverts.
+    struct DisplayConfig final
     {
-        addons_.clear();
-        mod_catalog_ = {};
-        mod_catalog_error_.clear();
-        mod_catalog_valid_ = net::load_mod_catalog(std::filesystem::current_path() / "addons",
-                                                   mod_catalog_, mod_catalog_error_);
-        if (!mod_catalog_valid_)
-        {
-            addons_.push_back("BLOCKED  /  " + uppercase(mod_catalog_error_));
-            host_settings_.mod_manifest = {};
-            host_settings_.mod_manifest.protocol = host_settings_.protocol;
-            join_client_manifest_ = {};
-            join_client_manifest_.protocol = net::ProtocolVersion::classic_v3;
-            join_browser_.set_client(join_client_manifest_, true);
+        WindowMode mode{WindowMode::windowed};
+        int width{};
+        int height{};
+        bool operator==(const DisplayConfig &) const noexcept = default;
+    };
+
+    [[nodiscard]] DisplayConfig display_config_from_settings() const noexcept
+    {
+        return {settings_.window_mode, settings_.window_width, settings_.window_height};
+    }
+
+    // Ask the monitor under the window what it can do: its desktop size and
+    // refresh rate, and every resolution it accepts in exclusive fullscreen.
+    void refresh_display_capabilities()
+    {
+        fullscreen_modes_.clear();
+        desktop_size_ = {};
+        display_refresh_rate_ = 0;
+        SDL_DisplayID display = window_ != nullptr ? SDL_GetDisplayForWindow(window_) : 0U;
+        if (display == 0U)
+            display = SDL_GetPrimaryDisplay();
+        if (display == 0U)
             return;
-        }
-        for (const net::LoadedMod &mod : mod_catalog_.mods)
+        if (const SDL_DisplayMode *desktop = SDL_GetDesktopDisplayMode(display))
+            desktop_size_ = {desktop->w, desktop->h};
+        // The mode in use right now, which differs from the desktop's while an
+        // exclusive fullscreen mode is active.
+        if (const SDL_DisplayMode *current = SDL_GetCurrentDisplayMode(display))
+            display_refresh_rate_ = static_cast<int>(std::lround(current->refresh_rate));
+        int count{};
+        if (SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(display, &count))
         {
-            const std::string profiles = mod.classic && mod.modern ? "CLASSIC+MODERN"
-                                         : mod.classic             ? "CLASSIC"
-                                                                   : "MODERN";
-            addons_.push_back(std::format("{} {}  /  {}  /  {}", mod.descriptor.id,
-                                          mod.descriptor.version,
-                                          net::mod_scope_label(mod.descriptor.scope), profiles));
+            for (int index = 0; index < count; ++index)
+                if (modes[index] != nullptr && modes[index]->w >= 960 && modes[index]->h >= 540)
+                    fullscreen_modes_.emplace_back(modes[index]->w, modes[index]->h);
+            SDL_free(modes);
         }
-        if (!net::make_mod_manifest(mod_catalog_, host_settings_.protocol,
-                                    host_settings_.mod_manifest, mod_catalog_error_) ||
-            !net::make_mod_manifest(mod_catalog_, net::ProtocolVersion::classic_v3,
-                                    join_client_manifest_, mod_catalog_error_))
+        std::sort(fullscreen_modes_.begin(), fullscreen_modes_.end());
+        fullscreen_modes_.erase(std::unique(fullscreen_modes_.begin(), fullscreen_modes_.end()),
+                                fullscreen_modes_.end());
+    }
+
+    // The sizes the Resolution row steps through. Exclusive fullscreen offers
+    // only what the monitor reports; a window offers common sizes as well, but
+    // nothing larger than the desktop it has to fit on.
+    [[nodiscard]] std::vector<std::pair<int, int>> resolution_choices() const
+    {
+        if (settings_.window_mode == WindowMode::fullscreen && !fullscreen_modes_.empty())
+            return fullscreen_modes_;
+        std::vector<std::pair<int, int>> sizes{{1280, 720},  {1600, 900},  {1920, 1080},
+                                               {2560, 1440}, {3440, 1440}, {3840, 2160}};
+        sizes.insert(sizes.end(), fullscreen_modes_.begin(), fullscreen_modes_.end());
+        if (desktop_size_.first > 0 && desktop_size_.second > 0)
+            std::erase_if(sizes, [&](const auto &size) {
+                return size.first > desktop_size_.first || size.second > desktop_size_.second;
+            });
+        if (sizes.empty())
+            sizes.emplace_back(1280, 720);
+        return sizes;
+    }
+
+    // "Match display" stores the monitor's refresh rate in frame_limit, which
+    // is the only number the frame limiter reads.
+    void sync_frame_limit_to_display()
+    {
+        if (settings_.frame_limit_mode != FrameLimitMode::display || display_refresh_rate_ <= 0)
+            return;
+        const int target = std::clamp(display_refresh_rate_, 30, 360);
+        if (settings_.frame_limit != target)
         {
-            mod_catalog_valid_ = false;
-            addons_.clear();
-            addons_.push_back("BLOCKED  /  " + uppercase(mod_catalog_error_));
+            settings_.frame_limit = target;
+            dirty_ = true;
         }
-        join_browser_.set_client(join_client_manifest_, true);
+    }
+
+    // Runs once the window exists. The saved display mode used to be ignored
+    // at launch, so a player who chose Borderless got a small window every
+    // time. Explicit sizes, captures and benchmarks keep their plain window.
+    void initialize_display_settings()
+    {
+        refresh_display_capabilities();
+        int width{};
+        int height{};
+        SDL_GetWindowSize(window_, &width, &height);
+        applied_display_ = {WindowMode::windowed, width, height};
+        const bool honour_saved_mode = !options_.screenshot_path.has_value() &&
+                                       options_.width <= 0 && options_.bench_frames <= 0;
+        if (honour_saved_mode && settings_.window_mode != WindowMode::windowed)
+            apply_window_settings();
+        else if (honour_saved_mode)
+            applied_display_ = display_config_from_settings();
+        sync_frame_limit_to_display();
+        if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_DISPLAY_CONFIRM") != nullptr)
+        {
+            // Lets a capture show the keep/revert prompt without switching modes.
+            display_revert_ = applied_display_;
+            display_confirm_seconds_ = 9.0F;
+        }
+        if (SDL_getenv("OPENMINERZ_DIAGNOSTIC_RESET_ARMED") != nullptr)
+        {
+            // Likewise for the "press again to reset" state of the open page.
+            reset_armed_tab_ = menu_.settings_tab();
+            reset_armed_seconds_ = 4.0F;
+        }
     }
 
     void apply_window_settings()
@@ -17628,6 +22040,13 @@ class Application::Impl final
         }
         if (settings_.window_mode == WindowMode::windowed)
         {
+            // A window larger than the desktop cannot be reached with the mouse.
+            if (desktop_size_.first > 0 && desktop_size_.second > 0)
+            {
+                settings_.window_width = std::min(settings_.window_width, desktop_size_.first);
+                settings_.window_height = std::min(settings_.window_height, desktop_size_.second);
+                settings_.normalize();
+            }
             SDL_SetWindowFullscreen(window_, false);
             SDL_SetWindowFullscreenMode(window_, nullptr);
             SDL_SetWindowBordered(window_, true);
@@ -17649,21 +22068,347 @@ class Application::Impl final
             {
                 SDL_SetWindowFullscreenMode(window_, &closest);
                 SDL_SetWindowFullscreen(window_, true);
+                // Show the mode the monitor really entered, not the request.
+                settings_.window_width = closest.w;
+                settings_.window_height = closest.h;
+                settings_.normalize();
             }
             else
             {
+                // No exclusive mode is available: fill the desktop instead of
+                // leaving the player with a mode that could not be entered.
+                settings_.window_mode = WindowMode::borderless;
                 SDL_SetWindowFullscreenMode(window_, nullptr);
                 SDL_SetWindowFullscreen(window_, true);
             }
         }
         SDL_SyncWindow(window_);
+        applied_display_ = display_config_from_settings();
+        refresh_display_capabilities();
+        sync_frame_limit_to_display();
+    }
+
+    // The player dragged the window edge. Remember that size so the Resolution
+    // row shows what is really on screen and the next launch reopens the same
+    // window. Fullscreen sizes, explicit --size launches and captures are not
+    // the player's choice of window and are left alone.
+    void note_window_resized(int width, int height)
+    {
+        if (settings_.window_mode != WindowMode::windowed ||
+            applied_display_.mode != WindowMode::windowed || display_apply_pending_ ||
+            display_prompt_active() || options_.screenshot_path.has_value() ||
+            options_.width > 0 || options_.bench_frames > 0 || width < 960 || height < 540)
+            return;
+        if ((SDL_GetWindowFlags(window_) &
+             (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED | SDL_WINDOW_MINIMIZED)) != 0U)
+            return;
+        if (settings_.window_width == width && settings_.window_height == height)
+            return;
+        settings_.window_width = width;
+        settings_.window_height = height;
+        settings_.normalize();
+        applied_display_ = display_config_from_settings();
+        dirty_ = true;
+        dirty_timer_ = 1.0F;
+    }
+
+    // A display-mode or resolution change is applied a moment after the last
+    // key press, so stepping through five resolutions is one mode switch, not
+    // five. Windowed and borderless are always safe; only an exclusive
+    // fullscreen mode asks to be kept and otherwise reverts by itself.
+    void request_display_change()
+    {
+        display_apply_pending_ = true;
+        display_apply_delay_ = 0.45F;
+    }
+
+    void commit_display_change()
+    {
+        display_apply_pending_ = false;
+        display_apply_delay_ = 0.0F;
+        const DisplayConfig previous = applied_display_;
+        if (display_config_from_settings() == previous)
+            return;
+        apply_window_settings();
+        if (options_.screenshot_path.has_value())
+            return;
+        if (applied_display_.mode == WindowMode::fullscreen && !(applied_display_ == previous))
+        {
+            display_revert_ = previous;
+            display_confirm_seconds_ = 12.0F;
+        }
+        dirty_ = true;
+        dirty_timer_ = 0.0F;
+    }
+
+    void keep_display_change()
+    {
+        if (!display_revert_.has_value())
+            return;
+        display_revert_.reset();
+        display_confirm_seconds_ = 0.0F;
+        dirty_ = true;
+        dirty_timer_ = 0.0F;
+        toast("DISPLAY MODE KEPT", std::format("FULLSCREEN AT {} X {}", settings_.window_width,
+                                                settings_.window_height));
+    }
+
+    void revert_display_change()
+    {
+        if (!display_revert_.has_value())
+            return;
+        const DisplayConfig previous = *display_revert_;
+        display_revert_.reset();
+        display_confirm_seconds_ = 0.0F;
+        settings_.window_mode = previous.mode;
+        settings_.window_width = previous.width;
+        settings_.window_height = previous.height;
+        settings_.normalize();
+        apply_window_settings();
+        dirty_ = true;
+        dirty_timer_ = 0.0F;
+        toast("DISPLAY MODE RESTORED", "THE PREVIOUS DISPLAY SETTINGS ARE BACK IN USE");
+    }
+
+    // Timers for the settings screen. Called from render() with its own clock,
+    // so it keeps running whatever the simulation or the pause state is doing.
+    void service_settings_runtime()
+    {
+        const auto now = Clock::now();
+        const float delta = std::clamp(
+            std::chrono::duration<float>(now - settings_service_time_).count(), 0.0F, 0.25F);
+        settings_service_time_ = now;
+        if (reset_armed_seconds_ > 0.0F)
+            reset_armed_seconds_ = std::max(0.0F, reset_armed_seconds_ - delta);
+        if (menu_.screen() != ui::MenuScreen::settings ||
+            menu_.settings_tab() != reset_armed_tab_)
+            reset_armed_seconds_ = 0.0F;
+        if (display_apply_pending_)
+        {
+            display_apply_delay_ -= delta;
+            // Leaving the screen must not strand a half-chosen mode.
+            if (display_apply_delay_ <= 0.0F || menu_.screen() != ui::MenuScreen::settings)
+                commit_display_change();
+        }
+        if (display_revert_.has_value() &&
+            SDL_getenv("OPENMINERZ_DIAGNOSTIC_DISPLAY_CONFIRM") == nullptr)
+        {
+            display_confirm_seconds_ -= delta;
+            if (display_confirm_seconds_ <= 0.0F)
+                revert_display_change();
+        }
+    }
+
+    [[nodiscard]] bool display_prompt_active() const noexcept
+    {
+        return display_revert_.has_value();
+    }
+
+    // Push every renderer-facing setting. Used at start-up and whenever a new
+    // world renderer is created: a fresh renderer starts from its own
+    // defaults, which used to drop the player's tone, exposure and colour
+    // choices as soon as a world was started or loaded.
+    void apply_render_settings()
+    {
+        if (world_preview_ == nullptr)
+            return;
+        world_preview_->set_particle_density(particle_density(settings_.particle_quality));
+        apply_grading_settings();
+        world_preview_->set_quality(shadow_map_resolution(settings_.shadow_quality),
+                                    static_cast<float>(settings_.graphics.shadow_distance),
+                                    settings_.texture_filtering,
+                                    settings_.anti_aliasing != AntiAliasing::off, settings_.bloom,
+                                    settings_.sun_shafts);
+        // The Enhanced presentation's sky and post-processing chain. Resolves
+        // to "nothing" for the Original presentation, which never changes.
+        world_preview_->set_post_effects(resolve_post_effects(settings_));
+        // Far terrain: likewise off for the Original presentation.
+        // OPENMINERZ_FAR_TERRAIN="off" or "<kilometres>[,<cell>[,<ring>]]"
+        // overrides the setting for one diagnostic run and is never saved.
+        FarTerrainChoice far_terrain = resolve_far_terrain(settings_);
+        if (const char *override_text = SDL_getenv("OPENMINERZ_FAR_TERRAIN");
+            override_text != nullptr && settings_.presentation == PresentationProfile::rebirth)
+        {
+            float kilometres{};
+            int cell = far_terrain.base_cell;
+            int ring = far_terrain.ring_cells;
+            if (std::string_view{override_text} == "off")
+                far_terrain.distance = 0;
+            else if (std::sscanf(override_text, "%f,%d,%d", &kilometres, &cell, &ring) >= 1 &&
+                     std::isfinite(kilometres))
+                far_terrain = {static_cast<int>(std::clamp(kilometres, 0.0F, 16.0F) * 1000.0F),
+                               cell, ring};
+        }
+        world_preview_->set_far_terrain(
+            {far_terrain.distance, far_terrain.base_cell, far_terrain.ring_cells});
+    }
+
+    // Apply whatever differs from `before`. Presets and page resets change many
+    // options at once, so this compares state instead of trusting which row
+    // was touched.
+    void apply_settings_change(const Settings &before)
+    {
+        dirty_ = true;
+        dirty_timer_ = 0.45F;
+        reset_armed_seconds_ = 0.0F;
+        if (before.view_distance != settings_.view_distance && world_preview_ != nullptr)
+            world_preview_->set_view_distance(settings_.view_distance);
+        apply_render_settings();
+        apply_audio_settings();
+        if (before.raw_mouse_input != settings_.raw_mouse_input)
+            SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE,
+                        settings_.raw_mouse_input ? "0" : "1");
+        if (before.frame_limit_mode != settings_.frame_limit_mode)
+            sync_frame_limit_to_display();
+        if (before.window_mode != settings_.window_mode ||
+            before.window_width != settings_.window_width ||
+            before.window_height != settings_.window_height)
+            request_display_change();
+    }
+
+    void restart_notice_for(const Settings &before)
+    {
+        if (before.texture_style != settings_.texture_style)
+            toast(settings_.texture_style == loaded_asset_style_ ? "TEXTURE PACK UNCHANGED"
+                                                                 : "RESTART TO APPLY",
+                  settings_.texture_style == loaded_asset_style_
+                      ? std::string{"THIS PACK IS ALREADY LOADED"}
+                      : std::format("THE {} TEXTURE PACK LOADS THE NEXT TIME YOU START THE GAME",
+                                    ui::setting_value(settings_, ui::SettingId::texture_style)));
+        if (before.audio_output_id != settings_.audio_output_id)
+            toast("RESTART TO APPLY",
+                  std::format("SOUND WILL PLAY THROUGH {} THE NEXT TIME YOU START THE GAME",
+                              uppercase(settings_.audio_output_name.empty()
+                                            ? std::string{"THE SYSTEM DEFAULT"}
+                                            : settings_.audio_output_name)));
+    }
+
+    // Leaving the settings screen. A display change still inside its short
+    // apply delay is committed first; if that opens the keep/revert prompt the
+    // player has to answer it before going anywhere.
+    void leave_settings_screen()
+    {
+        if (display_prompt_active())
+            return;
+        if (display_apply_pending_)
+        {
+            commit_display_change();
+            if (display_prompt_active())
+                return;
+        }
+        handle(menu_.back());
+    }
+
+    // Keys the settings screen handles itself. Returns true when consumed.
+    [[nodiscard]] bool settings_screen_key(SDL_Keycode key)
+    {
+        if (display_prompt_active())
+        {
+            if (key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE)
+                keep_display_change();
+            else if (key == SDLK_ESCAPE || key == SDLK_BACKSPACE)
+                revert_display_change();
+            return true;
+        }
+        switch (key)
+        {
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:
+        case SDLK_SPACE:
+            // Goes through adjust() so the change is applied and saved; the
+            // menu model on its own only edits the stored value.
+            adjust(1);
+            return true;
+        case SDLK_ESCAPE:
+            leave_settings_screen();
+            return true;
+        case SDLK_R:
+            request_page_reset();
+            return true;
+        case SDLK_Q:
+        case SDLK_PAGEUP:
+            menu_.change_tab(-1, settings_);
+            return true;
+        case SDLK_E:
+        case SDLK_PAGEDOWN:
+            menu_.change_tab(1, settings_);
+            return true;
+        case SDLK_K:
+            // UI area (app_mod_ui.inc): the add-on key bindings page.
+            if (menu_.settings_tab() != ui::SettingsTab::controls || !mod_ui_has_bindings())
+                return false;
+            mod_ui_->open_bindings_screen();
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // The same for a controller. Returns true when consumed.
+    [[nodiscard]] bool settings_screen_button(Uint8 button)
+    {
+        if (display_prompt_active())
+        {
+            if (button == SDL_GAMEPAD_BUTTON_SOUTH)
+                keep_display_change();
+            else if (button == SDL_GAMEPAD_BUTTON_EAST)
+                revert_display_change();
+            return true;
+        }
+        switch (button)
+        {
+        case SDL_GAMEPAD_BUTTON_SOUTH:
+            adjust(1);
+            return true;
+        case SDL_GAMEPAD_BUTTON_EAST:
+            leave_settings_screen();
+            return true;
+        case SDL_GAMEPAD_BUTTON_NORTH:
+            request_page_reset();
+            return true;
+        case SDL_GAMEPAD_BUTTON_WEST:
+            // UI area (app_mod_ui.inc): the add-on key bindings page.
+            if (menu_.settings_tab() != ui::SettingsTab::controls || !mod_ui_has_bindings())
+                return false;
+            mod_ui_->open_bindings_screen();
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // "Reset page": the first press arms it, a second within a few seconds
+    // restores every option on the open page to its default.
+    void request_page_reset()
+    {
+        if (menu_.screen() != ui::MenuScreen::settings || display_prompt_active())
+            return;
+        const ui::SettingsTab tab = menu_.settings_tab();
+        if (reset_armed_seconds_ <= 0.0F || reset_armed_tab_ != tab)
+        {
+            reset_armed_tab_ = tab;
+            reset_armed_seconds_ = 4.0F;
+            return;
+        }
+        const Settings before = settings_;
+        ui::reset_tab(settings_, tab);
+        apply_settings_change(before);
+        SDL_SetRenderVSync(renderer_, settings_.vsync ? 1 : 0);
+        restart_notice_for(before);
+        toast("DEFAULTS RESTORED",
+              std::format("{} IS BACK TO ITS ORIGINAL SETTINGS", ui::tab_title(tab)));
     }
 
     void apply_audio_settings()
     {
+        if (voice_audio_ != nullptr)
+            voice_audio_->set_volume(settings_.mute_unfocused && !window_focused_
+                                         ? 0.0F
+                                         : settings_.master_volume * settings_.voice_volume);
         if (sound_bank_ == nullptr)
             return;
-        sound_bank_->set_levels(settings_.master_volume, settings_.music_volume,
+        // (fix) mod_music_duck_: a mod's music plays (app_mod_graphics.inc).
+        sound_bank_->set_levels(settings_.master_volume, settings_.music_volume * mod_music_duck_,
                                 settings_.effects_volume, settings_.ambience_volume,
                                 settings_.mute_unfocused && !window_focused_);
     }
@@ -17692,7 +22437,27 @@ class Application::Impl final
         }
         try
         {
-            store_.save(settings_);
+            // A fullscreen mode the player has not yet agreed to keep, or a
+            // change still inside its apply delay, must not be what the next
+            // launch starts in: write the configuration known to work.
+            Settings to_save = settings_;
+            if (display_revert_.has_value() || display_apply_pending_)
+            {
+                const DisplayConfig &safe =
+                    display_revert_.has_value() ? *display_revert_ : applied_display_;
+                to_save.window_mode = safe.mode;
+                to_save.window_width = safe.width;
+                to_save.window_height = safe.height;
+            }
+            // A composed still's view overrides are not the player's choices.
+            if (options_.clean_view)
+            {
+                to_save.hud_visible = stored_hud_visible_;
+                to_save.show_fps = stored_show_fps_;
+            }
+            if (options_.still_fov.has_value())
+                to_save.vertical_fov = stored_vertical_fov_;
+            store_.save(to_save);
             dirty_ = false;
             dirty_timer_ = 0.0F;
         }
@@ -17745,7 +22510,7 @@ class Application::Impl final
             snapshot.phase = waiting_for_world_
                                  ? InteropStatePhase::loading
                              : menu_.screen() == ui::MenuScreen::world_preview ||
-                                       menu_.screen() == ui::MenuScreen::pause
+                                       in_game_menu_screen()
                                  ? InteropStatePhase::world
                                  : InteropStatePhase::frontend;
             snapshot.protocol = inventory_.profile() == InventoryProfile::modern
@@ -17816,28 +22581,99 @@ class Application::Impl final
         SDL_Surface *full = SDL_RenderReadPixels(renderer_, nullptr);
         if (full == nullptr)
             return;
-        SDL_Surface *scaled = SDL_ScaleSurface(full, 480, 270, SDL_SCALEMODE_LINEAR);
+        // Center-crop to 16:9 rather than stretching ultrawide or 4:3 views.
+        SDL_Rect crop{0, 0, full->w, full->h};
+        if (full->w * 9 > full->h * 16)
+        {
+            crop.w = full->h * 16 / 9;
+            crop.x = (full->w - crop.w) / 2;
+        }
+        else
+        {
+            crop.h = full->w * 9 / 16;
+            crop.y = (full->h - crop.h) / 2;
+        }
+        SDL_Surface *scaled = SDL_CreateSurface(960, 540, SDL_PIXELFORMAT_RGBA32);
+        const bool copied =
+            scaled && SDL_BlitSurfaceScaled(full, &crop, scaled, nullptr, SDL_SCALEMODE_LINEAR);
         SDL_DestroySurface(full);
-        if (scaled == nullptr)
+        if (!copied)
+        {
+            SDL_DestroySurface(scaled);
             return;
-        const std::filesystem::path path = world_preview_path(active_world_path_);
-        std::error_code error;
-        std::filesystem::create_directories(path.parent_path(), error);
-        if (!error && !SDL_SaveBMP(scaled, path.string().c_str()))
+        }
+        world_thumbnail_ = std::shared_ptr<SDL_Surface>{scaled, SDL_DestroySurface};
+    }
+
+    void persist_world_thumbnail()
+    {
+        if (!world_thumbnail_ || active_world_path_.empty())
+            return;
+        SDL_IOStream *output = SDL_IOFromDynamicMem();
+        if (!output)
+            return;
+        const bool encoded = SDL_SaveBMP_IO(world_thumbnail_.get(), output, false);
+        const auto length = SDL_GetIOSize(output);
+        const auto *data = static_cast<const std::uint8_t *>(SDL_GetPointerProperty(
+            SDL_GetIOProperties(output), SDL_PROP_IOSTREAM_DYNAMIC_MEMORY_POINTER, nullptr));
+        if (!encoded || !data || length <= 0 ||
+            !write_file_atomically(world_preview_path(active_world_path_),
+                                   {data, static_cast<std::size_t>(length)}))
             std::cerr << "world.preview.capture.failure=" << SDL_GetError() << '\n';
-        SDL_DestroySurface(scaled);
+        SDL_CloseIO(output);
     }
 
     LaunchOptions options_;
+    WorldHistory world_history_;
+    double world_play_time_frame_seconds_{};
+    std::shared_ptr<SDL_Surface> world_thumbnail_;
+    bool world_thumbnail_requested_{};
+    bool pending_world_exit_{};
     SettingsStore store_;
     Settings settings_;
+    // The saved values a composed still (--clean-view, --fov) overrides for
+    // its run only; save_settings writes these back instead.
+    bool stored_hud_visible_{};
+    bool stored_show_fps_{};
+    float stored_vertical_fov_{};
     AssetStyle loaded_asset_style_{AssetStyle::modern};
     ui::MenuModel menu_;
     SDL_Window *window_{};
     SDL_Renderer *renderer_{};
     std::unique_ptr<FontRenderer> font_;
+    // The shipped sprite fonts of each build (see retail_fonts()).
+    std::unique_ptr<RetailFonts> classic_fonts_;
+    std::unique_ptr<RetailFonts> modern_fonts_;
     std::unique_ptr<WorldPreviewRenderer> world_preview_;
     SDL_Texture *sniper_scope_texture_{};
+    SDL_Texture *health_empty_texture_{};
+    SDL_Texture *health_full_texture_{};
+    SDL_Texture *modern_health_empty_texture_{};
+    SDL_Texture *modern_health_full_texture_{};
+    SDL_Texture *modern_stamina_texture_{};
+    // InGameHUD's sprites as each build ships them (hud_<Name>.bmp in that
+    // build's pack), indexed by hud::Sprite; see draw_retail_hud().
+    HudArt classic_hud_art_;
+    HudArt modern_hud_art_;
+    // Each build's inventory / crate / crafting screen sprites and item-icon
+    // atlas, and the screens themselves (openminerz/screens.hpp).
+    ScreenArt classic_screen_art_;
+    ScreenArt modern_screen_art_;
+    screens::Session screens_;
+    float screens_pointer_x_{-1.0F};
+    float screens_pointer_y_{-1.0F};
+    bool screens_stand_in_logged_{};
+    bool screens_script_done_{};
+    std::size_t screens_script_frames_{};
+    SDL_Cursor *screens_pointer_cursor_{};
+    // drawDayTimer of the original HUD, in seconds, and the day it announces.
+    float hud_day_banner_seconds_{9.0F};
+    int hud_banner_day_{1};
+    // InGameHUD.lastTOD (-1 after construction and Reset()) and the elapsed
+    // part of fadeInGameStart.
+    float hud_last_time_of_day_{-1.0F};
+    float hud_fade_in_seconds_{1.0F};
+    bool hud_art_warning_shown_{};
     SDL_Texture *missile_lock_texture_{};
     SDL_Texture *missile_locking_texture_{};
     std::unique_ptr<StaticModelAsset> pickaxe_art_;
@@ -17871,6 +22707,8 @@ class Application::Impl final
     std::unique_ptr<StaticModelAsset> grenade_icon_art_;
     std::vector<AudioOutputDevice> audio_outputs_;
     std::unique_ptr<OriginalSoundBank> sound_bank_;
+    std::unique_ptr<VoiceChatAudio> voice_audio_;
+    bool voice_talking_{};
     SDL_Gamepad *gamepad_{};
     world::PlayerSimulation player_;
     PlayerInventory inventory_;
@@ -17894,15 +22732,47 @@ class Application::Impl final
     std::int32_t world_seed_{1337};
     world::LightningCycle lightning_cycle_{1337U ^ 0x5A17C0DEULL};
     bool lightning_visible_{};
+    float lightning_strength_{};
     float world_time_speed_{1.0F};
     float world_elapsed_{};
     float physics_accumulator_{};
-    float footstep_timer_{0.5F};
+    // Frame pacing: presentation-side state only (see the "Frame pacing"
+    // helpers). The simulation never reads any of it.
+    PacingOverrides pacing_overrides_{PacingOverrides::from_environment()};
+    pacing::FixedStepCamera fixed_step_camera_;
+    pacing::FrameLimiter frame_limiter_;
+    pacing::PresentLatencyPacer present_pacer_;
+    std::unique_ptr<PresentControl> present_control_;
+    std::optional<PresentQueueInfo> initial_present_queue_;
+    unsigned applied_frame_latency_{};
+    std::int64_t last_present_block_ns_{};
+    std::int64_t refresh_interval_ns_{-1};
+    std::size_t refresh_interval_checked_frame_{};
+    std::uint64_t frame_input_counter_{};
+    double pending_wait_milliseconds_{};
+    FramePhases frame_phases_{};
+    Clock::time_point tick_started_{};
+    std::optional<world::Vec3> presented_camera_;
+    // Look direction the aimed block was last computed for.
+    float targeted_yaw_{};
+    float targeted_pitch_{};
+    // Where creatures stood before the latest tick, and this frame's blended
+    // copies of them. Rendering reads the copies; simulation never does.
+    std::unordered_map<std::uint64_t, TickPose> previous_enemy_poses_;
+    std::optional<TickPose> previous_dragon_pose_;
+    std::vector<world::Enemy> presented_enemies_;
+    world::Dragon presented_dragon_{};
+    // (1 - alpha) ticks, in seconds: how far behind the live simulation state
+    // the frame being drawn sits.
+    float presentation_lag_seconds_{};
+    // Player._footStepTimer of the local player (Player.UpdateAudio).
+    world::FootstepClock local_footsteps_{};
     float placement_animation_time_{};
     ui::UiMetrics metrics_{};
     std::vector<HitRegion> hits_;
     std::vector<float> focus_;
-    std::vector<std::string> addons_;
+    // (Add-Ons) The mods that are on (app_mod_addons.inc): everything that
+    // runs, draws or advertises mods reads this catalog.
     net::ModCatalog mod_catalog_;
     std::string mod_catalog_error_;
     bool mod_catalog_valid_{true};
@@ -17914,11 +22784,21 @@ class Application::Impl final
     std::vector<std::string> join_descriptions_;
     std::vector<std::string> join_badges_;
     std::vector<std::size_t> join_row_sessions_;
-    std::optional<std::size_t> selected_join_session_;
+    // Lobby id of each browser row. The selection and the highlight follow these
+    // ids, so a refresh that reorders rows cannot retarget either.
+    std::vector<std::uint64_t> join_row_ids_;
     std::string join_password_;
     JoinBrowserState join_browser_state_{JoinBrowserState::idle};
     std::string join_browser_status_{"LIVE STEAM DISCOVERY HAS NOT STARTED"};
-    float join_refresh_timer_{30.0F};
+    // Schedules refreshes and queues a join behind the helper's current work.
+    net::JoinBrowserFlow join_flow_;
+    net::JoinProgressWatchdog join_watchdog_;
+    // Why the last join ended, kept on screen for the lobby it concerns.
+    std::string join_failure_text_;
+    std::uint64_t join_failure_lobby_{};
+    // The player cancelled while the helper was still entering the lobby. The
+    // operation cannot be interrupted, so its result is discarded when it lands.
+    bool online_join_cancelled_{};
     bool online_discovery_quiet_{};
     std::string direct_address_;
     std::optional<net::DirectEndpoint> direct_endpoint_;
@@ -17949,7 +22829,11 @@ class Application::Impl final
     std::string ui_join_probe_detail_;
     std::uint8_t online_local_gid_{};
     std::uint8_t online_terrain_server_gid_{};
+    // No longer read: the original does not hurry a PlayerUpdate after a
+    // teleport, death or respawn, so the sites that zero this are inert.
     float online_player_update_timer_{};
+    net::StockPlayerUpdateCadence player_update_cadence_;
+    std::optional<net::PlayerUpdatePayload> last_online_player_update_;
     float online_inventory_save_timer_{10.0F};
     float online_position_save_timer_{5.0F};
     float online_world_update_timer_{5.0F};
@@ -17957,10 +22841,26 @@ class Application::Impl final
     std::string online_world_key_;
     std::map<net::IntVector3, float> pending_chunk_reconciliations_;
     std::map<net::IntVector3, float> requested_chunk_reconciliations_;
+    // Per chunk corner, the cells edited since its reconciliation check was
+    // armed. They survive an authoritative chunk snapshot that may predate
+    // them. See schedule_authoritative_chunk_check/apply_authoritative_chunk.
+    std::map<net::IntVector3, std::set<net::IntVector3>> chunk_reconcile_overlay_;
     std::string online_persona_name_;
     bool steam_identity_verified_{};
     std::optional<std::uint16_t> last_online_carried_item_;
     std::unordered_map<std::uint8_t, OnlineRemotePlayer> online_remote_players_;
+    // UI-font size matched to the shipped NameTagFont: [0] Classic, [1] Modern.
+    struct NametagFontSize final
+    {
+        int pixels{};
+        int baseline{};
+    };
+    std::array<NametagFontSize, 2> nametag_font_sizes_{};
+    net::BootstrapGameplayBuffer bootstrap_gameplay_;
+    net::CrateFocusTracker crate_focus_;
+    std::optional<net::CrateFocusPayload> last_crate_focus_;
+    // (pickup id, spawner id) pairs already credited to the local player.
+    std::deque<std::pair<std::int32_t, std::int32_t>> credited_pickups_;
     std::unordered_map<std::uint8_t, std::vector<PendingPrePresencePacket>>
         pending_pre_presence_packets_;
     std::size_t pending_pre_presence_bytes_{};
@@ -17979,12 +22879,52 @@ class Application::Impl final
     bool inspector_view_{};
     bool inventory_open_{};
     bool locator_name_editing_{};
+    std::optional<world::VoxelRaycastHit> pending_station_placement_;
+    bool station_placement_confirmed_{};
+    std::vector<std::string> travel_names_;
+    std::vector<std::array<float, 3>> travel_points_;
+    // SelectPlayerScreen, pushed by Teleport To Player, Kick Player and Ban
+    // Player. A row means the session GID at the same index, never a label:
+    // the roster can change while the list is open.
+    enum class PlayerPickPurpose : std::uint8_t
+    {
+        teleport,
+        kick,
+        ban
+    };
+    PlayerPickPurpose player_pick_purpose_{PlayerPickPurpose::teleport};
+    std::vector<std::uint8_t> player_pick_gids_;
+    std::vector<std::string> player_pick_names_;
+    // PlayerStats.BanList: the Steam identities this host has banned, kept on
+    // disk across sessions and worlds as the original keeps it.
+    net::HostBanList host_ban_list_{default_host_ban_list_path()};
+    bool diagnostic_teleport_done_{};
     std::size_t locator_name_slot_{};
     std::string locator_name_draft_;
     std::string locator_key_fallback_;
     bool waiting_for_world_{};
     bool gamepad_use_down_{};
     bool gamepad_activate_down_{};
+    // Pause contract state (input_contract.hpp).
+    bool local_controls_were_enabled_{};
+    HeldInputLatch keyboard_jump_latch_;
+    HeldInputLatch gamepad_jump_latch_;
+    // Frames ticked from inside the Windows modal move/size/menu loop.
+    int main_thread_busy_{};
+    int render_busy_{};
+    SDL_ThreadID main_thread_id_{SDL_GetCurrentThreadID()};
+    bool modal_frame_{};
+    bool modal_frames_since_loop_frame_{};
+    bool modal_watch_installed_{};
+    std::uint64_t modal_frames_{};
+    Clock::time_point last_update_time_{Clock::now()};
+    // OPENMINERZ_DIAGNOSTIC_ACTIVITY state; see trace_activity.
+    bool activity_trace_{SDL_getenv("OPENMINERZ_DIAGNOSTIC_ACTIVITY") != nullptr};
+    Uint64 activity_report_ms_{};
+    Uint64 activity_last_update_ms_{};
+    Uint64 activity_longest_gap_ms_{};
+    std::uint64_t activity_updates_{};
+    double activity_delta_seconds_{};
     bool gamepad_input_active_{};
     bool mouse_primary_down_{};
     bool mouse_secondary_down_{};
@@ -18001,10 +22941,66 @@ class Application::Impl final
     std::optional<std::size_t> fired_launcher_slot_;
     std::optional<std::size_t> fired_launcher_tray_;
     std::optional<InventoryItemId> fired_launcher_visual_;
+    // Seconds left in the running reload clip (GunReloadClip::seconds_left).
     float gun_reload_time_{};
     float gun_aim_progress_{};
+    // Player.ControlSensitivity: 1, or retail's 0.25 while a gun is shouldered.
+    // Multiplies mouse and stick look alike; independent of the field of view.
+    float look_scale_{1.0F};
+    // Player.Reloading: the reload *request*. Only gun_input, a finished reload
+    // cycle and Player.Equip (withdraw_gun_reload) write it.
     bool gun_reloading_{};
-    bool gun_reload_cue_started_{};
+    // currentAnimState == Reloading: the reload clip and its cue are running.
+    bool gun_reload_clip_active_{};
+    // Player.UpdateAnimation and the avatar animation clock of the local
+    // player: which clip plays on which channel, at what time.
+    world::PlayerAnimator local_animator_{};
+    // False until local_animator_ has run its first UpdateAnimation pass.
+    bool local_animation_started_{};
+    // What the last pass read; PlayerUpdateMessage sends the same flags.
+    world::PlayerAnimationInput local_animation_input_{};
+    // Player.UsingTool: raised on the tick a shot, swing or placement
+    // happened, read (and cleared) by the next animation pass.
+    bool animation_use_pulse_{};
+    // GrenadeMessage was sent on the last pass; its echo plays Grenade_Reset.
+    bool animation_throw_grenade_{};
+    // The stoppable cue instance that belongs to the reload clip, if any.
+    const char *gun_reload_cue_{};
+    // InGameHUD.lastItem: what was in hand on the previous tick.
+    struct GunEquipIdentity final
+    {
+        std::size_t tray{};
+        std::size_t slot{};
+        InventoryItemId item{InventoryItemId::bare_hands};
+        bool operator==(const GunEquipIdentity &) const noexcept = default;
+    };
+    GunEquipIdentity gun_equipped_{};
+    // OPENMINERZ_DIAGNOSTIC_AUTOFIRE: hold the trigger of the --item gun with an
+    // endless magazine so --bench measures sustained block destruction.
+    bool diagnostic_autofire_{SDL_getenv("OPENMINERZ_DIAGNOSTIC_AUTOFIRE") != nullptr};
+    bool diagnostic_autofire_walk_{
+        diagnostic_autofire_ &&
+        std::string_view{SDL_getenv("OPENMINERZ_DIAGNOSTIC_AUTOFIRE")} == "walk"};
+    // OPENMINERZ_DIAGNOSTIC_AUTOFIRE=reload: the trigger is held without the
+    // endless clip, and every change of the local animation state is printed
+    // with its fixed-tick number ("ANIM tick=..."), for comparison with the
+    // original's timeline (tools/OriginalClientInterop/AnimationParityProbe).
+    bool diagnostic_autofire_reload_{
+        diagnostic_autofire_ &&
+        std::string_view{SDL_getenv("OPENMINERZ_DIAGNOSTIC_AUTOFIRE")} == "reload"};
+    std::int64_t diagnostic_animation_tick_{};
+    std::string diagnostic_animation_last_;
+    // OPENMINERZ_DIAGNOSTIC_BOLT_TRAVEL=<metres>: see diagnostic_frozen_bolt().
+    float diagnostic_bolt_travel_{[] {
+        const char *value = SDL_getenv("OPENMINERZ_DIAGNOSTIC_BOLT_TRAVEL");
+        return value != nullptr ? std::clamp(static_cast<float>(std::atof(value)), 0.0F, 200.0F)
+                                : 0.0F;
+    }()};
+    std::size_t diagnostic_shots_{};
+    std::size_t diagnostic_blast_calls_{};
+    std::size_t diagnostic_blocks_removed_{};
+    double diagnostic_blast_max_ms_{};
+    double diagnostic_blast_total_ms_{};
     std::optional<InventoryItemId> looping_equipped_item_;
     world::EnemyRng recoil_rng_{0xC45A71E2D39B5601ULL};
     float guided_lock_time_{};
@@ -18014,18 +23010,19 @@ class Application::Impl final
     bool guided_locked_{};
     bool guided_tone_played_{};
     bool grenade_cooking_{};
+    // Cook clip -> throw clip -> release, and the two PlayerUpdate grenade bits.
+    net::GrenadeArm grenade_arm_;
     std::uint8_t grenade_cooking_type_{};
     float grenade_cook_time_{};
     float grenade_cooldown_{};
     float grenade_animation_time_{};
-    int craft_scroll_{};
-    bool craft_modern_{};
-    int craft_category_{-1};
-    std::optional<std::size_t> craft_selected_;
-    std::vector<CraftHit> craft_hits_;
     world::EnemyHorde enemy_horde_;
     float surface_spawn_timer_{};
     float cave_spawn_timer_{};
+    // spawn_head_sunlight's cache.
+    std::array<int, 3> spawn_sunlight_cell_{std::numeric_limits<int>::min(), 0, 0};
+    int spawn_sunlight_ticks_{};
+    float spawn_sunlight_{1.0F};
     float felguard_timer_{};
     bool felguard_spawned_{};
     bool diagnostic_enemy_spawned_{};
@@ -18044,6 +23041,12 @@ class Application::Impl final
     mutable bool crater_probe_dry_{};
     float world_game_time_{};
     float last_player_damage_time_{-100.0F};
+    // `--environment water` asks for the Lagoon water enhancement by name for
+    // that one capture. It is not written to the settings file and it obeys
+    // the same session gate as the stored choice.
+    bool diagnostic_lagoon_water_{};
+    // Non-retail item stacks removed from a save at load, not yet reported.
+    std::optional<NonRetailItemCleanup> pending_item_cleanup_notice_;
     float player_oxygen_{1.0F};
     float lava_damage_time_{world::lava_damage_period_seconds};
     bool lava_sound_played_{};
@@ -18059,6 +23062,7 @@ class Application::Impl final
         float tail_time{1.8F};
         bool whizzed{};
         bool dead{};
+        bool observed{}; // (Authority) its strike on a remote target was noted
     };
     std::vector<Arrow> arrows_;
     struct ArmedExplosive final
@@ -18119,6 +23123,12 @@ class Application::Impl final
         bool locally_authoritative{true};
         int bounces{};
         bool dead{};
+        // PRESENTATION ONLY: a locally fired bolt is drawn leaving the muzzle
+        // the viewmodel pass shows, which is not where it is simulated from
+        // (fire_gun_round). (seen start - simulated start), in world space.
+        // Nothing in update_tracers or on the network may read these.
+        world::Vec3 seen_offset{};
+        bool seen_from_muzzle{};
     };
     std::vector<Tracer> tracers_;
     int next_projectile_id_{1};
@@ -18140,10 +23150,14 @@ class Application::Impl final
     std::uint8_t dragon_network_sound_{};
     std::set<std::int32_t> queued_dragon_fireball_ids_;
     float dragon_migration_scan_timer_{};
+    // EnemyManager's timed-dragon ladder (every peer runs its own).
+    world::DragonSchedule dragon_schedule_;
     bool dragon_kill_announced_{};
     bool dragon_loot_pending_{};
     world::DragonKind next_timed_dragon_{world::DragonKind::fire};
     int dragon_distance_index_{};
+    float dragon_spawn_retry_{};
+    std::optional<float> cavern_dragon_altitude_;
     float last_dragon_distance_{-1.0F};
     float last_song_distance_{-1.0F};
     float distance_origin_x_{};
@@ -18159,6 +23173,22 @@ class Application::Impl final
     float next_dragon_seconds_{};
     GameMode game_mode_{GameMode::survival};
     GameDifficulty difficulty_{GameDifficulty::hard};
+    PlayerProgress progress_;
+    world::WorldEncounterState encounter_state_;
+    std::vector<std::array<int, 4>> pending_encounter_edits_;
+    std::filesystem::path progress_path_;
+    float progress_save_timer_{15.0F};
+    std::future<bool> progress_save_;
+    std::vector<std::size_t> achievement_notifications_;
+    // InGameHUD.displayedAcheivement: the award on screen and the seconds left
+    // of its ten (acheivementDisplayTimer).
+    std::optional<std::size_t> achievement_popup_;
+    float achievement_popup_seconds_{};
+    // AwardEnd, AwardCenter, AwardCircle and the loading "Bar" sprite for
+    // Classic [0] and Modern [1].
+    std::array<std::array<SDL_Texture *, 4>, 2> award_art_{};
+    std::size_t achievement_first_visible_{};
+    InventoryProfile gameplay_profile_{InventoryProfile::classic};
     bool infinite_resources_{};
     // The "fresh ground" pack spawner (Normal/Hardcore/Endurance).
     float cleared_distance_{50.0F};
@@ -18173,6 +23203,9 @@ class Application::Impl final
     float dragon_flap_timer_{1.0F};
     float audio_environment_timer_{};
     int next_song_index_{};
+    std::string environment_song_;
+    std::string environment_song_candidate_;
+    float environment_song_hold_{};
     bool crater_music_triggered_{};
     float crater_music_reset_timer_{};
     int last_day_number_{};
@@ -18201,6 +23234,8 @@ class Application::Impl final
     std::vector<std::int32_t> applied_fireball_detonations_;
     int next_fireball_id_{};
     std::vector<WorldSlot> world_slots_;
+    int world_sort_{};
+    std::size_t world_detail_index_{};
     std::filesystem::path active_world_path_;
     float autosave_timer_{30.0F};
     std::optional<world::Vec3> pending_load_position_;
@@ -18211,6 +23246,31 @@ class Application::Impl final
     int previous_biome_band_{-1};
     bool dirty_{};
     float dirty_timer_{};
+    // --- Settings screen runtime state: display changes, page reset, FPS. ---
+    // The configuration the window was last switched to. display_revert_ is
+    // set while an exclusive-fullscreen change waits for the player to keep
+    // it; until then the settings file continues to hold the previous one.
+    DisplayConfig applied_display_{};
+    std::optional<DisplayConfig> display_revert_;
+    bool display_apply_pending_{};
+    float display_apply_delay_{};
+    float display_confirm_seconds_{};
+    Clock::time_point settings_service_time_{Clock::now()};
+    // What the monitor under the window supports (see refresh_display_capabilities).
+    std::vector<std::pair<int, int>> fullscreen_modes_;
+    std::pair<int, int> desktop_size_{};
+    int display_refresh_rate_{};
+    // "Reset page" needs a second press within a few seconds.
+    float reset_armed_seconds_{};
+    ui::SettingsTab reset_armed_tab_{ui::SettingsTab::display};
+    // Frame-rate read-out, averaged over half a second so it can be read.
+    Clock::time_point fps_last_frame_{Clock::now()};
+    double fps_window_seconds_{};
+    double fps_window_worst_{};
+    int fps_window_frames_{};
+    double fps_shown_rate_{};
+    double fps_shown_milliseconds_{};
+    double fps_shown_worst_milliseconds_{};
     float elapsed_{};
     float transition_{1.0F};
     float mouse_x_{};

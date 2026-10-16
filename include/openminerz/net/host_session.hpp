@@ -52,8 +52,10 @@ struct HostSessionSettings final
 
 using SessionProperties = std::array<std::optional<std::int32_t>, 8U>;
 
+// Slot 1 is the original "no longer joinable" flag. An active, joinable game
+// advertises zero; it is not a game-started flag.
 [[nodiscard]] SessionProperties make_session_properties(const HostSessionSettings &settings,
-                                                        bool game_begun, std::int32_t game_mode,
+                                                        bool join_closed, std::int32_t game_mode,
                                                         std::int32_t difficulty,
                                                         bool infinite_resources);
 

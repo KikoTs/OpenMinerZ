@@ -280,11 +280,13 @@ namespace OpenMinerZ.ContentBridge
         private readonly GraphicsDeviceManager graphics;
         private readonly string outputDirectory;
         private readonly bool refreshedLayout;
+        private readonly bool uiOnly;
         private Exception? failure;
 
-        public BridgeGame(string contentDirectory, string outputDirectory)
+        public BridgeGame(string contentDirectory, string outputDirectory, bool uiOnly = false)
         {
             this.outputDirectory = outputDirectory;
+            this.uiOnly = uiOnly;
             refreshedLayout = File.Exists(Path.Combine(
                 contentDirectory, "ReachContent", "Terrain", "Textures.xnb"));
             graphics = new GraphicsDeviceManager(this)
@@ -312,6 +314,46 @@ namespace OpenMinerZ.ContentBridge
             try
             {
                 Directory.CreateDirectory(outputDirectory);
+                object hudSprites = Content.Load<object>(Asset("SpriteSheet", @"UI\SpriteSheet"));
+                SaveSprite(hudSprites, "HealthBarEmpty", "health_empty.bmp");
+                SaveSprite(hudSprites, "HealthBarFull", "health_full.bmp");
+                if (refreshedLayout)
+                    SaveSprite(hudSprites, "StaminaBarEmpty", "stamina_empty.bmp");
+                // Every sprite InGameHUD draws over the world, cropped from this
+                // build's own sheet at its authored size (hud_<SheetName>.bmp).
+                // The native HUD (src/hud_layout.cpp) positions them with the
+                // original's arithmetic; both builds' sets are imported so either
+                // interface style can be shown with any texture pack.
+                foreach (string hudSprite in new[]
+                         {
+                             "HudGrid", "Selector", "CrossHair", "HealthBarEmpty", "HealthBarFull",
+                             "BubbleBar", "DamageArrow", "SniperScope", "MissleLock", "MissleLocking",
+                             "AwardEnd", "AwardCenter", "AwardCircle"
+                         })
+                    SaveSprite(hudSprites, hudSprite, "hud_" + hudSprite + ".bmp");
+                if (refreshedLayout)
+                    foreach (string hudSprite in new[] { "CrossHairTick", "StaminaBarEmpty" })
+                        SaveSprite(hudSprites, hudSprite, "hud_" + hudSprite + ".bmp");
+                // The ten sprite fonts CastleMinerZGame.LoadContent loads. The
+                // native client draws retail text with these glyphs and XNA's
+                // own placement arithmetic instead of a look-alike UI font.
+                foreach (string fontName in new[]
+                         {
+                             "SmallFont", "MedFont", "MedLargeFont", "LargeFont", "ConsoleFont",
+                             "NameTagFont", "System", "MyriadSmall", "MyriadMedium", "MyriadLarge"
+                         })
+                    ExportSpriteFont(Asset(@"720\" + fontName, @"Fonts\" + fontName),
+                                     "font_" + fontName + ".omfnt");
+                // The three pieces InGameHUD.DrawAcheivement builds the award
+                // pop-up from: an end cap (mirrored for the right side), a
+                // stretched centre and the medal circle.
+                SaveSprite(hudSprites, "AwardEnd", "award_end.bmp");
+                SaveSprite(hudSprites, "AwardCenter", "award_center.bmp");
+                SaveSprite(hudSprites, "AwardCircle", "award_circle.bmp");
+                // The fill of the world-loading progress bar.
+                SaveSprite(hudSprites, "Bar", "ui_bar.bmp");
+                if (uiOnly)
+                    return;
                 Texture[] terrain = Content.Load<Texture[]>(Asset(
                     @"Terrain\Textures", @"ReachContent\Terrain\Textures"));
                 string[] terrainNames = { "terrain_diffuse.bmp", "terrain_normal_spec.bmp",
@@ -514,6 +556,59 @@ namespace OpenMinerZ.ContentBridge
         private string Asset(string legacy, string refreshed) =>
             refreshedLayout ? refreshed : legacy;
 
+        // OMZF 2: line spacing, spacing, default character, sheet size, the
+        // glyph table (character, glyph rectangle, cropping rectangle, kerning
+        // triple) in character order, then the sheet as premultiplied RGBA.
+        // The native reader is src/sprite_font.cpp.
+        private void ExportSpriteFont(string assetName, string fileName)
+        {
+            SpriteFont font = Content.Load<SpriteFont>(assetName);
+            const BindingFlags hidden = BindingFlags.Instance | BindingFlags.NonPublic;
+            T Hidden<T>(string name) =>
+                (T)(typeof(SpriteFont).GetField(name, hidden)
+                        ?? throw new MissingFieldException("SpriteFont", name)).GetValue(font);
+            Texture2D texture = Hidden<Texture2D>("textureValue");
+            List<Rectangle> glyphs = Hidden<List<Rectangle>>("glyphData");
+            List<Rectangle> cropping = Hidden<List<Rectangle>>("croppingData");
+            List<char> characters = Hidden<List<char>>("characterMap");
+            List<Vector3> kerning = Hidden<List<Vector3>>("kerning");
+            Pixel[] pixels = TextureDecoder.Read(texture);
+            using (FileStream stream = File.Create(Path.Combine(outputDirectory, fileName)))
+            using (BinaryWriter writer = new BinaryWriter(stream))
+            {
+                writer.Write(0x465A4D4FU); // OMZF
+                writer.Write(2U);
+                writer.Write(font.LineSpacing);
+                writer.Write(font.Spacing);
+                writer.Write(font.DefaultCharacter.HasValue ? (int)font.DefaultCharacter.Value : -1);
+                writer.Write(texture.Width);
+                writer.Write(texture.Height);
+                writer.Write((uint)characters.Count);
+                for (int index = 0; index < characters.Count; ++index)
+                {
+                    writer.Write((uint)characters[index]);
+                    writer.Write(glyphs[index].X); writer.Write(glyphs[index].Y);
+                    writer.Write(glyphs[index].Width); writer.Write(glyphs[index].Height);
+                    writer.Write(cropping[index].X); writer.Write(cropping[index].Y);
+                    writer.Write(cropping[index].Width); writer.Write(cropping[index].Height);
+                    writer.Write(kerning[index].X); writer.Write(kerning[index].Y);
+                    writer.Write(kerning[index].Z);
+                }
+                // The sheet exactly as XNA samples it: premultiplied RGBA. It is
+                // DXT3, so a texel's colour (four levels per block) is NOT
+                // simply its alpha (sixteen levels); SpriteBatch adds the
+                // colour and attenuates the background by the alpha, and the
+                // native renderer does the same with both.
+                foreach (Pixel pixel in pixels)
+                {
+                    writer.Write(pixel.Red);
+                    writer.Write(pixel.Green);
+                    writer.Write(pixel.Blue);
+                    writer.Write(pixel.Alpha);
+                }
+            }
+        }
+
         private void SaveSprite(object manager, string spriteName, string fileName)
         {
             PropertyInfo indexer = manager.GetType().GetProperty("Item")
@@ -679,6 +774,8 @@ namespace OpenMinerZ.ContentBridge
                             materialFlags |= 1;
                         if (mesh.Name.Contains("recolor2_") || mesh.Name.Contains("COLOR2"))
                             materialFlags |= 2;
+                        if (mesh.Name.Contains("Beam"))
+                            materialFlags |= 5; // primary colour + emissive blade
                         writer.Write(materialFlags);
                         Vector3 diffuse = EffectDiffuse(part.Effect);
                         writer.Write(diffuse.X); writer.Write(diffuse.Y); writer.Write(diffuse.Z);
@@ -774,6 +871,37 @@ namespace OpenMinerZ.ContentBridge
                 ?? throw new InvalidDataException($"Could not load {assetName}");
         }
 
+        // CastleMinerZGame.SecondaryLoad registers the 1.6.3.8 space-weapon clips
+        // under names of their own ("LaserGunShoot" is
+        // SpaceWeapons\Animations\AssaultShoot). The files share their names with
+        // the conventional clips in AvatarAnimation, so exporting by file name
+        // dropped every one of them: a laser weapon had no hold, shoulder, shoot
+        // or reload clip, and its trigger played the pickaxe swing instead.
+        private static string? SpaceClipName(string stem)
+        {
+            switch (stem)
+            {
+                case "HoldAssultIdle": return "LaserGunIdle";
+                case "AKRun": return "LaserGunRun";
+                case "HoldPistolIdle": return "LaserPistolIdle";
+                case "PistolWalk": return "LaserPistolRun";
+                case "SMGWalk": return "LaserSMGRun";
+                case "RifleWalk": return "LaserRifleRun";
+            }
+            if (stem.EndsWith("TakeOut", StringComparison.Ordinal))
+                return null;
+            if (stem.StartsWith("Assault", StringComparison.Ordinal))
+                return "LaserGun" + stem.Substring("Assault".Length);
+            if (stem.StartsWith("PumpShotgun", StringComparison.Ordinal))
+                return "LaserShotgun" + stem.Substring("PumpShotgun".Length);
+            if (stem.StartsWith("Pistol", StringComparison.Ordinal) ||
+                stem.StartsWith("Rifle", StringComparison.Ordinal) ||
+                stem.StartsWith("SMG", StringComparison.Ordinal))
+                return "Laser" + stem;
+            // The space LMG clips are shipped but never registered.
+            return null;
+        }
+
         private void ExportAllAnimations()
         {
             if (refreshedLayout)
@@ -798,13 +926,34 @@ namespace OpenMinerZ.ContentBridge
                 Array.Sort(files, StringComparer.OrdinalIgnoreCase);
                 foreach (string sourcePath in files)
                 {
-                    string clipName = Path.GetFileNameWithoutExtension(sourcePath);
-                    if (!exported.Add(clipName))
+                    string stem = Path.GetFileNameWithoutExtension(sourcePath);
+                    string? clipName = sourceIndex == 1 ? SpaceClipName(stem) : stem;
+                    if (clipName == null || !exported.Add(clipName))
                         continue;
-                    string assetName = Path.Combine(assetRoots[sourceIndex], clipName);
+                    string assetName = Path.Combine(assetRoots[sourceIndex], stem);
                     string relativeFile = Path.Combine("animations", clipName + ".omza");
                     ExportAnimation(assetName, relativeFile);
                     manifest.Add($"{clipName}|{assetName}|{relativeFile}");
+                }
+            }
+            // The conventional LMG's clips live beside its model; the game
+            // registers these, never the LMG files of the space-weapon folder.
+            string lmg = @"Weapons\M294\Animation\";
+            if (File.Exists(Path.Combine(Content.RootDirectory, lmg + "Idle.xnb")))
+            {
+                foreach (string[] clip in new[]
+                         {
+                             new[] { "Idle", "LMGIdle" }, new[] { "Walk", "LMGRun" },
+                             new[] { "Shoot", "LMGShoot" }, new[] { "Shoulder", "LMGShoulder" },
+                             new[] { "ShoulderIdle", "LMGShoulderIdle" },
+                             new[] { "ShoulderWalk", "LMGShoulderWalk" },
+                             new[] { "ShoulderShoot", "LMGShoulderShoot" },
+                             new[] { "Reload", "LMGReload" },
+                         })
+                {
+                    string relativeFile = Path.Combine("animations", clip[1] + ".omza");
+                    ExportAnimation(lmg + clip[0], relativeFile);
+                    manifest.Add($"{clip[1]}|{lmg + clip[0]}|{relativeFile}");
                 }
             }
             File.WriteAllLines(Path.Combine(animationDirectory, "manifest.txt"), manifest);
@@ -836,6 +985,8 @@ namespace OpenMinerZ.ContentBridge
             };
 
             export(@"Character\Animation\Stand0", "Stand0", null);
+            export(@"Character\Animation\Tilt", "Tilt", null);
+            export(@"Character\Animation\MaleIdleLookAround", "MaleIdleLookAround", null);
             // Player.UpdateAnimation always keeps a full-body locomotion clip on
             // channel zero.  GenericWalk and the weapon/item clips below are
             // upper-body overlays; exporting only those leaves network avatars'
@@ -1286,11 +1437,46 @@ namespace OpenMinerZ.ContentBridge
                                                             "Terrain", "Textures.xnb"))
                                        ? "modern" : "classic",
                                    "DerivedData");
-                using (var game = new BridgeGame(contentDirectory, outputDirectory))
+                bool uiOnly = args.Length > 2 && args[2] == "--ui-only";
+                // --character-only adds (or refreshes) just the retail character in an
+                // existing pack: DerivedData/character.omrc and its sidecar. Nothing
+                // else in the pack is read or rewritten.
+                if (args.Length > 2 && args[2] == "--character-only")
+                    return OpenMinerZ.RetailCharacter.RetailCharacterExporter.Run(gameDirectory, outputDirectory);
+                // --screens-only adds (or refreshes) just the inventory / crate /
+                // crafting screen art: the screen_*.bmp sprites and the item-icon
+                // atlas the game itself renders (see ScreenAssets.cs).
+                if (args.Length > 2 && args[2] == "--screens-only")
+                    return OpenMinerZ.ScreenAssets.ScreenAssetExporter.Run(gameDirectory, outputDirectory);
+                using (var game = new BridgeGame(contentDirectory, outputDirectory, uiOnly))
                 {
                     game.Run();
                     game.ThrowIfFailed();
                 }
+                // The inventory / crate / crafting screen art and the item-icon
+                // atlas are interface art too, so --ui-only brings them as well:
+                // one command imports the whole interface of a build. That pass
+                // builds its own inert game and device; it runs in a process of
+                // its own so its statics cannot meet the character pass's.
+                using (var screens = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = Assembly.GetExecutingAssembly().Location,
+                    Arguments = "\"" + gameDirectory.TrimEnd('\\') + "\" \"" + outputDirectory.TrimEnd('\\') + "\" --screens-only",
+                    UseShellExecute = false,
+                }))
+                {
+                    screens.WaitForExit();
+                    if (screens.ExitCode != 0)
+                        return screens.ExitCode;
+                }
+                if (uiOnly)
+                    return 0;
+                // The retail character (body, both skeletons, every registered clip
+                // and the held-item transforms) is read through the game's own code
+                // on its own device, after the bridge's Reach device has gone.
+                int character = OpenMinerZ.RetailCharacter.RetailCharacterExporter.Run(gameDirectory, outputDirectory);
+                if (character != 0)
+                    return character;
                 string[] sourceFiles = Directory.GetFiles(
                     contentDirectory, "*", SearchOption.AllDirectories);
                 long sourceBytes = 0;
@@ -1307,7 +1493,7 @@ namespace OpenMinerZ.ContentBridge
                         "source_bytes=" + sourceBytes.ToString(),
                     });
                 Console.WriteLine($"Derived original content: {outputDirectory}");
-                Console.WriteLine("The build target stages the complete source Content tree beside this derived pack.");
+                Console.WriteLine("Use Import-GameAssets.ps1 to install the audio banks and private runtime. Do not distribute imported assets.");
                 return 0;
             }
             catch (Exception error)

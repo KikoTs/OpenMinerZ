@@ -1,342 +1,111 @@
 #include "openminerz/inventory.hpp"
+#include <cmath>
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 
 namespace openminerz
 {
 
-std::string_view item_name(InventoryItemId item) noexcept
+namespace
+{
+
+// InventoryItemClass.Name / Description1 / Description2 (1.6.3.8) and Name /
+// Description (1.9.9.8) exactly as each shipped InventoryItem.Initalize
+// registers them. Generated from the owned installs by
+// tools/OriginalClientInterop/PresentationParityProbe and held to them by
+// tests/test_presentation_parity.cpp.
+struct RetailItemText final
+{
+    std::uint16_t item;
+    const char *classic_name;
+    const char *classic_description1;
+    const char *classic_description2;
+    const char *modern_name;
+    const char *modern_description;
+};
+
+constexpr RetailItemText retail_item_text[]{
+#define OPENMINERZ_RETAIL_ITEM(id, retail_enum, classic_name, classic_description1,               \
+                               classic_description2, modern_name, modern_description)             \
+    {id, classic_name, classic_description1, classic_description2, modern_name, modern_description},
+#include "retail_item_text.inc"
+#undef OPENMINERZ_RETAIL_ITEM
+};
+
+// The table is ordered by id (the generator walks the registrations in order).
+const RetailItemText *find_retail_item_text(InventoryItemId item) noexcept
+{
+    const auto value = static_cast<std::uint16_t>(item);
+    const auto found = std::lower_bound(
+        std::begin(retail_item_text), std::end(retail_item_text), value,
+        [](const RetailItemText &entry, std::uint16_t wanted) { return entry.item < wanted; });
+    return found != std::end(retail_item_text) && found->item == value ? found : nullptr;
+}
+
+// Ids no shipped build registers a class for. Neither game can show them, so
+// there is no retail name to match; where the 1.9.9.8 string table still
+// carries the name the item was going to have, that is used.
+std::string_view unregistered_item_name(InventoryItemId item) noexcept
 {
     switch (item)
     {
-    case InventoryItemId::bare_hands:
-        return "BARE HANDS";
-    case InventoryItemId::dirt_block:
-        return "DIRT";
-    case InventoryItemId::sand_block:
-        return "SAND";
-    case InventoryItemId::rock_block:
-        return "ROCK";
-    case InventoryItemId::log_block:
-        return "LOG";
-    case InventoryItemId::wood_block:
-        return "WOOD";
-    case InventoryItemId::lantern_block:
-        return "LANTERN";
-    case InventoryItemId::blood_stone_block:
-        return "BLOODSTONE";
-    case InventoryItemId::space_rock:
-        return "SPACE ROCK";
-    case InventoryItemId::iron_wall:
-        return "IRON WALL";
-    case InventoryItemId::copper_wall:
-        return "COPPER WALL";
-    case InventoryItemId::golden_wall:
-        return "GOLD WALL";
-    case InventoryItemId::diamond_wall:
-        return "DIAMOND WALL";
-    case InventoryItemId::stick:
-        return "STICK";
-    case InventoryItemId::torch:
-        return "TORCH";
-    case InventoryItemId::coal:
-        return "COAL";
-    case InventoryItemId::copper_ore:
-        return "COPPER ORE";
-    case InventoryItemId::iron_ore:
-        return "IRON ORE";
-    case InventoryItemId::gold_ore:
-        return "GOLD ORE";
-    case InventoryItemId::diamond:
-        return "DIAMOND";
-    case InventoryItemId::iron:
-        return "IRON BARS";
-    case InventoryItemId::copper:
-        return "COPPER BARS";
-    case InventoryItemId::gold:
-        return "GOLD BARS";
-    case InventoryItemId::stone_pickaxe:
-        return "STONE PICKAXE";
-    case InventoryItemId::copper_pickaxe:
-        return "COPPER PICKAXE";
-    case InventoryItemId::iron_pickaxe:
-        return "IRON PICKAXE";
-    case InventoryItemId::gold_pickaxe:
-        return "GOLD PICKAXE";
-    case InventoryItemId::diamond_pickaxe:
-        return "DIAMOND PICKAXE";
-    case InventoryItemId::bloodstone_pickaxe:
-        return "BLOODSTONE PICKAXE";
-    case InventoryItemId::stone_spade:
-        return "STONE SPADE";
-    case InventoryItemId::copper_spade:
-        return "COPPER SPADE";
-    case InventoryItemId::iron_spade:
-        return "IRON SPADE";
-    case InventoryItemId::gold_spade:
-        return "GOLD SPADE";
-    case InventoryItemId::diamond_spade:
-        return "DIAMOND SPADE";
-    case InventoryItemId::stone_axe:
-        return "STONE AXE";
-    case InventoryItemId::copper_axe:
-        return "COPPER AXE";
-    case InventoryItemId::iron_axe:
-        return "IRON AXE";
-    case InventoryItemId::gold_axe:
-        return "GOLD AXE";
-    case InventoryItemId::diamond_axe:
-        return "DIAMOND AXE";
-    case InventoryItemId::compass:
-        return "COMPASS";
-    case InventoryItemId::clock:
-        return "CLOCK";
-    case InventoryItemId::brass_casing:
-        return "BRASS CASING";
-    case InventoryItemId::iron_casing:
-        return "IRON CASING";
-    case InventoryItemId::gold_casing:
-        return "GOLD CASING";
-    case InventoryItemId::diamond_casing:
-        return "DIAMOND CASING";
-    case InventoryItemId::bullets:
-        return "BULLETS";
-    case InventoryItemId::iron_bullets:
-        return "IRON BULLETS";
-    case InventoryItemId::gold_bullets:
-        return "GOLD BULLETS";
-    case InventoryItemId::diamond_bullets:
-        return "DIAMOND BULLETS";
-    case InventoryItemId::blood_stone_bullets:
-        return "BLOODSTONE BULLETS";
-    case InventoryItemId::knife:
-        return "KNIFE";
-    case InventoryItemId::assault_rifle:
-        return "ASSAULT RIFLE";
-    case InventoryItemId::pistol:
-        return "PISTOL";
-    case InventoryItemId::pump_shotgun:
-        return "PUMP SHOTGUN";
-    case InventoryItemId::bolt_action_rifle:
-        return "BOLT-ACTION RIFLE";
-    case InventoryItemId::smg:
-        return "SUBMACHINE GUN";
-    case InventoryItemId::gold_knife:
-        return "GOLD KNIFE";
-    case InventoryItemId::gold_assault_rifle:
-        return "GOLD ASSAULT RIFLE";
-    case InventoryItemId::gold_pistol:
-        return "GOLD PISTOL";
-    case InventoryItemId::gold_pump_shotgun:
-        return "GOLD SHOTGUN";
-    case InventoryItemId::gold_bolt_action_rifle:
-        return "GOLD RIFLE";
-    case InventoryItemId::gold_smg:
-        return "GOLD SMG";
-    case InventoryItemId::diamond_knife:
-        return "DIAMOND KNIFE";
-    case InventoryItemId::diamond_assault_rifle:
-        return "DIAMOND ASSAULT RIFLE";
-    case InventoryItemId::diamond_pistol:
-        return "DIAMOND PISTOL";
-    case InventoryItemId::diamond_pump_shotgun:
-        return "DIAMOND SHOTGUN";
-    case InventoryItemId::diamond_bolt_action_rifle:
-        return "DIAMOND RIFLE";
-    case InventoryItemId::diamond_smg:
-        return "DIAMOND SMG";
-    case InventoryItemId::blood_stone_knife:
-        return "BLOODSTONE KNIFE";
-    case InventoryItemId::blood_stone_assault_rifle:
-        return "BLOODSTONE ASSAULT RIFLE";
-    case InventoryItemId::blood_stone_pistol:
-        return "BLOODSTONE PISTOL";
-    case InventoryItemId::blood_stone_pump_shotgun:
-        return "BLOODSTONE SHOTGUN";
-    case InventoryItemId::blood_stone_bolt_action_rifle:
-        return "BLOODSTONE RIFLE";
-    case InventoryItemId::blood_stone_smg:
-        return "BLOODSTONE SMG";
     case InventoryItemId::space_knife:
-        return "SPACE KNIFE";
-    case InventoryItemId::iron_space_assault_rifle:
-        return "LASER ASSAULT RIFLE";
-    case InventoryItemId::iron_space_pistol:
-        return "LASER PISTOL";
-    case InventoryItemId::iron_space_pump_shotgun:
-        return "LASER SHOTGUN";
-    case InventoryItemId::iron_space_bolt_action_rifle:
-        return "LASER RIFLE";
-    case InventoryItemId::iron_space_smg:
-        return "LASER SMG";
-    case InventoryItemId::copper_space_assault_rifle:
-        return "GREEN LASER ASSAULT RIFLE";
-    case InventoryItemId::copper_space_pistol:
-        return "GREEN LASER PISTOL";
-    case InventoryItemId::copper_space_pump_shotgun:
-        return "GREEN LASER SHOTGUN";
-    case InventoryItemId::copper_space_bolt_action_rifle:
-        return "GREEN LASER RIFLE";
-    case InventoryItemId::copper_space_smg:
-        return "GREEN LASER SMG";
-    case InventoryItemId::gold_space_assault_rifle:
-        return "YELLOW LASER ASSAULT RIFLE";
-    case InventoryItemId::gold_space_pistol:
-        return "YELLOW LASER PISTOL";
-    case InventoryItemId::gold_space_pump_shotgun:
-        return "YELLOW LASER SHOTGUN";
-    case InventoryItemId::gold_space_bolt_action_rifle:
-        return "YELLOW LASER RIFLE";
-    case InventoryItemId::gold_space_smg:
-        return "YELLOW LASER SMG";
-    case InventoryItemId::diamond_space_assault_rifle:
-        return "BLUE LASER ASSAULT RIFLE";
-    case InventoryItemId::diamond_space_pistol:
-        return "BLUE LASER PISTOL";
-    case InventoryItemId::diamond_space_pump_shotgun:
-        return "BLUE LASER SHOTGUN";
-    case InventoryItemId::diamond_space_bolt_action_rifle:
-        return "BLUE LASER RIFLE";
-    case InventoryItemId::diamond_space_smg:
-        return "BLUE LASER SMG";
-    case InventoryItemId::iron_laser_sword:
-        return "LASER SWORD";
-    case InventoryItemId::copper_laser_sword:
-        return "GREEN LASER SWORD";
-    case InventoryItemId::gold_laser_sword:
-        return "YELLOW LASER SWORD";
-    case InventoryItemId::diamond_laser_sword:
-        return "BLUE LASER SWORD";
-    case InventoryItemId::blood_stone_laser_sword:
-        return "BLOODSTONE LASER SWORD";
-    case InventoryItemId::gold_lmg:
-        return "GOLD LIGHT MACHINE GUN";
-    case InventoryItemId::diamond_lmg:
-        return "DIAMOND LIGHT MACHINE GUN";
-    case InventoryItemId::blood_stone_lmg:
-        return "BLOODSTONE LIGHT MACHINE GUN";
-    case InventoryItemId::crate:
-        return "CRATE";
-    case InventoryItemId::snow:
-        return "SNOW";
-    case InventoryItemId::ice:
-        return "ICE";
-    case InventoryItemId::door:
-        return "DOOR";
-    case InventoryItemId::gps:
-        return "LOCATOR";
-    case InventoryItemId::teleport_gps:
-        return "TELEPORTER";
-    case InventoryItemId::tnt:
-        return "TNT";
-    case InventoryItemId::c4:
-        return "C4";
-    case InventoryItemId::slime:
-        return "SLIME";
-    case InventoryItemId::rocket_launcher:
-        return "ROCKET LAUNCHER";
-    case InventoryItemId::guided_rocket_launcher:
-        return "GUIDED ROCKET LAUNCHER";
-    case InventoryItemId::rocket_ammo:
-        return "ROCKETS";
-    case InventoryItemId::gun_powder:
-        return "GUNPOWDER";
-    case InventoryItemId::space_rock_inventory:
-        return "SPACE ROCK";
-    case InventoryItemId::explosive_powder:
-        return "EXPLOSIVE POWDER";
-    case InventoryItemId::laser_bullets:
-        return "LASER BULLETS";
-    case InventoryItemId::grenade:
-        return "GRENADE";
-    case InventoryItemId::lmg:
-        return "LIGHT MACHINE GUN";
-    case InventoryItemId::grass_block:
-        return "GRASS";
-    case InventoryItemId::gold_block:
-        return "GOLD BLOCK";
-    case InventoryItemId::iron_block:
-        return "IRON BLOCK";
-    case InventoryItemId::copper_block:
-        return "COPPER BLOCK";
-    case InventoryItemId::coal_block:
-        return "COAL BLOCK";
-    case InventoryItemId::diamond_block:
-        return "DIAMOND BLOCK";
-    case InventoryItemId::surface_lava_block:
-        return "LAVA";
-    case InventoryItemId::leaves_block:
-        return "LEAVES";
-    case InventoryItemId::forced_air_block:
-        return "FORCED AIR";
-    case InventoryItemId::modern_chainsaw_1:
-        return "CHAINSAW";
+        return "Space Knife";
     case InventoryItemId::modern_chainsaw_2:
-        return "CHAINSAW II";
     case InventoryItemId::modern_chainsaw_3:
-        return "CHAINSAW III";
-    case InventoryItemId::modern_sticky_grenade:
-        return "STICKY GRENADE";
-    case InventoryItemId::modern_stone_container:
-        return "STONE CONTAINER";
-    case InventoryItemId::modern_copper_container:
-        return "COPPER CONTAINER";
-    case InventoryItemId::modern_iron_container:
-        return "IRON CONTAINER";
-    case InventoryItemId::modern_gold_container:
-        return "GOLD CONTAINER";
-    case InventoryItemId::modern_diamond_container:
-        return "DIAMOND CONTAINER";
-    case InventoryItemId::modern_bloodstone_container:
-        return "BLOODSTONE CONTAINER";
-    case InventoryItemId::modern_spawn_basic:
-        return "RESPAWN BEACON";
+        return "Haunted Chainsaw";
     case InventoryItemId::modern_spawn_combat:
-        return "FOREMAN'S FLAG";
+        return "Fearsome Flag"; // Strings.Spawn_Combat
     case InventoryItemId::modern_spawn_explorer:
-        return "FARAWAY FLAG";
+        return "Faraway Flag"; // Strings.Spawn_Explorer
     case InventoryItemId::modern_spawn_builder:
-        return "FEARSOME FLAG";
-    case InventoryItemId::modern_glass_window_wood:
-        return "WOOD WINDOW";
-    case InventoryItemId::modern_glass_window_iron:
-        return "IRON WINDOW";
-    case InventoryItemId::modern_glass_window_gold:
-        return "BULLETPROOF WINDOW";
-    case InventoryItemId::modern_glass_window_diamond:
-        return "CLEAR WINDOW";
-    case InventoryItemId::modern_basic_grenade_launcher:
-        return "GRENADE LAUNCHER";
+        return "Foreman's Flag"; // Strings.Spawn_Builder
     case InventoryItemId::modern_advanced_grenade_launcher:
-        return "ADVANCED GRENADE LAUNCHER";
-    case InventoryItemId::modern_laser_drill:
-        return "LASER DRILL";
+        return "Grenade Launcher"; // Strings.Grenade_Launcher
     case InventoryItemId::modern_mega_pickaxe:
-        return "MEGA PICKAXE";
+        return "Mega PickAxe";
     case InventoryItemId::modern_snowball:
-        return "SNOWBALL GRENADE";
+        return "Snowball"; // Strings.Snowball_Grenade
     case InventoryItemId::modern_iceball:
-        return "ICEBALL GRENADE";
-    case InventoryItemId::modern_diamond_door:
-        return "DIAMOND DOOR";
-    case InventoryItemId::modern_lantern_fancy_block:
-        return "FANCY LANTERN";
-    case InventoryItemId::modern_precision_laser:
-        return "PRECISION LASER";
+        return "Iceball"; // Strings.Iceball_Grenade
     case InventoryItemId::modern_multi_laser:
-        return "MULTI LASER";
-    case InventoryItemId::modern_teleport_station:
-        return "TELEPORT STATION";
+        return "Laser Drill"; // Strings.Laser_Drill
     case InventoryItemId::modern_monster_block:
-        return "MONSTER SPAWNER";
-    case InventoryItemId::modern_iron_door:
-        return "IRON DOOR";
-    case InventoryItemId::modern_tech_door:
-        return "TECH DOOR";
+        return "Enemy Spawner"; // Strings.Enemy_Spawner
     default:
-        return "ITEM";
+        break;
     }
+    // The project-owned Classic block items take BlockType.Name, as every
+    // BlockInventoryItemClass does.
+    if (is_block_item(item))
+        return world::block_name(item_block(item));
+    return "";
+}
+
+} // namespace
+
+ItemText item_text(InventoryItemId item, InventoryProfile profile) noexcept
+{
+    const RetailItemText *entry = find_retail_item_text(item);
+    if (entry == nullptr)
+        return {unregistered_item_name(item), {}, {}};
+    const bool classic = profile == InventoryProfile::classic;
+    // An item only one build registers is described by that build.
+    if (classic ? entry->classic_name != nullptr : entry->modern_name == nullptr)
+        return {entry->classic_name, entry->classic_description1, entry->classic_description2};
+    return {entry->modern_name, entry->modern_description, {}};
+}
+
+std::string_view item_name(InventoryItemId item) noexcept
+{
+    // The two builds give every item they share the same Name, so the name
+    // needs no generation.
+    const RetailItemText *entry = find_retail_item_text(item);
+    if (entry == nullptr)
+        return unregistered_item_name(item);
+    return entry->modern_name != nullptr ? entry->modern_name : entry->classic_name;
 }
 
 PlayerAnimationMode item_player_animation_mode(InventoryItemId item) noexcept
@@ -521,187 +290,182 @@ int item_category(InventoryItemId item) noexcept
 
 std::string_view item_description(InventoryItemId item) noexcept
 {
-    switch (item)
+    // 1.9.9.8's Description is 1.6.3.8's two lines joined with ". " for every
+    // item both register, so this one string serves a single-line caller in
+    // either generation.
+    const RetailItemText *entry = find_retail_item_text(item);
+    if (entry == nullptr)
+        return {};
+    return entry->modern_description != nullptr ? entry->modern_description
+                                                : entry->classic_description1;
+}
+
+float modern_pick_dig_seconds(int tool_tier, int block_tier) noexcept
+{
+    // GetAverageDigTimeForToolTier, GetBlockDifficultyModifier and
+    // GetDifficultyRatio. Their defaults matter: a laser sword is tier 12, so
+    // against tier-0 and tier-1 blocks the difference (12, 11) has no entry
+    // and the ratio falls back to 1.
+    float seconds = 20.0F;
+    switch (tool_tier)
     {
-    case InventoryItemId::wood_block:
-        return "Planks cut from logs";
-    case InventoryItemId::rock_block:
-        return "Commonly found underground";
-    case InventoryItemId::log_block:
-    case InventoryItemId::leaves_block:
-        return "Comes from trees";
-    case InventoryItemId::dirt_block:
-    case InventoryItemId::sand_block:
-    case InventoryItemId::grass_block:
-    case InventoryItemId::snow:
-    case InventoryItemId::ice:
-        return "Found on the surface";
-    case InventoryItemId::lantern_block:
-        return "Lights the world, tougher than a torch";
-    case InventoryItemId::blood_stone_block:
-        return "Found in hell, very hard";
-    case InventoryItemId::space_rock:
-    case InventoryItemId::space_rock_inventory:
-        return "Comes from space";
-    case InventoryItemId::slime:
-        return "Comes from space, used for alien weapons";
-    case InventoryItemId::iron_wall:
-    case InventoryItemId::copper_wall:
-    case InventoryItemId::golden_wall:
-    case InventoryItemId::diamond_wall:
-        return "Strong wall, stops digging monsters";
-    case InventoryItemId::crate:
-        return "Stores items";
-    case InventoryItemId::tnt:
-        return "Blows up a large area";
-    case InventoryItemId::c4:
-        return "Placed explosive, destroys everything";
-    case InventoryItemId::stick:
-        return "Used to craft tools and torches";
-    case InventoryItemId::torch:
-        return "Lights your world, wards off monsters";
-    case InventoryItemId::door:
-        return "Open or close to keep monsters out";
-    case InventoryItemId::coal:
-        return "Fuel for smelting and crafting";
-    case InventoryItemId::copper_ore:
-    case InventoryItemId::iron_ore:
-    case InventoryItemId::gold_ore:
-        return "Smelt with coal or a log to make bars";
-    case InventoryItemId::diamond:
-        return "Very hard, used for diamond gear";
-    case InventoryItemId::iron:
-    case InventoryItemId::copper:
-    case InventoryItemId::gold:
-        return "Refined metal used to craft items";
+    case 0: seconds = 16.0F; break;
+    case 1: seconds = 14.0F; break;
+    case 2: seconds = 12.0F; break;
+    case 3: seconds = 10.0F; break;
+    case 4: seconds = 9.0F; break;
+    case 5: seconds = 6.0F; break;
+    case 6: seconds = 4.0F; break;
+    case 7: seconds = 3.0F; break;
+    case 8: seconds = 2.0F; break;
+    case 9: seconds = 1.5F; break;
+    case 10: seconds = 1.0F; break;
+    case 12: seconds = 0.5F; break;
+    default: break;
+    }
+    float difficulty = 5.0F;
+    switch (block_tier)
+    {
+    case 0: difficulty = 0.1F; break;
+    case 1: difficulty = 0.25F; break;
+    case 2: difficulty = 0.5F; break;
+    case 3: difficulty = 1.0F; break;
+    case 4: difficulty = 1.5F; break;
+    case 5: difficulty = 2.0F; break;
+    case 6: difficulty = 3.0F; break;
+    case 7: difficulty = 4.5F; break;
+    case 8: difficulty = 6.0F; break;
+    case 9: difficulty = 8.0F; break;
+    case 10: difficulty = 10.0F; break;
+    default: break;
+    }
+    float ratio = 1.0F;
+    switch (tool_tier - block_tier)
+    {
+    case 0: ratio = 1.0F; break;
+    case 1: ratio = 0.75F; break;
+    case 2: ratio = 0.5F; break;
+    case 3: ratio = 0.35F; break;
+    case 4: ratio = 0.25F; break;
+    case 5: ratio = 0.2F; break;
+    case 6: ratio = 0.17F; break;
+    case 7: ratio = 0.15F; break;
+    case 8: ratio = 0.14F; break;
+    case 9: ratio = 0.13F; break;
+    case 10: ratio = 0.12F; break;
+    default: break;
+    }
+    // Single-precision products in the original's order, then the 10 ms floor.
+    seconds *= difficulty;
+    seconds *= ratio;
+    if (seconds < 0.01F)
+        seconds = 0.01F;
+    // TimeSpan.FromSeconds keeps whole milliseconds: (long)(value * 1000 + 0.5).
+    // 9 * 0.25 * 0.35 is 0.78749996 as a float and therefore 787 ms, not 788.
+    const double milliseconds = std::floor(static_cast<double>(seconds) * 1000.0 + 0.5);
+    return static_cast<float>(milliseconds / 1000.0);
+}
+
+namespace
+{
+
+// PickInventoryItem.GetPickaxeBlockTier (1.9.9.8). Evaluated on the parent
+// block type, like every TimeToDig. -1 stands for int.MaxValue: no pick tier.
+[[nodiscard]] int modern_pick_block_tier(world::BlockType block) noexcept
+{
+    using B = world::BlockType;
+    switch (block)
+    {
+    case B::dirt:
+    case B::grass:
+    case B::sand:
+    case B::rock:
+    case B::snow:
+    case B::leaves:
+    case B::wood:
+    case B::ice:
+        return 0;
+    case B::coal_ore:
+        return 1;
+    case B::copper_ore:
+    case B::copper_wall:
+        return 2;
+    case B::iron_ore:
+    case B::iron_wall:
+    case B::loot_block:
+        return 3;
+    case B::golden_wall:
+        return 4;
+    case B::gold_ore:
+    case B::diamond_wall:
+        return 5;
+    case B::diamond_ore:
+    case B::lucky_loot_block:
+        return 6;
+    case B::blood_stone:
+        return 8;
+    case B::space_rock:
+    case B::space_rock_inventory:
+        return 9;
+    case B::slime:
+        return 10;
+    default:
+        return -1;
+    }
+}
+
+// PickInventoryItem.GetToolTier (1.9.9.8): every laser sword is tier 12, the
+// picks follow their material (Stone 3, Copper 4, Iron 5, Gold 6, Diamond 8,
+// BloodStone 10). Zero for anything that is not a PickInventoryItem.
+[[nodiscard]] int modern_pick_tool_tier(InventoryItemId tool) noexcept
+{
+    switch (tool)
+    {
     case InventoryItemId::stone_pickaxe:
+        return 3;
     case InventoryItemId::copper_pickaxe:
+        return 4;
     case InventoryItemId::iron_pickaxe:
+        return 5;
     case InventoryItemId::gold_pickaxe:
+        return 6;
     case InventoryItemId::diamond_pickaxe:
+        return 8;
     case InventoryItemId::bloodstone_pickaxe:
-        return "Breaks stone and ore faster";
-    case InventoryItemId::stone_spade:
-    case InventoryItemId::copper_spade:
-    case InventoryItemId::iron_spade:
-    case InventoryItemId::gold_spade:
-    case InventoryItemId::diamond_spade:
-        return "Digs dirt and sand, removes TNT and C4";
-    case InventoryItemId::stone_axe:
-    case InventoryItemId::copper_axe:
-    case InventoryItemId::iron_axe:
-    case InventoryItemId::gold_axe:
-    case InventoryItemId::diamond_axe:
-        return "Chops wood, basic melee defense";
-    case InventoryItemId::knife:
-    case InventoryItemId::gold_knife:
-    case InventoryItemId::diamond_knife:
-    case InventoryItemId::blood_stone_knife:
-    case InventoryItemId::space_knife:
-        return "Basic melee defense";
+        return 10;
     case InventoryItemId::iron_laser_sword:
     case InventoryItemId::copper_laser_sword:
     case InventoryItemId::gold_laser_sword:
     case InventoryItemId::diamond_laser_sword:
     case InventoryItemId::blood_stone_laser_sword:
-        return "Advanced melee and mining tool";
-    case InventoryItemId::compass:
-        return "Points back to the start point";
-    case InventoryItemId::clock:
-        return "Shows the time of day";
-    case InventoryItemId::gps:
-        return "Marks a spot so you can find it again";
-    case InventoryItemId::teleport_gps:
-        return "Teleports you to a marked spot";
-    case InventoryItemId::brass_casing:
-    case InventoryItemId::iron_casing:
-    case InventoryItemId::gold_casing:
-    case InventoryItemId::diamond_casing:
-        return "Used for making ammunition";
-    case InventoryItemId::bullets:
-        return "Ammo for conventional weapons";
-    case InventoryItemId::iron_bullets:
-        return "Ammo for gold weapons";
-    case InventoryItemId::gold_bullets:
-        return "Ammo for diamond weapons";
-    case InventoryItemId::diamond_bullets:
-        return "Ammo for bloodstone weapons";
-    case InventoryItemId::blood_stone_bullets:
-        return "High grade ammunition";
-    case InventoryItemId::laser_bullets:
-        return "Ammo for laser weapons";
-    case InventoryItemId::rocket_ammo:
-        return "Ammo for rocket launchers";
-    case InventoryItemId::gun_powder:
-        return "A raw crafting material";
-    case InventoryItemId::explosive_powder:
-        return "Crafts explosives, dropped by dragons and demons";
-    case InventoryItemId::grenade:
-        return "Cook it and throw it";
-    case InventoryItemId::rocket_launcher:
-        return "Dumb-fired explosive projectile";
-    case InventoryItemId::guided_rocket_launcher:
-        return "Guided missile for killing dragons";
-    case InventoryItemId::pistol:
-    case InventoryItemId::gold_pistol:
-    case InventoryItemId::diamond_pistol:
-    case InventoryItemId::blood_stone_pistol:
-    case InventoryItemId::iron_space_pistol:
-    case InventoryItemId::copper_space_pistol:
-    case InventoryItemId::gold_space_pistol:
-    case InventoryItemId::diamond_space_pistol:
-        return "Basic semi-automatic gun";
-    case InventoryItemId::assault_rifle:
-    case InventoryItemId::gold_assault_rifle:
-    case InventoryItemId::diamond_assault_rifle:
-    case InventoryItemId::blood_stone_assault_rifle:
-    case InventoryItemId::iron_space_assault_rifle:
-    case InventoryItemId::copper_space_assault_rifle:
-    case InventoryItemId::gold_space_assault_rifle:
-    case InventoryItemId::diamond_space_assault_rifle:
-        return "High power, full auto";
-    case InventoryItemId::pump_shotgun:
-    case InventoryItemId::gold_pump_shotgun:
-    case InventoryItemId::diamond_pump_shotgun:
-    case InventoryItemId::blood_stone_pump_shotgun:
-    case InventoryItemId::iron_space_pump_shotgun:
-    case InventoryItemId::copper_space_pump_shotgun:
-    case InventoryItemId::gold_space_pump_shotgun:
-    case InventoryItemId::diamond_space_pump_shotgun:
-        return "Short range burst fire";
-    case InventoryItemId::bolt_action_rifle:
-    case InventoryItemId::gold_bolt_action_rifle:
-    case InventoryItemId::diamond_bolt_action_rifle:
-    case InventoryItemId::blood_stone_bolt_action_rifle:
-    case InventoryItemId::iron_space_bolt_action_rifle:
-    case InventoryItemId::copper_space_bolt_action_rifle:
-    case InventoryItemId::gold_space_bolt_action_rifle:
-    case InventoryItemId::diamond_space_bolt_action_rifle:
-        return "High power, very accurate";
-    case InventoryItemId::smg:
-    case InventoryItemId::gold_smg:
-    case InventoryItemId::diamond_smg:
-    case InventoryItemId::blood_stone_smg:
-    case InventoryItemId::iron_space_smg:
-    case InventoryItemId::copper_space_smg:
-    case InventoryItemId::gold_space_smg:
-    case InventoryItemId::diamond_space_smg:
-        return "High rate of fire";
-    case InventoryItemId::lmg:
-    case InventoryItemId::gold_lmg:
-    case InventoryItemId::diamond_lmg:
-    case InventoryItemId::blood_stone_lmg:
-        return "Powerful with a large clip";
+        return 12;
     default:
-        return "";
+        return 0;
     }
 }
 
-float dig_time_seconds(InventoryItemId tool, world::BlockType block) noexcept
+} // namespace
+
+float dig_time_seconds(InventoryItemId tool, world::BlockType block,
+                       InventoryProfile profile) noexcept
 {
     using B = world::BlockType;
     constexpr float no_entry = -1.0F;
     const auto value = static_cast<std::uint16_t>(tool);
+
+    if (profile == InventoryProfile::modern)
+    {
+        // PickInventoryItem.TimeToDig: the tier formula when the tool reaches
+        // the block's tier, otherwise the base table (two seconds for
+        // containers and structures, the bare-hand times, never for the rest).
+        if (const int tool_tier = modern_pick_tool_tier(tool); tool_tier > 0)
+        {
+            const int block_tier = modern_pick_block_tier(block);
+            if (block_tier >= 0 && block_tier <= tool_tier)
+                return modern_pick_dig_seconds(tool_tier, block_tier);
+            return world::bare_hand_break_seconds(block);
+        }
+    }
 
     // ToolMaterialTypes tiers, indexed 0 stone .. 5 bloodstone.
     enum class Tier
@@ -1003,17 +767,22 @@ float dig_time_seconds(InventoryItemId tool, world::BlockType block) noexcept
     {
         seconds = pick_table(static_cast<Tier>(value - 23U));
     }
-    else if (value >= 114U && value <= 118U) // Laser swords: laser table, then
-    {                                        // the metal tier wins where it has
-        seconds = laser_table();             // an entry, like the original.
-        const Tier tier = tool == InventoryItemId::iron_laser_sword      ? Tier::iron
-                          : tool == InventoryItemId::copper_laser_sword  ? Tier::copper
-                          : tool == InventoryItemId::gold_laser_sword    ? Tier::gold
-                          : tool == InventoryItemId::diamond_laser_sword ? Tier::diamond
-                                                                         : Tier::blood_stone;
-        const float metal = pick_table(tier);
-        if (metal >= 0.0F)
-            seconds = metal;
+    else if (value >= 114U && value <= 118U)
+    {
+        // 1.6.3.8 PickInventoryItem.TimeToDig tests the laser-sword ids first
+        // and RETURNS from that switch, so all five swords dig identically; the
+        // material table is reached only for a block the laser list lacks.
+        // (The OpenClassic mod lets the material overwrite it. Retail does not.)
+        seconds = laser_table();
+        if (seconds < 0.0F)
+        {
+            const Tier tier = tool == InventoryItemId::iron_laser_sword      ? Tier::iron
+                              : tool == InventoryItemId::copper_laser_sword  ? Tier::copper
+                              : tool == InventoryItemId::gold_laser_sword    ? Tier::gold
+                              : tool == InventoryItemId::diamond_laser_sword ? Tier::diamond
+                                                                             : Tier::blood_stone;
+            seconds = pick_table(tier);
+        }
     }
     else if (value >= 29U && value <= 33U) // Spades, stone through diamond.
     {
@@ -1031,12 +800,47 @@ float dig_time_seconds(InventoryItemId tool, world::BlockType block) noexcept
     return world::bare_hand_break_seconds(block);
 }
 
-float item_enemy_damage(InventoryItemId item) noexcept
+float item_enemy_damage(InventoryItemId item, InventoryProfile profile) noexcept
 {
     if (const GunStats *gun = gun_stats(item); gun != nullptr)
         return gun->enemy_damage;
     if (item == InventoryItemId::modern_chainsaw_1)
         return 5.0F;
+    if (profile == InventoryProfile::modern)
+    {
+        // The cells 1.9.9.8 changed. SaberInventoryItemClass passes a literal
+        // 1f to its base and ignores the 8f it was registered with; the Ice
+        // and TNT registrations carry each other's Classic values.
+        switch (item)
+        {
+        case InventoryItemId::iron_laser_sword:
+        case InventoryItemId::copper_laser_sword:
+        case InventoryItemId::gold_laser_sword:
+        case InventoryItemId::diamond_laser_sword:
+        case InventoryItemId::blood_stone_laser_sword:
+            return 1.0F;
+        case InventoryItemId::ice:
+            return 0.1F;
+        case InventoryItemId::tnt:
+            return 0.01F;
+        default:
+            break;
+        }
+    }
+    switch (item)
+    {
+    // Modern-only block items: the three strong doors are
+    // ItemBlockInventoryItemClass (0.025), the fancy lantern shares 0.075
+    // with the plain one.
+    case InventoryItemId::modern_diamond_door:
+    case InventoryItemId::modern_iron_door:
+    case InventoryItemId::modern_tech_door:
+        return 0.025F;
+    case InventoryItemId::modern_lantern_fancy_block:
+        return 0.075F;
+    default:
+        break;
+    }
     switch (static_cast<std::uint16_t>(item))
     {
     case 0U:
@@ -1054,6 +858,9 @@ float item_enemy_damage(InventoryItemId item) noexcept
         return 0.15F;
     case 13U:
         return 0.05F; // StickInventoryItemClass.
+    case 14U: // TorchInventoryItemClass and DoorInventoryItemClass both pass
+    case 76U: // 0.025 to BlockInventoryItemClass, not the 0.1 base default.
+        return 0.025F;
     case 74U:         // Snow and ice blocks.
     case 75U:
         return 0.01F;
@@ -1434,14 +1241,66 @@ InventoryItemId mined_item(world::BlockType block) noexcept
     case world::BlockType::empty:
     case world::BlockType::uninitialized:
         return InventoryItemId::bare_hands;
+    // InventoryItem.CreatesWhenDug ends in BlockInventoryItemClass.CreateBlockItem,
+    // which returns null when no item class is registered for the block, and
+    // InGameHUD.Dig then creates no pickup. Neither generation registers a
+    // Leaves item, and Modern registers only the basic spawn point. A pickup of
+    // an id the other side never registered is not something a stock client can
+    // even deserialize.
+    case world::BlockType::leaves:
+    case world::BlockType::spawn_point_builder:
+    case world::BlockType::spawn_point_combat:
+    case world::BlockType::spawn_point_explorer:
+        return InventoryItemId::bare_hands;
     default:
         return block_item(block);
     }
 }
 
-std::uint16_t item_stack_limit(InventoryItemId item) noexcept
+bool item_registered(InventoryItemId item, InventoryProfile profile) noexcept
 {
-    return item_stack_limit(item, InventoryProfile::classic);
+    const auto value = static_cast<std::uint16_t>(item);
+    // 0..122 is the shared range; SpaceKnife (81) is declared in both enums
+    // and registered by neither InventoryItem.Initalize.
+    if (value <= 122U)
+        return item != InventoryItemId::space_knife;
+    if (profile != InventoryProfile::modern)
+        return false;
+    switch (item)
+    {
+    case InventoryItemId::modern_chainsaw_1:
+    case InventoryItemId::modern_sticky_grenade:
+    case InventoryItemId::modern_stone_container:
+    case InventoryItemId::modern_copper_container:
+    case InventoryItemId::modern_iron_container:
+    case InventoryItemId::modern_gold_container:
+    case InventoryItemId::modern_diamond_container:
+    case InventoryItemId::modern_bloodstone_container:
+    case InventoryItemId::modern_spawn_basic:
+    case InventoryItemId::modern_glass_window_wood:
+    case InventoryItemId::modern_glass_window_iron:
+    case InventoryItemId::modern_glass_window_gold:
+    case InventoryItemId::modern_glass_window_diamond:
+    case InventoryItemId::modern_basic_grenade_launcher:
+    case InventoryItemId::modern_laser_drill:
+    case InventoryItemId::modern_diamond_door:
+    case InventoryItemId::modern_lantern_fancy_block:
+    case InventoryItemId::modern_precision_laser:
+    case InventoryItemId::modern_teleport_station:
+    case InventoryItemId::modern_iron_door:
+    case InventoryItemId::modern_tech_door:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool item_uses_tool_input(InventoryItemId item) noexcept
+{
+    return !is_block_item(item) && gun_stats(item) == nullptr &&
+           item != InventoryItemId::fired_rocket && item != InventoryItemId::fired_guided_rocket &&
+           item != InventoryItemId::gps && item != InventoryItemId::teleport_gps &&
+           !item_grenade_type(item).has_value();
 }
 
 std::uint16_t item_stack_limit(InventoryItemId item, InventoryProfile profile) noexcept
@@ -1506,7 +1365,12 @@ std::uint16_t item_stack_limit(InventoryItemId item, InventoryProfile profile) n
             return 1U;
         if (value == 102U)
             return 999U;
-        if (value == 103U || value == 104U)
+        // RocketLauncherInventoryItemClass sets MaxStackCount = 3 in 1.9.9.8. It
+        // is the class of the plain launcher and of both fired-pose ids; the
+        // guided launcher has its own class and stays at one.
+        if (value == 103U || value == 112U || value == 113U)
+            return 3U;
+        if (value == 104U)
             return 1U;
         if (value == 105U || value == 109U || value == 111U)
             return 5000U;
@@ -1539,9 +1403,11 @@ std::uint16_t item_stack_limit(InventoryItemId item, InventoryProfile profile) n
     default:
         break;
     }
+    // 102 is Slime, a BlockInventoryItemClass that stacks to 64 like any other
+    // block; it merely sits between the laser guns and the launchers.
     const bool tool = (value >= 23U && value <= 40U) || (value >= 49U && value <= 72U) ||
-                      (value >= 77U && value <= 78U) || (value >= 81U && value <= 104U) ||
-                      (value >= 111U && value <= 122U);
+                      (value >= 77U && value <= 78U) || (value >= 81U && value <= 101U) ||
+                      (value >= 103U && value <= 104U) || (value >= 111U && value <= 122U);
     return tool || item == InventoryItemId::bare_hands ? 1U : 64U;
 }
 
@@ -1633,6 +1499,25 @@ std::array<float, 3> item_material_tint(InventoryItemId item) noexcept
     return {1.0F, 1.0F, 1.0F};
 }
 
+std::array<float, 3> projectile_tint(InventoryItemId item) noexcept
+{
+    const auto value = static_cast<std::uint16_t>(item);
+    if (value >= 82U && value <= 86U)
+        return {1.0F, 0.025F, 0.015F};
+    if (value >= 87U && value <= 91U)
+        return {0.025F, 1.0F, 0.055F};
+    if (value >= 92U && value <= 96U)
+        return {1.0F, 0.82F, 0.015F};
+    if (value >= 97U && value <= 101U)
+        return {0.025F, 0.16F, 1.0F};
+    if (item == InventoryItemId::modern_laser_drill ||
+        item == InventoryItemId::modern_precision_laser)
+        return {1.0F, 0.025F, 0.08F};
+    if (item == InventoryItemId::modern_multi_laser)
+        return {0.10F, 0.75F, 1.0F};
+    return item_material_tint(item);
+}
+
 const GunStats *gun_stats(InventoryItemId item) noexcept
 {
     // Field order: fire cooldown, reload seconds, shoulder magnification, clip capacity,
@@ -1658,14 +1543,16 @@ const GunStats *gun_stats(InventoryItemId item) noexcept
         GunStats shotgun{1.0F, 0.567F, 1.0F, 6U, false, Id::bare_hands, "Shotgun", "ShotGunReload"};
         shotgun.rounds_per_reload = 1U;
         shotgun.inaccuracy = 0.1F;
-        shotgun.recoil_radians = 0.17453293F;
+        shotgun.recoil_radians = 0.17453292F; // Angle.FromDegrees(10f), as a float.
         shotgun.tracer_velocity = 50.0F;
         shotgun.tracer_flight_seconds = 0.4F;
-        GunStats bolt{0.0031746032F, 2.4F,           1.5F,       8U,
-                      false,         Id::bare_hands, "GunShot1", "AssaultReload"};
+        // TimeSpan.FromMinutes/FromSeconds round to whole milliseconds, so the
+        // authored 1/315 s and 60/937 s fire rates are really 3 ms and 64 ms.
+        GunStats bolt{0.003F, 2.4F,           1.5F,       8U,
+                      false,  Id::bare_hands, "GunShot1", "AssaultReload"};
         bolt.recoil_radians = 0.20943952F;
         bolt.tracer_velocity = 150.0F;
-        GunStats smg{0.0640341515F, 2.0F, 1.1F, 20U, true, Id::bare_hands, "GunShot2", "Reload"};
+        GunStats smg{0.064F, 2.0F, 1.1F, 20U, true, Id::bare_hands, "GunShot2", "Reload"};
         smg.inaccuracy = 0.1F;
         smg.tracer_flight_seconds = 1.0F;
         GunStats lmg{0.112F, 9.7F, 1.3F, 100U, true, Id::bare_hands, "GunShot2", "Reload"};
@@ -1673,7 +1560,7 @@ const GunStats *gun_stats(InventoryItemId item) noexcept
         lmg.tracer_flight_seconds = 1.0F;
         GunStats rpg{1.0F, 0.567F, 1.0F, 1U, false, Id::bare_hands, "RPGLaunch", "ShotGunReload"};
         rpg.inaccuracy = 0.1F;
-        rpg.recoil_radians = 0.17453293F;
+        rpg.recoil_radians = 0.17453292F;
         rpg.tracer_velocity = 50.0F;
         rpg.tracer_flight_seconds = 0.4F;
         GunStats laser_pistol{0.06F, 1.25F, 1.2F, 7U, false, Id::bare_hands, "LaserGun4", "Reload"};
@@ -1780,6 +1667,55 @@ GunReloadCycle gun_reload_cycle(const GunStats &stats, std::uint16_t rounds_in_c
     return {loaded, rounds_in_clip + loaded < stats.clip_capacity && reserve_ammo > loaded};
 }
 
+GunTriggerDecision gun_trigger_step(const GunStats &stats, GunTriggerState state,
+                                    std::uint16_t rounds_in_clip, std::uint32_t reserve_ammo,
+                                    GunTriggerInput input) noexcept
+{
+    const bool use_held = input.use_held || input.use_pressed;
+    const bool can_reload = rounds_in_clip < stats.clip_capacity && reserve_ammo > 0U;
+    if (can_reload && input.reload_pressed)
+    {
+        state.released = !use_held;
+        state.reloading = true;
+    }
+    if (state.released && input.use_pressed)
+        state.reloading = false;
+    if (state.reloading || !input.cooldown_expired ||
+        !((use_held && stats.automatic) || input.use_pressed))
+        return {state, false};
+    if (rounds_in_clip > 0U && input.fire_permitted)
+    {
+        // The shot itself clears Reloading, then the emptied clip asks for the
+        // automatic reload in the same sample.
+        state.reloading = rounds_in_clip == 1U && reserve_ammo > 0U;
+        return {state, true};
+    }
+    // An empty (or lock-less) trigger pull only ever requests a reload. Because
+    // the request is restored within this same sample, a pull that withdrew it
+    // above leaves a running reload clip untouched.
+    if (can_reload)
+        state.reloading = true;
+    return {state, false};
+}
+
+GunReloadStep gun_reload_step(GunReloadClip clip, bool reloading, bool unshouldered,
+                              bool fire_animation_playing, float reload_seconds,
+                              float delta_seconds) noexcept
+{
+    if (clip.active)
+    {
+        if (!reloading)
+            return {{}, GunReloadEvent::cancelled};
+        clip.seconds_left = std::max(0.0F, clip.seconds_left - std::max(0.0F, delta_seconds));
+        if (clip.seconds_left <= 0.0F)
+            return {{}, GunReloadEvent::completed};
+        return {clip, GunReloadEvent::none};
+    }
+    if (reloading && unshouldered && !fire_animation_playing)
+        return {{true, std::max(0.0F, reload_seconds)}, GunReloadEvent::started};
+    return {{}, GunReloadEvent::none};
+}
+
 GunRecoil gun_recoil(float amount_radians, float yaw_roll, float pitch_roll) noexcept
 {
     const float yaw_sample = std::clamp(yaw_roll, 0.0F, 1.0F) * 0.5F - 0.25F;
@@ -1787,13 +1723,132 @@ GunRecoil gun_recoil(float amount_radians, float yaw_roll, float pitch_roll) noe
     return {yaw_sample * amount_radians, pitch_sample * amount_radians};
 }
 
-const std::vector<CraftingRecipe> &crafting_recipes() noexcept
+const std::array<RecipeGroup, 4> &modern_recipe_groups() noexcept
 {
+    using T = RecipeType;
+    // CraftingScreen's constructor: Materials, Tools, Weapons, Structures and
+    // the Tier2Items under each, in construction order.
+    static constexpr std::array<RecipeGroup, 4> groups{{
+        {"Materials", {T::ores, T::components}, 2U},
+        {"Tools", {T::pickaxes, T::spades, T::axes, T::special_tools}, 4U},
+        {"Weapons",
+         {T::ammo, T::knives, T::pistols, T::shotguns, T::rifles, T::assault_rifles, T::smgs,
+          T::lmgs, T::rpg, T::explosives, T::laser_swords},
+         11U},
+        {"Structures",
+         {T::walls, T::containers, T::spawn_points, T::other_structure, T::doors},
+         5U},
+    }};
+    return groups;
+}
+
+const char *recipe_type_label(RecipeType type) noexcept
+{
+    switch (type)
+    {
+    case RecipeType::ores:
+        return "Ores";
+    case RecipeType::components:
+        return "Components";
+    case RecipeType::pickaxes:
+        return "Pickaxes";
+    case RecipeType::spades:
+        return "Spades";
+    case RecipeType::axes:
+        return "Axes";
+    case RecipeType::special_tools:
+        return "Special";
+    case RecipeType::ammo:
+        return "Ammo";
+    case RecipeType::knives:
+        return "Knives";
+    case RecipeType::pistols:
+        return "Pistols";
+    case RecipeType::shotguns:
+        return "Shotguns";
+    case RecipeType::rifles:
+        return "Rifles";
+    case RecipeType::assault_rifles:
+        return "Assault Rifles";
+    case RecipeType::smgs:
+        return "SMG's";
+    case RecipeType::lmgs:
+        return "LMG's";
+    case RecipeType::rpg:
+        return "RPG";
+    case RecipeType::laser_swords:
+        return "Laser Swords";
+    case RecipeType::walls:
+        return "Walls";
+    case RecipeType::doors:
+        return "Doors";
+    case RecipeType::other_structure:
+        return "Other";
+    case RecipeType::explosives:
+        return "Explosives";
+    case RecipeType::containers:
+        return "Containers";
+    case RecipeType::spawn_points:
+        return "Spawn Points";
+    case RecipeType::advanced:
+    case RecipeType::none:
+        break;
+    }
+    return "";
+}
+
+const std::vector<CraftingRecipe> &crafting_recipes(InventoryProfile profile) noexcept
+{
+    if (profile == InventoryProfile::modern)
+    {
+        static const std::vector<CraftingRecipe> modern = [] {
+            using Id = InventoryItemId;
+            std::vector<CraftingRecipe> book;
+            book.reserve(127U);
+            const auto add = [&](Id result, std::uint16_t count,
+                                 std::initializer_list<CraftingIngredient> ingredients) {
+                CraftingRecipe recipe;
+                recipe.result = result;
+                recipe.result_count = count;
+                std::copy(ingredients.begin(), ingredients.end(), recipe.ingredients.begin());
+                book.push_back(recipe);
+            };
+#include "modern_recipes.inc"
+            // Recipe.RecipeTypes of the 127 entries above, as runs in cookbook
+            // order (recorded from the shipped 1.9.9.8 Recipe.CookBook).
+            using T = RecipeType;
+            struct TypeRun final
+            {
+                RecipeType type;
+                std::size_t count;
+            };
+            static constexpr std::array<TypeRun, 34> type_runs{{
+                {T::components, 2U},      {T::special_tools, 1U}, {T::other_structure, 2U},
+                {T::components, 4U},      {T::ammo, 5U},          {T::components, 1U},
+                {T::special_tools, 4U},   {T::containers, 7U},    {T::spawn_points, 4U},
+                {T::pickaxes, 7U},        {T::spades, 5U},        {T::axes, 5U},
+                {T::ores, 6U},            {T::knives, 4U},        {T::laser_swords, 5U},
+                {T::pistols, 8U},         {T::lmgs, 4U},          {T::smgs, 8U},
+                {T::rifles, 8U},          {T::shotguns, 8U},      {T::assault_rifles, 8U},
+                {T::advanced, 1U},        {T::walls, 1U},         {T::ores, 1U},
+                {T::walls, 1U},           {T::ores, 1U},          {T::walls, 1U},
+                {T::ores, 1U},            {T::walls, 1U},         {T::ores, 1U},
+                {T::explosives, 4U},      {T::rpg, 2U},           {T::doors, 2U},
+                {T::other_structure, 4U},
+            }};
+            std::size_t index = 0;
+            for (const TypeRun &run : type_runs)
+                for (std::size_t step = 0; step < run.count && index < book.size(); ++step)
+                    book[index++].type = run.type;
+            return book;
+        }();
+        return modern;
+    }
     // The complete static Receipe.CookBook, in authored order.
     static const std::vector<CraftingRecipe> cookbook = [] {
         using Id = InventoryItemId;
         std::vector<CraftingRecipe> book;
-        book.reserve(101U);
+        book.reserve(107U);
         const auto add = [&](Id result, std::uint16_t count,
                              std::initializer_list<CraftingIngredient> parts) {
             CraftingRecipe recipe;
@@ -1951,6 +2006,9 @@ float item_use_cooldown_seconds(InventoryItemId item) noexcept
     case InventoryItemId::blood_stone_knife:
         return 0.25F;
     case InventoryItemId::grenade:
+    // 1.9.9.8 registers the sticky grenade with the same
+    // GrenadeInventoryItemClass (one-second cooldown) as the HE grenade.
+    case InventoryItemId::modern_sticky_grenade:
     case InventoryItemId::fired_rocket:
     case InventoryItemId::fired_guided_rocket:
         return 1.0F;
@@ -2045,8 +2103,13 @@ world::BlockType PlayerInventory::selected_block() const noexcept
     return selected().has_value() ? selected()->block : world::BlockType::empty;
 }
 
-float item_self_damage_per_use(InventoryItemId item) noexcept
+float item_self_damage_per_use(InventoryItemId item, InventoryProfile profile) noexcept
 {
+    // 1.9.9.8 PickInventoryItemClass: `case ToolMaterialTypes.Stone:
+    // ItemSelfDamagePerUse = 0.002f`. Its spade and axe classes, and all three
+    // 1.6.3.8 classes, keep 0.0025.
+    if (profile == InventoryProfile::modern && item == InventoryItemId::stone_pickaxe)
+        return 0.002F;
     switch (item)
     {
     case InventoryItemId::stone_pickaxe:
@@ -2153,9 +2216,10 @@ float item_self_damage_per_use(InventoryItemId item) noexcept
     }
 }
 
-bool inflict_item_damage(InventoryStack &stack, bool infinite_resource_mode) noexcept
+bool inflict_item_damage(InventoryStack &stack, bool infinite_resource_mode,
+                         InventoryProfile profile) noexcept
 {
-    const float damage = item_self_damage_per_use(stack.item);
+    const float damage = item_self_damage_per_use(stack.item, profile);
     stack.durability -= damage;
     // Both shipped InventoryItem.InflictDamage bodies apply the same damage a
     // second time in InfiniteResourceMode. Preserve that odd original rule.
@@ -2186,7 +2250,7 @@ void PlayerInventory::stack_existing(std::array<Slot, Size> &slots, const Invent
         return;
     for (auto &slot : slots)
     {
-        if (!slot.has_value() || slot->item != source.item || slot->count >= limit)
+        if (!slot.has_value() || !slot->same_kind(source) || slot->count >= limit)
             continue;
         const auto available = static_cast<std::uint16_t>(limit - slot->count);
         const auto moved = std::min(available, remaining);
@@ -2283,12 +2347,46 @@ bool PlayerInventory::consume_item(InventoryItemId item, std::uint16_t amount) n
 {
     if (count(item) < amount)
         return false;
+    if (profile_ == InventoryProfile::classic)
+    {
+        // 1.6.3.8 PlayerInventory.Consume(itemClass, amount) (its only caller is
+        // GunInventoryItem.Reload) repeatedly takes the SMALLEST matching tray
+        // stack (`StackCount < num`, so the lowest slot wins a tie) until the
+        // tray has none left, and only then does the same in the backpack.
+        // 1.9.9.8 rewrote it to walk the slots in order, which is the loop below.
+        const auto drain_smallest_first = [&](auto &slots) {
+            while (amount > 0U)
+            {
+                Slot *smallest = nullptr;
+                // A mod item (mod_item != 0) is never its fallback's retail item.
+                for (auto &slot : slots)
+                    if (slot.has_value() && slot->item == item && slot->mod_item == 0U &&
+                        (smallest == nullptr || slot->count < (*smallest)->count))
+                        smallest = &slot;
+                if (smallest == nullptr)
+                    return;
+                if ((*smallest)->count > amount)
+                {
+                    (*smallest)->count = static_cast<std::uint16_t>((*smallest)->count - amount);
+                    amount = 0U;
+                }
+                else
+                {
+                    amount = static_cast<std::uint16_t>(amount - (*smallest)->count);
+                    smallest->reset();
+                }
+            }
+        };
+        drain_smallest_first(trays_.front());
+        drain_smallest_first(storage_);
+        return true;
+    }
     auto consume_from = [&](auto &slots) {
         for (auto &slot : slots)
         {
             if (amount == 0U)
                 return;
-            if (!slot.has_value() || slot->item != item)
+            if (!slot.has_value() || slot->item != item || slot->mod_item != 0U)
                 continue;
             const auto moved = std::min(slot->count, amount);
             slot->count = static_cast<std::uint16_t>(slot->count - moved);
@@ -2309,7 +2407,7 @@ std::uint32_t PlayerInventory::count(InventoryItemId item) const noexcept
     std::uint32_t result{};
     const auto add_matches = [&](const auto &slots) {
         for (const auto &slot : slots)
-            if (slot.has_value() && slot->item == item)
+            if (slot.has_value() && slot->item == item && slot->mod_item == 0U)
                 result += slot->count;
     };
     const std::size_t tray_limit = profile_ == InventoryProfile::modern ? tray_count : 1U;
@@ -2336,18 +2434,37 @@ const PlayerInventory::Slot &PlayerInventory::slot(std::size_t linear_index) con
                                        : tray()[linear_index - storage_size];
 }
 
+std::uint16_t PlayerInventory::add_stack_to_section(const InventoryStack &stack,
+                                                    bool to_tray) noexcept
+{
+    if (!stack.valid())
+        return stack.count;
+    std::uint16_t remaining = stack.count;
+    const std::uint16_t limit = item_stack_limit(stack.item, profile_);
+    if (!to_tray)
+    {
+        // PlayerInventory.AddItemToInventory: backpack stacks, then an empty slot.
+        stack_into(storage_, stack, limit, remaining);
+        return remaining;
+    }
+    // AddItemToTray. 1.9.9.8's InventoryTrayManager tops up the stacks of BOTH
+    // trays and then takes the first empty slot of tray 0, then tray 1; 1.6.3.8
+    // has the one tray.
+    const std::size_t tray_limit = profile_ == InventoryProfile::modern ? tray_count : 1U;
+    for (std::size_t index{}; index < tray_limit; ++index)
+        stack_existing(trays_[index], stack, limit, remaining);
+    for (std::size_t index{}; index < tray_limit; ++index)
+        place_into_empty(trays_[index], stack, limit, remaining);
+    return remaining;
+}
+
 bool PlayerInventory::move_to_other_section(std::size_t linear_index) noexcept
 {
     Slot &source = slot(linear_index);
     if (!source.has_value())
         return false;
     const InventoryStack moving = *source;
-    std::uint16_t remaining = moving.count;
-    const std::uint16_t limit = item_stack_limit(moving.item, profile_);
-    if (linear_index < storage_size)
-        stack_into(tray(), moving, limit, remaining);
-    else
-        stack_into(storage_, moving, limit, remaining);
+    const std::uint16_t remaining = add_stack_to_section(moving, linear_index < storage_size);
     if (remaining == moving.count)
         return false;
     if (remaining == 0U)
@@ -2357,9 +2474,100 @@ bool PlayerInventory::move_to_other_section(std::size_t linear_index) noexcept
     return true;
 }
 
+bool PlayerInventory::register_spawn_point(std::array<float, 3> point)
+{
+    if (profile_ != InventoryProfile::modern ||
+        std::ranges::any_of(point, [](float v) { return !std::isfinite(v) || std::abs(v) > 1'000'000; }) ||
+        point[1] < -64 || point[1] >= 64)
+        return false;
+    spawn_point_ = InventoryStack{InventoryItemId::modern_spawn_basic, 1};
+    spawn_point_->waypoint = point;
+    spawn_point_->waypoint_valid = true;
+    return true;
+}
+
+bool PlayerInventory::register_teleport_station(std::array<float, 3> point, std::string name)
+{
+    if (profile_ != InventoryProfile::modern || name.size() > 1024 ||
+        std::ranges::any_of(name, [](unsigned char c) { return c < 32 || c == 127; }) ||
+        std::ranges::any_of(point, [](float v) { return !std::isfinite(v) || std::abs(v) > 1'000'000; }) ||
+        point[1] < -64 || point[1] >= 64)
+        return false;
+    auto existing = std::ranges::find_if(teleport_stations_, [&](const auto &s) { return s.waypoint == point; });
+    if (existing == teleport_stations_.end())
+    {
+        if (teleport_stations_.size() >= 256) return false;
+        teleport_stations_.emplace_back(InventoryItemId::modern_teleport_station, std::uint16_t{1U});
+        existing = teleport_stations_.end() - 1;
+    }
+    existing->waypoint = point;
+    existing->waypoint_valid = true;
+    existing->waypoint_name = name.empty() ? "Delta" : std::move(name);
+    return true;
+}
+
+bool PlayerInventory::valid_travel_destinations() const noexcept
+{
+    if (teleport_stations_.size() > 256 ||
+        (profile_ != InventoryProfile::modern && (spawn_point_ || !teleport_stations_.empty())))
+        return false;
+    const auto valid = [](const InventoryStack &stack, InventoryItemId item) {
+        return stack.item == item && stack.count == 1 && stack.waypoint_valid &&
+               std::isfinite(stack.durability) && stack.durability >= 0 && stack.durability <= 1 &&
+               stack.waypoint_name.size() <= 1024 &&
+               std::ranges::none_of(stack.waypoint_name, [](unsigned char c) { return c < 32 || c == 127; }) &&
+               std::ranges::all_of(stack.waypoint, [](float v) { return std::isfinite(v) && std::abs(v) <= 1'000'000; }) &&
+               stack.waypoint[1] >= -64 && stack.waypoint[1] < 64;
+    };
+    if (spawn_point_ && !valid(*spawn_point_, InventoryItemId::modern_spawn_basic)) return false;
+    for (std::size_t i = 0; i < teleport_stations_.size(); ++i)
+    {
+        if (!valid(teleport_stations_[i], InventoryItemId::modern_teleport_station)) return false;
+        for (std::size_t j = 0; j < i; ++j)
+            if (teleport_stations_[i].waypoint == teleport_stations_[j].waypoint) return false;
+    }
+    return true;
+}
+
+void PlayerInventory::remove_travel_destination(std::array<float, 3> point)
+{
+    if (spawn_point_ && spawn_point_->waypoint == point) spawn_point_.reset();
+    std::erase_if(teleport_stations_, [&](const auto &station) { return station.waypoint == point; });
+}
+
+bool PlayerInventory::recipe_discovered(const CraftingRecipe &recipe) const noexcept
+{
+    // (Polish) A stack discovers by what it is: a mod item only the recipes
+    // that name that mod item, never those of its fallback.
+    const auto matches = [&](const Slot &slot) {
+        if (!slot)
+            return false;
+        if (slot->item == recipe.result && slot->mod_item == recipe.result_mod_item)
+            return true;
+        if (const auto *gun = gun_stats(slot->item);
+            gun && gun->ammo_item == recipe.result && recipe.result_mod_item == 0U && slot->mod_item == 0U)
+            return true;
+        return std::any_of(recipe.ingredients.begin(), recipe.ingredients.end(), [&](const auto &part) {
+            return part.count && part.item == slot->item && part.mod_item == slot->mod_item;
+        });
+    };
+    if (std::any_of(storage_.begin(), storage_.end(), matches))
+        return true;
+    const std::size_t count = profile_ == InventoryProfile::modern ? tray_count : 1U;
+    for (std::size_t i = 0; i < count; ++i)
+        if (std::any_of(trays_[i].begin(), trays_[i].end(), matches))
+            return true;
+    return false;
+}
+
 bool PlayerInventory::can_craft(const CraftingRecipe &recipe) const noexcept
 {
-    if (recipe.result == InventoryItemId::bare_hands)
+    // Modern's Precision Laser recipe is RecipeTypes.Advanced, a type the
+    // crafting screen builds no tab for: it cannot be crafted in the original.
+    if (recipe.result == InventoryItemId::bare_hands || !recipe_listed(recipe))
+        return false;
+    // (Polish) The server crafts mod recipes, never this inventory.
+    if (recipe.mod_recipe != 0U)
         return false;
     for (const CraftingIngredient &ingredient : recipe.ingredients)
     {
@@ -2384,7 +2592,9 @@ std::uint16_t PlayerInventory::craft(const CraftingRecipe &recipe) noexcept
             {
                 if (needed == 0U)
                     return;
-                if (!slot.has_value() || slot->item != ingredient.item)
+                // (Polish) A mod item is not its fallback: can_craft did not
+                // count it, so it is not used up either.
+                if (!slot.has_value() || slot->item != ingredient.item || slot->mod_item != 0U)
                     continue;
                 const auto moved = std::min(slot->count, needed);
                 slot->count = static_cast<std::uint16_t>(slot->count - moved);
@@ -2399,6 +2609,15 @@ std::uint16_t PlayerInventory::craft(const CraftingRecipe &recipe) noexcept
             take_from(trays_[index]);
     }
     return add_item(recipe.result, recipe.result_count);
+}
+
+std::optional<PlayerInventory> inventory_checkpoint(const PlayerInventory &inventory,
+                                                    const PlayerInventory::Slot &held)
+{
+    PlayerInventory snapshot = inventory;
+    if (held && snapshot.add_stack(*held) != 0U)
+        return std::nullopt;
+    return snapshot;
 }
 
 } // namespace openminerz

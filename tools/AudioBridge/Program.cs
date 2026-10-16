@@ -90,23 +90,7 @@ namespace OpenMinerZ.AudioBridge
                         new System.Collections.Generic.Dictionary<int, AudioEmitter>();
                     string[] ambientCueNames = { "Birds", "Crickets", "Drips", "lostSouls" };
                     Cue?[] ambientCues = new Cue?[4];
-                    var pendingSongs = new System.Collections.Generic.List<string>();
-                    Func<string, int> musicPriority = song =>
-                    {
-                        if (song.StartsWith("Song", StringComparison.Ordinal) &&
-                            int.TryParse(song.Substring(4), out int number))
-                            return number;
-                        // InGameHUD updates all distance triggers before its crater trigger.
-                        return 0;
-                    };
-                    Action<string> queueMusic = song =>
-                    {
-                        if (pendingSongs.Contains(song))
-                            return;
-                        pendingSongs.Add(song);
-                        pendingSongs.Sort((left, right) =>
-                            musicPriority(right).CompareTo(musicPriority(left)));
-                    };
+                    float[] ambientWeights = new float[4];
                     Cue? musicCue = null;
                     Action<string> startMusic = cueName =>
                     {
@@ -163,18 +147,16 @@ namespace OpenMinerZ.AudioBridge
                                         effects.SetVolume(effectsLevel);
                                         music.SetVolume(musicLevel);
                                         ambienceMaster = ambienceLevel;
-                                        foreach (AudioCategory category in ambience)
-                                            category.SetVolume(ambienceLevel);
+                                        for (int i = 0; i < ambience.Length; i++)
+                                            ambience[i].SetVolume(ambientWeights[i] * ambienceLevel);
                                     }
                                 }
                                 else if (command == "music start")
                                 {
-                                    pendingSongs.Clear();
                                     startMusic("Theme");
                                 }
                                 else if (command == "music stop")
                                 {
-                                    pendingSongs.Clear();
                                     if (musicCue != null)
                                     {
                                         if (!musicCue.IsStopped)
@@ -185,14 +167,10 @@ namespace OpenMinerZ.AudioBridge
                                 }
                                 else if (command.StartsWith("song ", StringComparison.Ordinal))
                                 {
-                                    // Vanilla checks transition triggers from Song6 down to Song1,
-                                    // then checks SpaceTheme. If several become eligible while a
-                                    // cue is playing, the highest-distance track wins next.
+                                    // The current environment owns music; stale biome
+                                    // tracks must never play after the player has left.
                                     string song = command.Substring(5).Trim();
-                                    if (musicCue != null && !musicCue.IsStopped)
-                                        queueMusic(song);
-                                    else
-                                        startMusic(song);
+                                    startMusic(song);
                                 }
                                 else if (command.StartsWith("loop start ", StringComparison.Ordinal))
                                 {
@@ -436,15 +414,28 @@ namespace OpenMinerZ.AudioBridge
                                     {
                                         for (int i = 0; i < 4; i++)
                                         {
+                                            float weight = Math.Max(0f, Math.Min(1f,
+                                                float.Parse(fields[1 + i], CultureInfo.InvariantCulture)));
+                                            // Quiet beds must stop, including their reverb tails.
+                                            // The old code continuously restarted all four loops.
+                                            ambientWeights[i] = weight * (i == 3 ? 0.28f : i == 2 ? 0.45f : 0.7f);
+                                            ambience[i].SetVolume(ambientWeights[i] * ambienceMaster);
+                                            if (weight <= 0.001f)
+                                            {
+                                                if (ambientCues[i] != null)
+                                                {
+                                                    ambientCues[i]!.Stop(AudioStopOptions.Immediate);
+                                                    ambientCues[i]!.Dispose();
+                                                    ambientCues[i] = null;
+                                                }
+                                                continue;
+                                            }
                                             if (ambientCues[i] == null || ambientCues[i]!.IsStopped)
                                             {
+                                                ambientCues[i]?.Dispose();
                                                 ambientCues[i] = soundBank.GetCue(ambientCueNames[i]);
                                                 ambientCues[i]!.Play();
                                             }
-                                            float weight = float.Parse(fields[1 + i],
-                                                CultureInfo.InvariantCulture);
-                                            ambience[i].SetVolume(Math.Max(0f,
-                                                Math.Min(1f, weight)) * ambienceMaster);
                                         }
                                     }
                                 }
@@ -476,12 +467,7 @@ namespace OpenMinerZ.AudioBridge
                         {
                             musicCue.Dispose();
                             musicCue = null;
-                            if (pendingSongs.Count > 0)
-                            {
-                                string nextSong = pendingSongs[0];
-                                pendingSongs.RemoveAt(0);
-                                startMusic(nextSong);
-                            }
+
                         }
                         liveCues.RemoveAll(cue =>
                         {

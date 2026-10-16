@@ -71,6 +71,14 @@ constexpr std::array client_broadcasts{
     "PlayerUpdateMessage"sv,
     "RemoveBlocksMessage"sv,
     "RemoveDragonMessage"sv,
+    // CastleMinerZGame._processRestartLevelMessage checks neither the sender
+    // nor the game mode in 1.6.3.8 or 1.9.9.8, and the message echoes: every
+    // peer that receives it, the host included, returns to the start, and the
+    // sender has already restarted itself. The shipped menus only send it from
+    // the host, but a stock host relays it from anybody. Refusing a guest's
+    // restart here left the sender restarted and everyone else where they
+    // were, which is the Endurance run split in two.
+    "RestartLevelMessage"sv,
     "ShotgunShotMessage"sv,
     "SpawnEnemyMessage"sv,
     "SpeedUpEnemyMessage"sv,
@@ -83,8 +91,8 @@ constexpr std::array client_broadcasts{
 constexpr std::array host_only_messages{
     "AppointServerMessage"sv, "ConsumePickupMessage"sv, "InventoryRetrieveFromServerMessage"sv,
     "KickMessage"sv,          "ProvideChunkMessage"sv,  "ProvideDeltaListMessage"sv,
-    "RestartLevelMessage"sv,  "SpawnDragonMessage"sv,   "TimeOfDayMessage"sv,
-    "UpdateSpawnerMessage"sv, "WorldInfoMessage"sv,
+    "SpawnDragonMessage"sv,   "TimeOfDayMessage"sv,     "UpdateSpawnerMessage"sv,
+    "WorldInfoMessage"sv,
 };
 
 ClientGameplayDecision reject(std::string_view message, ClientGameplayAuthorityError error) noexcept
@@ -174,8 +182,17 @@ ClientGameplayDecision assess_client_gameplay_authority(
         KillEnemyPayload kill;
         if (!decode_kill_enemy_payload(decoded.payload, protocol, kill, payload_error))
             return reject(message, ClientGameplayAuthorityError::invalid_packet);
-        if (kill.killer_id != inbound.sender_gid)
-            return reject(message, ClientGameplayAuthorityError::identity_spoof);
+        // KillerID is NOT the sender. TracerManager and Explosive apply every
+        // replicated shot and blast to each peer's own copy of the horde with
+        // the SHOOTER's id, and BaseZombie.TakeDamage/TakeExplosiveDamage send
+        // `KillEnemyMessage(LocalPlayer.Gamer, EnemyID, Target.Gamer.Id,
+        // shooterID, item)` from whichever peer's copy reached zero. Executed
+        // against the owned assemblies, peer 3 observing peer 7's bullet emits
+        // sender 3 / killer 7. Treating that as a spoof made this host refuse
+        // to relay it: the enemy stayed dead for the observer, who had already
+        // consumed its own echo, and alive for everyone else. Whether the
+        // named killer is a real session member is checked where the roster
+        // is known, exactly as it already is for KillDragonMessage.
     }
     else if (message == "KillDragonMessage")
     {
@@ -222,8 +239,11 @@ ClientGameplayDecision assess_client_gameplay_authority(
     else if (message == "RemoveBlocksMessage")
     {
         RemoveBlocksPayload removal;
-        if (!decode_remove_blocks_payload(decoded.payload, removal, payload_error) ||
-            removal.blocks.empty())
+        // An EMPTY removal is ordinary stock traffic, not a malformed packet:
+        // Explosive.FindBlocksToRemove ends with an unconditional
+        // RemoveBlocksMessage.Send, so a grenade bursting in open air or a
+        // laser bolt striking something it cannot break broadcasts zero cells.
+        if (!decode_remove_blocks_payload(decoded.payload, removal, payload_error))
             return reject(message, ClientGameplayAuthorityError::invalid_packet);
         for (const IntVector3 location : removal.blocks)
             if (!valid_network_block_location(location))
@@ -340,18 +360,56 @@ bool ClientGameplayRateLimiter::allow(PeerId peer, std::string_view message,
         --window.spawner_block_edits_remaining;
         return ++window.total <= 10'000U;
     }
-    if (++window.total > 240U)
+    // Every budget below is a hostile-peer ceiling, never a gameplay rule. The
+    // original host relays without counting, the sender has already applied
+    // its own local echo, and nothing is ever re-sent: a refusal here is a
+    // permanent disagreement between the sender and the rest of the session.
+    // Each number therefore has to clear the largest burst the ORIGINAL can
+    // legitimately produce in one second - a chain reaction through a TNT
+    // field, a whole pile of drops walked over in one frame, a horde enraged
+    // at midnight - rather than what a player ordinarily does.
+    if (++window.total > 8'192U)
         return false;
+    // CastleMinerZGame.Update's anti-cheat sweep bans a peer that sends more
+    // than ten AlterBlockMessages, or kicks one that sends more than twenty
+    // RemoveBlocksMessages, inside its one-second _safetyCheckTimer window -
+    // but _processAlterBlocksMessage APPLIES the edit either way and the sweep
+    // only decides whether to ban afterwards. Refusing the edit instead, at the
+    // original's own threshold, turned ordinary fast placing and mining into
+    // "the block I just placed popped back": a single door is two edits and a
+    // held mouse button clears ten a second easily. These stay purely as a
+    // hostile-peer ceiling, set where real play cannot reach them.
     if (message == "AlterBlockMessage")
-        return ++window.block_edits <= 10U;
+        return ++window.block_edits <= 120U;
+    // One per second refused the second of two grenades thrown a second
+    // apart (the fuse is measured from the throw, so cooking one of them lands
+    // both inside a window) and any rocket that followed a grenade. Everyone
+    // but the thrower then saw terrain vanish with no explosion and took no
+    // splash damage.
     if (message == "DetonateGrenadeMessage" || message == "DetonateRocketMessage")
-        return ++window.explosions <= 1U;
+        return ++window.explosions <= 32U;
     if (message == "RemoveBlocksMessage")
-        return ++window.block_removals <= 20U;
+        return ++window.block_removals <= 60U;
+    // PickupManager publishes one message per stack, and a refused one destroys
+    // the item: the sender has already debited its inventory or crate. The
+    // budget must therefore exceed DropAll plus a multi-crate ejection.
+    // One blast can open many crates at once, each ejecting up to 32 stacks.
     if (message == "CreatePickupMessage")
-        return ++window.pickup_creations <= 60U;
+        return ++window.pickup_creations <= 4'096U;
+    // CrateScreen's quick transfers rewrite up to 32 slots per keypress and a
+    // refused slot leaves the crate permanently disagreeing between peers.
+    if (message == "ItemCrateMessage")
+        return ++window.crate_items <= 192U;
+    if (message == "DestroyCrateMessage")
+        return ++window.crate_destructions <= 512U;
+    // PickupEntity.OnUpdate requests EVERY pickup within two units in the same
+    // frame and marks each `_pickedUp` for good, and the original host answers
+    // them all (96 simultaneous requests executed against the owned assembly
+    // produce 96 grants). A death pile or two burst crates is far more than
+    // thirty, and each refused request was an item that player could never
+    // pick up again. Matches the creation budget above.
     if (message == "RequestPickupMessage")
-        return ++window.pickup_requests <= 30U;
+        return ++window.pickup_requests <= 4'096U;
     if (message == "GunshotMessage")
         return ++window.gunshots <= 60U;
     if (message == "ShotgunShotMessage")
@@ -359,30 +417,63 @@ bool ClientGameplayRateLimiter::allow(PeerId peer, std::string_view message,
     if (message == "MeleePlayerMessage")
         return ++window.melee_attacks <= 12U;
     if (message == "GrenadeMessage" || message == "FireRocketMessage")
-        return ++window.projectile_launches <= 4U;
+        return ++window.projectile_launches <= 16U;
+    // Explosive.ProcessOneExplosion sends one of these for EVERY charge a
+    // chain reaction reaches, all in the frame the first one goes off.
     if (message == "DetonateExplosiveMessage")
-        return ++window.placed_explosive_detonations <= 64U;
+        return ++window.placed_explosive_detonations <= 4'096U;
+    // InGameHUD.SetFuseForExplosive: one flash per charge a digging enemy arms.
     if (message == "AddExplosionEffectsMessage" || message == "AddExplosiveFlashMessage")
-        return ++window.explosive_effects <= 16U;
+        return ++window.explosive_effects <= 256U;
+    // One dig effect accompanies every swing that lands, so this tracks the
+    // block-edit budget rather than the original's unrelated ban threshold.
     if (message == "DigMessage")
-        return ++window.dig_effects <= 12U;
+        return ++window.dig_effects <= 60U;
     if (message == "DoorOpenCloseMessage")
-        return ++window.door_events <= 12U;
+        return ++window.door_events <= 30U;
     if (message == "DestroyCustomBlockMessage")
         return ++window.custom_block_events <= 16U;
     if (message == "SpawnEnemyMessage")
         return ++window.enemy_spawns <= 64U;
+    // ZombieChase re-sends SpeedUpEnemyMessage every frame until its own echo
+    // has been applied, for every enemy chasing the local player, and
+    // EnemyManager.ZombieFestIsOn trips all of them in the same frame at
+    // midnight; a death makes every one of them give up at once, and one blast
+    // kills a crowd. Thirty a second left the refused enemies slow, or alive,
+    // for everybody except the player they were chasing.
     if (message == "KillEnemyMessage" || message == "SpeedUpEnemyMessage" ||
         message == "EnemyGiveUpMessage")
-        return ++window.enemy_events <= 30U;
+        return ++window.enemy_events <= 1'024U;
+    // DragonEntity sends one waypoint per 0.2 s of DRAGON time, not of wall
+    // time: a stock owner catching up after a hitch runs many fixed steps in
+    // one frame, and the transport delivers what a stall held back in a burst.
+    // Eight a second clipped those bursts; this is a hostile-rate guard only.
     if (message == "UpdateDragonMessage")
-        return ++window.dragon_updates <= 8U;
+        return ++window.dragon_updates <= 240U;
+    // These shared one budget of eight, which ordinary play exhausts:
+    //  * the owner sends one ExistingDragonMessage per newcomer, and several
+    //    players admitted together arrive together;
+    //  * DragonClientEntity.TakeDamage sends KillDragonMessage for every hit
+    //    that lands before its own kill has echoed back (each shotgun pellet,
+    //    each queued remote shot), all in one frame;
+    //  * reliable attacks and detonations arrive in bursts after a stall.
+    // A refused detonation is terrain every other peer never loses.
     if (message == "DetonateFireballMessage" || message == "DragonAttackMessage" ||
         message == "ExistingDragonMessage" || message == "KillDragonMessage" ||
         message == "MigrateDragonMessage" || message == "RemoveDragonMessage")
-        return ++window.dragon_events <= 8U;
+        return ++window.dragon_events <= 1'024U;
+    // CastleMinerZGame.SendNetworkUpdates sends one every frame while the
+    // player is using a tool or reloading (otherwise once per roster-sized
+    // frame cycle), so the rate is the stock client's frame rate: a 144 or
+    // 240 Hz player mining or firing was clipped at 90.
     if (message == "PlayerUpdateMessage")
-        return ++window.player_updates <= 90U;
+        return ++window.player_updates <= 1'024U;
+    // The original puts no limit on restarts either. One a second is far more
+    // than its menus can produce (a restart needs a dead session or a menu
+    // visit) and still stops a hostile guest pinning everyone to the start
+    // every frame.
+    if (message == "RestartLevelMessage")
+        return ++window.level_restarts <= 1U;
     if (message == "ChatMessage" || message == "BroadcastTextMessage")
         return ++window.text_messages <= 8U;
     if (message == "VoiceChatMessage")

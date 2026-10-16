@@ -1,5 +1,8 @@
 #include "openminerz/world/player.hpp"
 
+#include "openminerz/world/liquid.hpp" // mod-liquid
+#include "openminerz/world/movement_probe.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -77,6 +80,10 @@ void PlayerSimulation::spawn(const WorldRegion &world, int near_x, int near_z)
     int spawn_z = std::clamp(near_z, world.minimum_z() + 2, world.maximum_z() - 2);
     int surface = world_min_y;
     bool found{};
+    // (mod-liquid) A column under a lake is no place to start while a dry one
+    // is in reach; with none, the lake bed is (the player floats up).
+    const bool liquids = active_liquids() != nullptr;
+    for (int pass = liquids ? 0 : 1; pass < 2 && !found; ++pass)
     for (int radius = 0; radius <= 10 && !found; ++radius)
     {
         for (int dz = -radius; dz <= radius && !found; ++dz)
@@ -91,6 +98,8 @@ void PlayerSimulation::spawn(const WorldRegion &world, int near_x, int near_z)
                 const int z = std::clamp(near_z + dz, world.minimum_z() + 2, world.maximum_z() - 2);
                 for (int y = world_min_y + chunk_height - 2; y >= world_min_y; --y)
                 {
+                    if (pass == 0 && liquid_at(world, x, y, z))
+                        break;
                     const BlockType ground = world.block(x, y, z);
                     if (!blocks_player(ground) || ground == BlockType::fixed_lantern)
                     {
@@ -123,8 +132,8 @@ void PlayerSimulation::spawn(const WorldRegion &world, int near_x, int near_z)
     state_.grounded = true;
     jump_was_down_ = false;
     jump_count_ = 0;
-    stamina_recovery_delay_ = 0.0F;
-    stamina_block_time_ = 0.0F;
+    stamina_recover_ticks_ = stamina_timer_ceiling;
+    stamina_block_ticks_ = stamina_timer_ceiling;
     cancel_breaking();
     refresh_target(world);
 }
@@ -156,27 +165,64 @@ void PlayerSimulation::update(const WorldRegion &world, const PlayerInput &input
     // five-unit surface Speed to 1.894 at full submersion.
     const float sine = std::sin(state_.yaw);
     const float cosine = std::cos(state_.yaw);
-    const float depth = water_world ? water_depth(state_.position.y) : 0.0F;
+    // (mod-liquid) A mod liquid is swum in exactly like the Lagoon's water,
+    // measured from its own surface instead of the sea plane.
+    const float liquid =
+        liquid_depth(world, state_.position.x, state_.position.y, state_.position.z);
+    const float depth = std::max(water_world ? water_depth(state_.position.y) : 0.0F, liquid);
     const float submerged = std::clamp(depth, 0.0F, 1.0F);
-    const bool in_water = water_world && depth > 0.0F;
-    stamina_recovery_delay_ = std::max(0.0F, stamina_recovery_delay_ - fixed_delta_seconds);
-    stamina_block_time_ = std::max(0.0F, stamina_block_time_ - fixed_delta_seconds);
+    const bool in_water = depth > 0.0F;
+    touched_liquid_ = liquid > 0.0F;
     state_.sprinting = false;
     const bool moving = input.strafe != 0.0F || input.forward != 0.0F;
-    const float sprint_cost = sprint_stamina_cost_per_second * fixed_delta_seconds;
-    if (!state_.fly_mode && moving && input.sprint && stamina_block_time_ <= 0.0F &&
-        sprint_cost <= state_.stamina)
-    {
-        state_.stamina -= sprint_cost;
-        stamina_recovery_delay_ = stamina_recovery_delay_seconds;
-        if (state_.stamina <= 1.0F)
-            stamina_block_time_ = stamina_exhaustion_block_seconds;
+    // 1.9.9.8 Player.ProcessInput: a movement key and the sprint key held, and
+    // InGameHUD.CheckAndUseStamina(GetSprintCost() * dt) granted.
+    // The same test runs in `_flyMode`: 1.9.9.8 sprints in the air too, and
+    // pays for it. Only the Free flight extra has no sprint.
+    const bool retail_flight = state_.fly_mode && flight_model_ == FlightModel::retail;
+    if ((!state_.fly_mode || retail_flight) && moving && input.sprint &&
+        spend_stamina(sprint_stamina_cost_per_second * fixed_delta_seconds))
         state_.sprinting = true;
-    }
-    if (state_.fly_mode)
+    if (retail_flight)
     {
-        // Player._flyMode: gravity off, jump climbs, the descend key sinks,
-        // and the cruise is brisker than walking.
+        // 1.9.9.8 Player.UpdateAnimation, executed in the shipped client by
+        // SimulationParityProbe (fly_creative, _sprint, _dive):
+        //     v  = camera.Right   * (strafe * 4 * 6)
+        //     v += camera.Forward * (-num4 * 6)
+        //     if (Jump.Held) v.Y += JumpImpulse * 1.5
+        // where num4 is the SAME gait speed the ground uses: 4 at a full
+        // stick (8 sprinting), and below 0.8 the stroll formula, which is
+        // evaluated for a zero stick too -- a pure strafe drifts 1.42 back
+        // along the camera. No input is no velocity; gravity is off (the
+        // caller's Player.OnUpdate zeroes WorldAcceleration); and Player.Jump's
+        // own impulse is overwritten by this in the same frame.
+        const float walk = input.forward;
+        const float strafe = input.strafe;
+        const float amount = std::abs(walk);
+        float along{};
+        float across{};
+        if (std::max(amount, std::abs(strafe)) >= 0.1F)
+        {
+            const float gait = state_.sprinting ? sprint_multiplier : 1.0F;
+            const float forward_speed = amount < 0.8F
+                                            ? (amount - 0.1F) / 0.4F * (ground_stroll_speed * gait)
+                                            : amount * (ground_run_speed * gait);
+            along = walk < 0.0F ? -forward_speed : forward_speed;
+            across = strafe * ground_run_speed;
+        }
+        const Vec3 forward = view_direction();
+        state_.velocity.x =
+            (cosine * across + forward.x * along) * retail_fly_multiplier;
+        state_.velocity.y = forward.y * along * retail_fly_multiplier;
+        state_.velocity.z = (sine * across + forward.z * along) * retail_fly_multiplier;
+        if (input.jump)
+            state_.velocity.y += retail_fly_rise_speed;
+        jump_was_down_ = input.jump;
+    }
+    else if (state_.fly_mode)
+    {
+        // The Free flight extra: gravity off, jump climbs, the descend key
+        // sinks, and the heading alone steers at the configured speed.
         const float configured_speed = std::clamp(creative_flight_speed, 4.0F, 32.0F);
         state_.velocity.x = (movement.x * cosine + movement.z * sine) * configured_speed;
         state_.velocity.z = (movement.x * sine - movement.z * cosine) * configured_speed;
@@ -186,23 +232,65 @@ void PlayerSimulation::update(const WorldRegion &world, const PlayerInput &input
     }
     else
     {
-        const float surface_speed =
-            state_.sprinting ? movement_speed * sprint_multiplier : movement_speed;
-        const float speed = std::lerp(surface_speed, underwater_speed, submerged);
-        state_.velocity.x = (movement.x * cosine + movement.z * sine) * speed;
-        state_.velocity.z = (movement.x * sine - movement.z * cosine) * speed;
+        if (in_water)
+        {
+            const float surface_speed =
+                state_.sprinting ? movement_speed * sprint_multiplier : movement_speed;
+            const float speed = std::lerp(surface_speed, underwater_speed, submerged);
+            state_.velocity.x = (movement.x * cosine + movement.z * sine) * speed;
+            state_.velocity.z = (movement.x * sine - movement.z * cosine) * speed;
+        }
+        else
+        {
+            // Player.ProcessInput, executed in the shipped client by
+            // tools/OriginalClientInterop/SimulationParityProbe. Two writers
+            // run every frame:
+            //   1. FPSRig.UpdateVelocity: Speed (5) on each axis.
+            //   2. Player.UpdateAnimation, which OVERWRITES that whenever the
+            //      player was in contact with the ground last frame: strafe at
+            //      4, forward or back at 4 (a stick under 0.8 strolls at up to
+            //      1.66; 0.947 scaled by (stick - 0.1) / 0.4).
+            // So a player RUNS at 4 and its diagonal is 5.66, not 5 and 7.07.
+            // In 1.6.3.8 the override has no airborne branch, so a jump
+            // carries the rig's 5; 1.9.9.8 added one (4, or 8 sprinting).
+            // The stroll formula is evaluated for a zero stick too: a pure
+            // strafe drifts BACKWARD at 0.237. Sprinting doubles 4 and 0.947.
+            const float walk = input.forward;
+            const float strafe = input.strafe;
+            const float amount = std::abs(walk);
+            float local_x = strafe * movement_speed;
+            float local_z = -walk * movement_speed;
+            if (std::max(amount, std::abs(strafe)) < 0.1F)
+            {
+                local_x = 0.0F;
+                local_z = 0.0F;
+            }
+            else if (state_.grounded || modern_double_jump)
+            {
+                const float gait = state_.sprinting ? sprint_multiplier : 1.0F;
+                const float forward_speed =
+                    state_.grounded && amount < 0.8F
+                        ? (amount - 0.1F) / 0.4F * (ground_stroll_speed * gait)
+                        : amount * (ground_run_speed * gait);
+                local_x = strafe * ground_run_speed;
+                local_z = walk < 0.0F ? forward_speed : -forward_speed;
+            }
+            // The rig's local axes (right, back) turned to the heading.
+            state_.velocity.x = local_x * cosine - local_z * sine;
+            state_.velocity.z = local_x * sine + local_z * cosine;
+        }
         if (state_.grounded)
             jump_count_ = 0;
         const bool jump_pressed = input.jump && !jump_was_down_;
+        // FPSRig.CanJump: in contact, or (1.9.9.8) fewer than JumpCountLimit
+        // jumps since the last contact. Player.CanJump then charges stamina:
+        // nothing for the first jump of a flight, a quarter of the bar for
+        // the next, refused like any other spend while exhausted.
         const bool airborne_jump = !state_.grounded && modern_double_jump && jump_count_ < 2;
-        const float jump_cost = jump_count_ < 1 ? 0.0F : modern_air_jump_stamina_cost;
         if (jump_pressed && !in_water && (state_.grounded || airborne_jump) &&
-            jump_cost <= state_.stamina)
+            spend_stamina(jump_count_ < 1 ? 0.0F : modern_air_jump_stamina_cost))
         {
             state_.velocity.y += jump_impulse;
-            state_.stamina -= jump_cost;
-            if (jump_cost > 0.0F)
-                stamina_recovery_delay_ = stamina_recovery_delay_seconds;
             ++jump_count_;
             state_.grounded = false;
             state_.step_view_offset = 0.0F;
@@ -225,8 +313,23 @@ void PlayerSimulation::update(const WorldRegion &world, const PlayerInput &input
             state_.velocity.y = std::clamp(state_.velocity.y, -underwater_vertical_speed,
                                            underwater_vertical_speed);
         }
+        // (mod-liquid) Out of a lake: Jump held against its bank near the
+        // surface lifts the player over the edge, as in Minecraft. The
+        // Lagoon's open sea never needed it, so only mod liquids do this.
+        if (liquid > 0.0F && liquid < liquid_climb_depth && input.jump && side_contact_)
+            state_.velocity.y = std::max(state_.velocity.y, liquid_climb_speed);
     }
     move_and_collide(world, fixed_delta_seconds, auto_climb);
+    // (mod-liquid) Whether the body ended this tick in a liquid: a fall that
+    // lands in one, however shallow, deals no damage (the app asks).
+    if (!touched_liquid_ && active_liquids() != nullptr)
+    {
+        const int cell_x = floor_to_int(state_.position.x);
+        const int cell_z = floor_to_int(state_.position.z);
+        for (int y = floor_to_int(state_.position.y); y <= floor_to_int(state_.position.y + body_height);
+             ++y)
+            touched_liquid_ = touched_liquid_ || liquid_at(world, cell_x, y, cell_z);
+    }
     if (in_water)
     {
         // Player.OnUpdate applies depth-scaled drag after this frame's scene
@@ -238,10 +341,36 @@ void PlayerSimulation::update(const WorldRegion &world, const PlayerInput &input
         state_.velocity.y *= damping;
         state_.velocity.z *= damping;
     }
-    if (stamina_recovery_delay_ <= 0.0F)
+    // InGameHUD.OnUpdate, which runs after the player has moved: both
+    // OneShotTimers advance (in 100 ns ticks, as TimeSpan does), then stamina
+    // refills at a quarter of the bar a second once a full second has passed
+    // since it was last spent.
+    const auto tick_step =
+        static_cast<std::int64_t>(std::llround(static_cast<double>(fixed_delta_seconds) * 1e7));
+    stamina_block_ticks_ = std::min(stamina_block_ticks_ + tick_step, stamina_timer_ceiling);
+    stamina_recover_ticks_ = std::min(stamina_recover_ticks_ + tick_step, stamina_timer_ceiling);
+    if (state_.stamina < 100.0F && stamina_recover_ticks_ >= stamina_recover_timer_ticks)
         state_.stamina =
             std::min(100.0F, state_.stamina + fixed_delta_seconds * stamina_recovery_per_second);
     refresh_target(world);
+}
+
+// InGameHUD.CheckAndUseStamina. A zero cost always passes; anything else needs
+// stamina to be usable at all (never in Endurance), the two-second exhaustion
+// block to have run out, and the bar to cover it. Spending restarts the
+// recovery timer, and a bar left at one percent or less restarts the block.
+bool PlayerSimulation::spend_stamina(float amount) noexcept
+{
+    if (amount <= 0.0F)
+        return true;
+    if (!stamina_usable_ || stamina_block_ticks_ < stamina_block_timer_ticks ||
+        amount > state_.stamina)
+        return false;
+    state_.stamina -= amount;
+    stamina_recover_ticks_ = 0;
+    if (state_.stamina <= 1.0F)
+        stamina_block_ticks_ = 0;
+    return true;
 }
 
 void PlayerSimulation::look(float horizontal_radians, float vertical_radians) noexcept
@@ -268,7 +397,15 @@ Vec3 PlayerSimulation::view_direction() const noexcept
 void PlayerSimulation::refresh_target(const WorldRegion &world)
 {
     const Vec3 eye{state_.position.x, state_.position.y + eye_height, state_.position.z};
-    state_.target = raycast(world, eye, view_direction(), interaction_reach);
+    // InGameHUD.DoConstructionModeUpdate: five units along the camera, with
+    // ConstructionProbe.SkipEmbedded set, so the cell the eye is INSIDE (leaves,
+    // an open door, a torch) is never the target; the ray goes on past it.
+    state_.target = raycast_internal(world, eye, view_direction(), interaction_reach, false, true);
+    // InGameHUD.Dig and Build both need BlockTerrain.OkayToBuildHere: nothing
+    // in the world's bottom or top layer (world Y -64 and 63) can be dug.
+    if (state_.target.has_value() &&
+        (state_.target->y <= world_min_y || state_.target->y >= world_min_y + chunk_height - 1))
+        state_.target.reset();
 }
 
 bool PlayerSimulation::mine_target(WorldRegion &world)
@@ -286,8 +423,34 @@ bool PlayerSimulation::mine_target(WorldRegion &world)
 
 bool PlayerSimulation::place_target(WorldRegion &world)
 {
-    if (!state_.target.has_value() || world.block(state_.target->place_x, state_.target->place_y,
-                                                  state_.target->place_z) != BlockType::empty)
+    if (!state_.target.has_value())
+        return false;
+    // (mod-liquid) A block placed into a liquid replaces it. Unless the block
+    // is the liquid's own fallback (the cell would not change at all) or the
+    // body is in the way, which is tested before: the cell's generated
+    // identity goes with the liquid, so it could not be put back.
+    const int cell_x = state_.target->place_x;
+    const int cell_y = state_.target->place_y;
+    const int cell_z = state_.target->place_z;
+    if (liquid_at(world, cell_x, cell_y, cell_z))
+    {
+        const Vec3 feet = state_.position;
+        const bool in_the_way =
+            feet.x + body_half_width > static_cast<float>(cell_x) &&
+            feet.x - body_half_width < static_cast<float>(cell_x + 1) &&
+            feet.y + body_height > static_cast<float>(cell_y) &&
+            feet.y < static_cast<float>(cell_y + 1) &&
+            feet.z + body_half_width > static_cast<float>(cell_z) &&
+            feet.z - body_half_width < static_cast<float>(cell_z + 1);
+        if (in_the_way || world.block(cell_x, cell_y, cell_z) == state_.selected_block ||
+            !blocks_player(state_.selected_block))
+            return false;
+        world.set_block(cell_x, cell_y, cell_z, state_.selected_block);
+        refresh_target(world);
+        return true;
+    }
+    if (world.block(state_.target->place_x, state_.target->place_y, state_.target->place_z) !=
+        BlockType::empty)
     {
         return false;
     }
@@ -361,12 +524,21 @@ std::optional<BlockBreakUpdate> PlayerSimulation::update_breaking(WorldRegion &w
                             target.normal_x,
                             target.normal_y,
                             target.normal_z};
-    if (impact_cooldown <= 0.0F)
+    // `if (CoolDownTimer.Expired)`, on the frame the original's tick timer
+    // expires (see one_shot_expired).
+    if (one_shot_expired(impact_cooldown))
     {
         update.impact = true;
         impact_cooldown = impact_period;
     }
-    if (std::isfinite(duration) && (duration <= 0.0F || breaking_seconds_ >= duration))
+    // InventoryItem.ProcessInput only reaches hud.Dig inside
+    // `if (CoolDownTimer.Expired)`: DigTime keeps running between swings, but a
+    // block breaks on the first SWING at or after its TimeToDig, never between
+    // swings. A 0.01 s block therefore falls once per tool cooldown (0.3 s for
+    // picks and laser swords), a 0.5 s block on the swing at 0.6 s, and even a
+    // zero-second block (torch, surface lava) needs a swing. Completing the
+    // instant the time elapsed let fast tools clear one block per tick.
+    if (update.impact && std::isfinite(duration) && breaking_seconds_ >= duration)
     {
         update.removed_blocks = world.removal_effects(coordinate.x, coordinate.y, coordinate.z);
         for (const BlockRemovalEffect &effect : update.removed_blocks)
@@ -397,19 +569,20 @@ void PlayerSimulation::cancel_breaking() noexcept
 std::optional<VoxelRaycastHit> PlayerSimulation::raycast(const WorldRegion &world, Vec3 origin,
                                                          Vec3 direction, float reach)
 {
-    return raycast_internal(world, origin, direction, reach, false);
+    return raycast_internal(world, origin, direction, reach, false, false);
 }
 
 std::optional<VoxelRaycastHit> PlayerSimulation::raycast_blocking(const WorldRegion &world,
                                                                   Vec3 origin, Vec3 direction,
                                                                   float reach)
 {
-    return raycast_internal(world, origin, direction, reach, true);
+    return raycast_internal(world, origin, direction, reach, true, false);
 }
 
 std::optional<VoxelRaycastHit> PlayerSimulation::raycast_internal(const WorldRegion &world,
                                                                   Vec3 origin, Vec3 direction,
-                                                                  float reach, bool blocking_only)
+                                                                  float reach, bool blocking_only,
+                                                                  bool skip_embedded)
 {
     direction = normalize(direction);
     if (length_squared(direction) < 0.5F)
@@ -451,10 +624,18 @@ std::optional<VoxelRaycastHit> PlayerSimulation::raycast_internal(const WorldReg
     int normal_x{};
     int normal_y{};
     int normal_z{};
+    bool origin_cell = true;
     while (distance <= reach)
     {
         const BlockType type = world.block(x, y, z);
-        if (is_solid(type) && (!blocking_only || blocks_player(type)))
+        // TraceProbe.SetIntersection: a probe that starts inside a shape and
+        // has SkipEmbedded set reports nothing for that shape.
+        const bool embedded = skip_embedded && origin_cell;
+        origin_cell = false;
+        // (mod-liquid) Every ray passes through liquids: the crosshair digs
+        // and builds on what lies beyond the water.
+        if (!embedded && is_solid(type) && (!blocking_only || blocks_player(type)) &&
+            !liquid_at(world, x, y, z))
         {
             return VoxelRaycastHit{x,        y,        z,        previous_x, previous_y, previous_z,
                                    normal_x, normal_y, normal_z, distance,   type};
@@ -504,7 +685,7 @@ bool PlayerSimulation::touches_solid(const WorldRegion &world, Vec3 feet_positio
         {
             for (int x = minimum_x; x <= maximum_x; ++x)
             {
-                if (blocks_player(world.block(x, y, z)))
+                if (cell_blocks_player(world, x, y, z)) // (mod-liquid) liquids stop nothing
                 {
                     return true;
                 }
@@ -514,121 +695,109 @@ bool PlayerSimulation::touches_solid(const WorldRegion &world, Vec3 feet_positio
     return false;
 }
 
-// Port of the movement probe's SimulateSlopedSides gate: a horizontal
-// collision counts as a climbable slope only when the obstruction sits at
-// feet level (nothing solid blocks the candidate box above the feet band) and
-// the cell above the player's own feet is open, exactly like BruteForceTrace's
-// feet-band bookkeeping plus SlopingIsBlocked.
-bool PlayerSimulation::can_slope_slide(const WorldRegion &world, Vec3 candidate) const noexcept
-{
-    const int above_feet_y = floor_to_int(state_.position.y + 0.01F) + 1;
-    if (blocks_player(world.block(floor_to_int(state_.position.x), above_feet_y,
-                                  floor_to_int(state_.position.z))))
-    {
-        return false;
-    }
-    const int band_top = floor_to_int(state_.position.y + 0.2F);
-    const int minimum_x = floor_to_int(candidate.x - body_half_width + collision_epsilon);
-    const int maximum_x = floor_to_int(candidate.x + body_half_width - collision_epsilon);
-    const int maximum_y = floor_to_int(candidate.y + body_height - collision_epsilon);
-    const int minimum_z = floor_to_int(candidate.z - body_half_width + collision_epsilon);
-    const int maximum_z = floor_to_int(candidate.z + body_half_width - collision_epsilon);
-    for (int y = band_top + 1; y <= maximum_y; ++y)
-    {
-        for (int z = minimum_z; z <= maximum_z; ++z)
-        {
-            for (int x = minimum_x; x <= maximum_x; ++x)
-            {
-                if (blocks_player(world.block(x, y, z)))
-                {
-                    return false;
-                }
-            }
-        }
-    }
-    return true;
-}
-
+// Player.ResolveCollsion, statement for statement. A stock host believes the
+// position a client reports, so every way this differs from the original is a
+// player standing somewhere a stock player could not be.
+//
+//   * EnemyManager.AttentuateVelocity first: blocking enemies within two
+//     blocks halve the horizontal speed (and any UPWARD speed, which is what
+//     makes jumping next to a zombie so feeble), more when walking at them.
+//   * Up to four slide iterations of the swept AABBTraceProbe. With AutoClimb
+//     on and a vertical speed under half the jump impulse, the sides of a
+//     block in the feet band are "sloped": instead of stopping the player they
+//     lift it at five units a second to that block's top + 0.001.
+//   * InContact (grounded) is ONLY a +Y face hit, or a slope, in this frame.
+//     There is no tolerance probe below the feet: gravity makes a standing
+//     player collide with the floor every frame.
 void PlayerSimulation::move_and_collide(const WorldRegion &world, float delta_seconds,
                                         bool auto_climb)
 {
-    // Vanilla Player.cs: block sides act as slopes whenever AutoClimb is on
-    // and vertical speed is below half the jump impulse. That is what carries
-    // a 2.5-block jump onto a third block and walks you up single steps.
-    const bool slide_allowed = auto_climb && state_.velocity.y < jump_impulse * 0.5F;
-    bool sliding{};
-
-    Vec3 candidate = state_.position;
-    candidate.x += state_.velocity.x * delta_seconds;
-    if (touches_solid(world, candidate))
+    constexpr Vec3 box_minimum{-body_half_width, 0.0F, -body_half_width};
+    constexpr Vec3 box_maximum{body_half_width, body_height, body_half_width};
+    float remaining = delta_seconds;
+    const Vec3 stored_velocity = state_.velocity;
+    Vec3 next = state_.position;
+    Vec3 velocity = state_.velocity;
+    if (velocity_attenuation_)
     {
-        if (slide_allowed && can_slope_slide(world, candidate))
-        {
-            sliding = true;
-        }
-        else
-        {
-            state_.velocity.x = 0.0F;
-        }
-        candidate.x = state_.position.x;
+        // The original normalizes a possibly zero vector; the NaN it gets
+        // fails `> 0` exactly as a zero direction does here.
+        const float horizontal = std::sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+        const Vec3 forward = horizontal > 0.0F
+                                 ? Vec3{velocity.x / horizontal, 0.0F, velocity.z / horizontal}
+                                 : Vec3{};
+        const float attenuation = velocity_attenuation_(forward, state_.position);
+        velocity.x *= attenuation;
+        if (velocity.y > 0.0F)
+            velocity.y *= attenuation;
+        velocity.z *= attenuation;
     }
-    state_.position = candidate;
-
-    candidate = state_.position;
-    candidate.z += state_.velocity.z * delta_seconds;
-    if (touches_solid(world, candidate))
-    {
-        if (slide_allowed && can_slope_slide(world, candidate))
-        {
-            sliding = true;
-        }
-        else
-        {
-            state_.velocity.z = 0.0F;
-        }
-        candidate.z = state_.position.z;
-    }
-    state_.position = candidate;
-
-    if (sliding)
-    {
-        // The sloped block lifts at five units per second, clamps to its top
-        // and counts as ground contact so a mid-slide jump works.
-        const float band_target =
-            static_cast<float>(floor_to_int(state_.position.y + 0.2F) + 1) + 0.001F;
-        Vec3 lifted = state_.position;
-        lifted.y = std::min(state_.position.y + auto_climb_visual_speed * delta_seconds,
-                            std::max(state_.position.y, band_target));
-        if (!touches_solid(world, lifted))
-        {
-            state_.position = lifted;
-        }
-        state_.velocity.y = 0.0F;
-        state_.grounded = true;
-        return;
-    }
-
+    const float entry_vertical = velocity.y;
     state_.grounded = false;
-    candidate = state_.position;
-    candidate.y += state_.velocity.y * delta_seconds;
-    if (touches_solid(world, candidate))
+    side_contact_ = false; // (mod-liquid)
+    int iterations{};
+    bool collides{};
+    do
     {
-        if (state_.velocity.y < 0.0F)
-        {
+        const Vec3 start = next;
+        const Vec3 step{velocity.x * remaining, velocity.y * remaining, velocity.z * remaining};
+        next = {start.x + step.x, start.y + step.y, start.z + step.z};
+        const bool slopes = auto_climb && velocity.y < jump_impulse * 0.5F;
+        const MovementTrace trace =
+            trace_movement_box(world, start, next, box_minimum, box_maximum, slopes);
+        collides = trace.collides;
+        // The sloped block carries the player up for `seconds` of this frame.
+        const auto climb = [&](float seconds) {
             state_.grounded = true;
+            velocity.y = 0.0F;
+            next.y += auto_climb_visual_speed * seconds;
+            const float top = static_cast<float>(trace.sloped_block_y) + 1.001F;
+            if (next.y > top)
+                next.y = top;
+        };
+        if (collides)
+        {
+            if (trace.in_face == ProbeFace::positive_y)
+                state_.grounded = true;
+            else if (trace.in_face != ProbeFace::negative_y)
+                side_contact_ = true; // (mod-liquid)
+            const float travelled = std::max(trace.in_t - 0.001F, 0.0F);
+            next = {start.x + step.x * travelled, start.y + step.y * travelled,
+                    start.z + step.z * travelled};
+            const bool on_slope =
+                trace.found_sloped_block && trace.sloped_block_t <= trace.in_t;
+            if (on_slope)
+                climb(travelled * remaining);
+            const float into = trace.in_normal.x * velocity.x + trace.in_normal.y * velocity.y +
+                               trace.in_normal.z * velocity.z;
+            velocity = {velocity.x - trace.in_normal.x * into, velocity.y - trace.in_normal.y * into,
+                        velocity.z - trace.in_normal.z * into};
+            remaining *= 1.0F - travelled;
+            if (remaining <= 1e-07F)
+                break;
+            if (length_squared(velocity) <= 1e-06F ||
+                stored_velocity.x * velocity.x + stored_velocity.y * velocity.y +
+                        stored_velocity.z * velocity.z <=
+                    1e-06F)
+            {
+                velocity = {};
+                if (on_slope)
+                    climb(remaining);
+                break;
+            }
         }
-        state_.velocity.y = 0.0F;
-    }
-    else
-    {
-        state_.position = candidate;
-    }
-    if (!state_.grounded)
-    {
-        Vec3 probe = state_.position;
-        probe.y -= 0.025F;
-        state_.grounded = touches_solid(world, probe);
-    }
+        else if (trace.found_sloped_block)
+        {
+            climb(remaining);
+        }
+        ++iterations;
+    } while (collides && iterations < 4);
+    if (iterations == 4)
+        velocity = {};
+    // What the landing absorbed: Player.ResolveCollsion's fall damage input.
+    landing_speed_change_ = velocity.y - entry_vertical;
+    state_.position = next;
+    state_.velocity = velocity;
 }
 
 } // namespace openminerz::world

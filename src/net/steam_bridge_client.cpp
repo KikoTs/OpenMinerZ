@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <span>
@@ -99,6 +100,70 @@ class LocalMemory final
 [[nodiscard]] std::string windows_error(std::string_view operation, DWORD code = GetLastError())
 {
     return std::string{operation} + " failed with Windows error " + std::to_string(code);
+}
+
+#if !defined(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+// `sleep_for(2ms)` actually costs one ~15.6 ms scheduler tick at the default
+// Windows timer resolution. A process-local high-resolution waitable timer
+// waits the requested time without raising the global timer resolution for
+// every other process on the machine.
+class ShortWait final
+{
+  public:
+    ShortWait()
+    {
+        timer_.reset(CreateWaitableTimerExW(nullptr, nullptr,
+                                            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS));
+        if (!timer_.valid())
+            timer_.reset(CreateWaitableTimerExW(nullptr, nullptr, 0U, TIMER_ALL_ACCESS));
+    }
+
+    void operator()(std::chrono::microseconds duration) const
+    {
+        if (timer_.valid() && duration.count() > 0)
+        {
+            LARGE_INTEGER due{};
+            due.QuadPart = -static_cast<LONGLONG>(duration.count() * 10);
+            if (SetWaitableTimer(timer_.get(), &due, 0, nullptr, nullptr, FALSE) != FALSE &&
+                WaitForSingleObject(timer_.get(), 1'000U) == WAIT_OBJECT_0)
+                return;
+        }
+        std::this_thread::sleep_for(duration);
+    }
+
+  private:
+    Handle timer_;
+};
+
+[[nodiscard]] const ShortWait &short_wait()
+{
+    static const ShortWait wait;
+    return wait;
+}
+
+// Opt-in steady-state timing for a real session: OPENMINERZ_NET_TIMING=1.
+[[nodiscard]] bool bridge_timing_enabled()
+{
+    static const bool enabled = [] {
+        std::array<char, 8> value{};
+        const DWORD size = GetEnvironmentVariableA("OPENMINERZ_NET_TIMING", value.data(),
+                                                   static_cast<DWORD>(value.size()));
+        return size > 0U && size < value.size() && value[0] != '0';
+    }();
+    return enabled;
+}
+
+[[nodiscard]] double percentile(const std::vector<double> &sorted, double fraction)
+{
+    if (sorted.empty())
+        return 0.0;
+    const auto index = static_cast<std::size_t>(
+        static_cast<double>(sorted.size() - 1U) * std::clamp(fraction, 0.0, 1.0));
+    return sorted[index];
 }
 
 [[nodiscard]] std::filesystem::path canonical_regular_file(const std::filesystem::path &path,
@@ -447,12 +512,73 @@ class SteamBridgeClient::Implementation final
         }
     }
 
+    [[nodiscard]] bool ipc_probe(const std::filesystem::path &helper_path, std::size_t samples,
+                                 SteamBridgeIpcProbe &probe, std::string &error)
+    {
+        try
+        {
+            if (samples == 0U || samples > 10'000U)
+                throw std::runtime_error{"The bridge IPC probe needs 1-10000 samples"};
+            const std::filesystem::path helper =
+                canonical_regular_file(helper_path, L"OpenMinerZ.SteamBridge32.exe");
+            create_pipe();
+            create_job();
+            launch(helper, std::nullopt);
+            connect(std::chrono::seconds{10});
+            if (wait_for_frame(std::chrono::seconds{10}).type != SteamBridgeMessageType::hello)
+                throw std::runtime_error{"The IPC probe helper did not send hello"};
+            std::vector<double> round_trips;
+            round_trips.reserve(samples);
+            for (std::size_t index{}; index < samples; ++index)
+            {
+                const auto started = Clock::now();
+                send_frame(SteamBridgeMessageType::heartbeat, {});
+                if (spin_for_frame(std::chrono::seconds{5}).type !=
+                    SteamBridgeMessageType::heartbeat)
+                    throw std::runtime_error{"The IPC probe helper did not echo a heartbeat"};
+                round_trips.push_back(
+                    std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+            }
+            const auto burst_started = Clock::now();
+            for (std::size_t index{}; index < samples; ++index)
+                send_frame(SteamBridgeMessageType::heartbeat, {});
+            for (std::size_t index{}; index < samples; ++index)
+                if (spin_for_frame(std::chrono::seconds{30}).type !=
+                    SteamBridgeMessageType::heartbeat)
+                    throw std::runtime_error{"The IPC probe helper dropped a pipelined heartbeat"};
+            const double burst_milliseconds =
+                std::chrono::duration<double, std::milli>(Clock::now() - burst_started).count();
+            send_frame(SteamBridgeMessageType::stop, {});
+            if (wait_for_frame(std::chrono::seconds{5}).type != SteamBridgeMessageType::stopped)
+                throw std::runtime_error{"The IPC probe helper did not stop cleanly"};
+            teardown();
+            std::ranges::sort(round_trips);
+            probe.samples = samples;
+            probe.round_trip_p50_ms = percentile(round_trips, 0.5);
+            probe.round_trip_p95_ms = percentile(round_trips, 0.95);
+            probe.round_trip_maximum_ms = round_trips.back();
+            probe.burst_frames_per_second =
+                burst_milliseconds <= 0.0
+                    ? 0.0
+                    : static_cast<double>(samples) * 1'000.0 / burst_milliseconds;
+            error.clear();
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            error = exception.what();
+            teardown();
+            return false;
+        }
+    }
+
     [[nodiscard]] bool poll(std::optional<SteamBridgeClientEvent> &event, std::string &error)
     {
         event.reset();
         try
         {
             require_running();
+            report_timing();
             const auto frame = receive_frame();
             if (!frame.has_value())
             {
@@ -474,6 +600,15 @@ class SteamBridgeClient::Implementation final
                 if (!decode_steam_bridge_peer(frame->payload, decoded.peer, protocol_error))
                     throw std::runtime_error{"The helper returned an invalid departed peer"};
                 break;
+            case SteamBridgeMessageType::peer_entered: {
+                SteamBridgeMember member;
+                if (!decode_steam_bridge_member(frame->payload, member, protocol_error))
+                    throw std::runtime_error{"The helper returned an invalid lobby member"};
+                decoded.kind = SteamBridgeClientEventKind::peer_entered;
+                decoded.peer = member.peer;
+                decoded.peer_name = std::move(member.persona_name);
+                break;
+            }
             case SteamBridgeMessageType::failure:
                 decoded.kind = SteamBridgeClientEventKind::failure;
                 if (!decode_steam_bridge_failure(frame->payload, decoded.failure, protocol_error))
@@ -483,6 +618,15 @@ class SteamBridgeClient::Implementation final
             case SteamBridgeMessageType::heartbeat:
                 decoded.kind = SteamBridgeClientEventKind::heartbeat;
                 require_empty(*frame);
+                if (timing_heartbeat_.has_value())
+                {
+                    const double milliseconds =
+                        std::chrono::duration<double, std::milli>(Clock::now() -
+                                                                  *timing_heartbeat_)
+                            .count();
+                    timing_heartbeat_.reset();
+                    round_trips_.push_back(milliseconds);
+                }
                 break;
             case SteamBridgeMessageType::stopped:
                 decoded.kind = SteamBridgeClientEventKind::stopped;
@@ -519,7 +663,7 @@ class SteamBridgeClient::Implementation final
                         require_empty(*frame);
                         break;
                     }
-                    std::this_thread::sleep_for(std::chrono::milliseconds{2});
+                    short_wait()(std::chrono::microseconds{500});
                 }
             }
             teardown();
@@ -690,7 +834,21 @@ class SteamBridgeClient::Implementation final
             encode_steam_bridge_frame(type, outgoing_sequence_++, payload, protocol_error);
         if (!encoded.has_value())
             throw std::runtime_error{"OpenMinerZ attempted to send an invalid bridge frame"};
+        if (!bridge_timing_enabled())
+        {
+            write_exact(pipe_.get(), process_.get(), *encoded);
+            return;
+        }
+        // The game's own thread writes here. Time it: a full pipe buffer turns
+        // this into a main-thread stall that every other player feels.
+        const auto started = Clock::now();
         write_exact(pipe_.get(), process_.get(), *encoded);
+        const double milliseconds =
+            std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+        ++frames_sent_;
+        bytes_sent_ += encoded->size();
+        write_milliseconds_ += milliseconds;
+        longest_write_milliseconds_ = std::max(longest_write_milliseconds_, milliseconds);
     }
 
     [[nodiscard]] std::optional<SteamBridgeFrame> receive_frame()
@@ -731,6 +889,11 @@ class SteamBridgeClient::Implementation final
             throw std::runtime_error{"The helper returned a corrupt bridge frame"};
         if (decoded.sequence != incoming_sequence_++)
             throw std::runtime_error{"The helper bridge sequence is missing or replayed"};
+        if (bridge_timing_enabled())
+        {
+            ++frames_received_;
+            bytes_received_ += encoded.size();
+        }
         return decoded;
     }
 
@@ -741,7 +904,21 @@ class SteamBridgeClient::Implementation final
         {
             if (const auto frame = receive_frame(); frame.has_value())
                 return *frame;
-            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            short_wait()(std::chrono::microseconds{500});
+        }
+        throw std::runtime_error{"The x86 helper response timed out"};
+    }
+
+    // Waits without sleeping, so a measurement reports the helper's own
+    // turnaround instead of this process's timer granularity.
+    [[nodiscard]] SteamBridgeFrame spin_for_frame(std::chrono::milliseconds timeout)
+    {
+        const auto deadline = Clock::now() + timeout;
+        while (Clock::now() < deadline)
+        {
+            if (const auto frame = receive_frame(); frame.has_value())
+                return *frame;
+            static_cast<void>(SwitchToThread());
         }
         throw std::runtime_error{"The x86 helper response timed out"};
     }
@@ -759,6 +936,46 @@ class SteamBridgeClient::Implementation final
     {
         if (!frame.payload.empty())
             throw std::runtime_error{"The helper returned payload data on a control frame"};
+    }
+
+    // One line every five seconds while OPENMINERZ_NET_TIMING=1: what the
+    // steady-state transport actually cost, including the longest single
+    // main-thread write stall.
+    void report_timing()
+    {
+        if (!bridge_timing_enabled() || !running_)
+            return;
+        const auto now = Clock::now();
+        if (last_timing_report_ == Clock::time_point{})
+            last_timing_report_ = now;
+        if (!timing_heartbeat_.has_value() && now - last_timing_heartbeat_ >= std::chrono::seconds{1})
+        {
+            last_timing_heartbeat_ = now;
+            timing_heartbeat_ = now;
+            send_frame(SteamBridgeMessageType::heartbeat, {});
+        }
+        if (now - last_timing_report_ < std::chrono::seconds{5})
+            return;
+        const double seconds =
+            std::chrono::duration<double>(now - last_timing_report_).count();
+        std::vector<double> sorted = round_trips_;
+        std::ranges::sort(sorted);
+        std::cout << "network.bridge.timing in=" << static_cast<double>(frames_received_) / seconds
+                  << "/s out=" << static_cast<double>(frames_sent_) / seconds
+                  << "/s in_bytes=" << static_cast<double>(bytes_received_) / seconds
+                  << "/s out_bytes=" << static_cast<double>(bytes_sent_) / seconds
+                  << "/s write_block_total_ms=" << write_milliseconds_
+                  << " write_block_max_ms=" << longest_write_milliseconds_
+                  << " rtt_p50_ms=" << percentile(sorted, 0.5)
+                  << " rtt_max_ms=" << (sorted.empty() ? 0.0 : sorted.back()) << '\n';
+        last_timing_report_ = now;
+        frames_received_ = 0U;
+        frames_sent_ = 0U;
+        bytes_received_ = 0U;
+        bytes_sent_ = 0U;
+        write_milliseconds_ = 0.0;
+        longest_write_milliseconds_ = 0.0;
+        round_trips_.clear();
     }
 
     void note_partial()
@@ -815,6 +1032,16 @@ class SteamBridgeClient::Implementation final
     Handle process_;
     Handle job_;
     std::wstring pipe_name_;
+    std::size_t frames_sent_{};
+    std::size_t frames_received_{};
+    std::size_t bytes_sent_{};
+    std::size_t bytes_received_{};
+    double write_milliseconds_{};
+    double longest_write_milliseconds_{};
+    std::vector<double> round_trips_;
+    Clock::time_point last_timing_report_{};
+    Clock::time_point last_timing_heartbeat_{};
+    std::optional<Clock::time_point> timing_heartbeat_;
     std::optional<Clock::time_point> partial_since_;
     std::uint32_t incoming_sequence_{1U};
     std::uint32_t outgoing_sequence_{1U};
@@ -837,6 +1064,13 @@ bool SteamBridgeClient::protocol_self_test(const std::filesystem::path &helper_p
 {
     Implementation implementation;
     return implementation.protocol_self_test(helper_path, timeout, error);
+}
+
+bool SteamBridgeClient::ipc_probe(const std::filesystem::path &helper_path, std::size_t samples,
+                                  SteamBridgeIpcProbe &probe, std::string &error)
+{
+    Implementation implementation;
+    return implementation.ipc_probe(helper_path, samples, probe, error);
 }
 
 bool SteamBridgeClient::start_host(const SteamBridgeClientOptions &options,
@@ -909,6 +1143,12 @@ SteamBridgeClient::SteamBridgeClient(SteamBridgeClient &&) noexcept = default;
 SteamBridgeClient &SteamBridgeClient::operator=(SteamBridgeClient &&) noexcept = default;
 bool SteamBridgeClient::protocol_self_test(const std::filesystem::path &, std::chrono::milliseconds,
                                            std::string &error)
+{
+    error = "The legacy Steam bridge is available only on Windows";
+    return false;
+}
+bool SteamBridgeClient::ipc_probe(const std::filesystem::path &, std::size_t,
+                                  SteamBridgeIpcProbe &, std::string &error)
 {
     error = "The legacy Steam bridge is available only on Windows";
     return false;

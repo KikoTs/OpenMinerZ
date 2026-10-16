@@ -13,6 +13,11 @@ namespace
 {
 
 constexpr std::array<std::uint8_t, 4U> extension_magic{'O', 'M', 'Z', 'E'};
+// The handshake's flags byte: synchronized mods follow; (Authority) the host
+// admits OpenMinerZ players only. A manifest without the second encodes as it
+// always did.
+constexpr unsigned extension_flag_mods = 1U;
+constexpr unsigned extension_flag_openminerz_only = 2U;
 
 bool supported_protocol(ProtocolVersion protocol) noexcept
 {
@@ -50,18 +55,28 @@ std::size_t seven_bit_prefix_size(std::size_t value) noexcept
     return result;
 }
 
-std::uint32_t crc32(std::span<const std::uint8_t> bytes) noexcept
-{
-    std::uint32_t crc = 0xFFFFFFFFU;
-    for (const std::uint8_t value : bytes)
+// The bitwise CRC32 below, one byte at a time: mod-channel frames are hashed
+// on every send and receive, so the table form keeps that cheap.
+constexpr std::array<std::uint32_t, 256U> crc32_table = [] {
+    std::array<std::uint32_t, 256U> table{};
+    for (std::uint32_t index = 0U; index < 256U; ++index)
     {
-        crc ^= value;
+        std::uint32_t crc = index;
         for (unsigned bit = 0U; bit < 8U; ++bit)
         {
             const std::uint32_t mask = 0U - (crc & 1U);
             crc = (crc >> 1U) ^ (0xEDB88320U & mask);
         }
+        table[index] = crc;
     }
+    return table;
+}();
+
+std::uint32_t crc32(std::span<const std::uint8_t> bytes) noexcept
+{
+    std::uint32_t crc = 0xFFFFFFFFU;
+    for (const std::uint8_t value : bytes)
+        crc = (crc >> 8U) ^ crc32_table[(crc ^ value) & 0xFFU];
     return ~crc;
 }
 
@@ -92,6 +107,39 @@ bool is_extension_packet(std::span<const std::uint8_t> packet) noexcept
 {
     return packet.size() >= extension_magic.size() &&
            std::equal(extension_magic.begin(), extension_magic.end(), packet.begin());
+}
+
+std::optional<ExtensionMessageKind> extension_message_kind(
+    std::span<const std::uint8_t> packet) noexcept
+{
+    if (packet.size() < extension_magic.size() + 2U || !is_extension_packet(packet) ||
+        packet[extension_magic.size()] != extension_protocol_version)
+        return std::nullopt;
+    const std::uint8_t kind = packet[extension_magic.size() + 1U];
+    const bool handshake = kind >= static_cast<std::uint8_t>(ExtensionMessageKind::client_hello) &&
+                           kind <= static_cast<std::uint8_t>(ExtensionMessageKind::server_reject);
+    const bool channel = kind >= static_cast<std::uint8_t>(ExtensionMessageKind::mod_data) &&
+                         kind <= static_cast<std::uint8_t>(ExtensionMessageKind::download_refusal);
+    if (!handshake && !channel)
+        return std::nullopt;
+    return static_cast<ExtensionMessageKind>(kind);
+}
+
+bool is_mod_channel_packet(std::span<const std::uint8_t> packet) noexcept
+{
+    return extension_message_kind(packet) == ExtensionMessageKind::mod_data;
+}
+
+bool is_mod_download_packet(std::span<const std::uint8_t> packet) noexcept
+{
+    const auto kind = extension_message_kind(packet);
+    return kind.has_value() && *kind >= ExtensionMessageKind::download_request &&
+           *kind <= ExtensionMessageKind::download_refusal;
+}
+
+std::uint32_t extension_crc32(std::span<const std::uint8_t> bytes) noexcept
+{
+    return crc32(bytes);
 }
 
 bool validate_mod_manifest(const ModManifest &manifest, std::string &error) noexcept
@@ -157,9 +205,10 @@ bool validate_mod_manifest(const ModManifest &manifest, std::string &error) noex
 
 bool requires_extension(const ModManifest &manifest) noexcept
 {
-    return std::any_of(manifest.mods.begin(), manifest.mods.end(), [](const ModDescriptor &mod) {
-        return mod.scope == ModScope::server || mod.scope == ModScope::core;
-    });
+    return manifest.openminerz_only ||
+           std::any_of(manifest.mods.begin(), manifest.mods.end(), [](const ModDescriptor &mod) {
+               return mod.scope == ModScope::server || mod.scope == ModScope::core;
+           });
 }
 
 std::vector<std::uint8_t> encode_extension_message(const ExtensionMessage &message)
@@ -178,7 +227,10 @@ std::vector<std::uint8_t> encode_extension_message(const ExtensionMessage &messa
                  writer.write_u8(extension_protocol_version) &&
                  writer.write_u8(static_cast<std::uint8_t>(message.kind)) &&
                  writer.write_u8(static_cast<std::uint8_t>(message.manifest.protocol)) &&
-                 writer.write_u8(mods.empty() ? 0U : 1U) && writer.write_u64(message.nonce) &&
+                 writer.write_u8(static_cast<std::uint8_t>(
+                     (mods.empty() ? 0U : extension_flag_mods) |
+                     (message.manifest.openminerz_only ? extension_flag_openminerz_only : 0U))) &&
+                 writer.write_u64(message.nonce) &&
                  writer.write_u16(static_cast<std::uint16_t>(mods.size()));
     for (std::size_t index = 0U; valid && index < mods.size(); ++index)
     {
@@ -257,7 +309,8 @@ bool decode_extension_message(std::span<const std::uint8_t> packet, ExtensionMes
         error = ExtensionDecodeError::unsupported_game_protocol;
         return false;
     }
-    if ((flags & ~1U) != 0U || ((flags & 1U) != 0U) != (mod_count != 0U))
+    if ((flags & ~(extension_flag_mods | extension_flag_openminerz_only)) != 0U ||
+        ((flags & extension_flag_mods) != 0U) != (mod_count != 0U))
     {
         error = ExtensionDecodeError::invalid_flags;
         return false;
@@ -270,6 +323,7 @@ bool decode_extension_message(std::span<const std::uint8_t> packet, ExtensionMes
 
     message.kind = static_cast<ExtensionMessageKind>(kind_value);
     message.manifest.protocol = static_cast<ProtocolVersion>(protocol_value);
+    message.manifest.openminerz_only = (flags & extension_flag_openminerz_only) != 0U;
     message.manifest.mods.reserve(mod_count);
     for (std::uint16_t index = 0U; index < mod_count; ++index)
     {
@@ -338,7 +392,9 @@ ModCompatibilityResult compare_mod_manifests(const ModManifest &host, const ModM
     {
         if (requires_extension(host))
             return {ModCompatibility::extension_required,
-                    "This host requires OpenMinerZ server/core mods."};
+                    synchronized_mods(host).empty()
+                        ? "This host admits OpenMinerZ players only."
+                        : "This host requires OpenMinerZ server/core mods."};
         return {};
     }
     if (peer == nullptr || !validate_mod_manifest(*peer, error))

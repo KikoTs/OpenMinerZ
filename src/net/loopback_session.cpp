@@ -28,12 +28,12 @@ bool delivery_matches(const MessageDescriptor &message, std::span<const std::uin
 
 } // namespace
 
-LoopbackSession::LoopbackSession(HostSessionSettings settings, bool game_begun,
+LoopbackSession::LoopbackSession(HostSessionSettings settings, bool join_closed,
                                  std::int32_t game_mode, std::int32_t difficulty,
                                  bool infinite_resources, bool host_occupies_player_slot)
     : protocol_{settings.protocol},
-      admission_{std::move(settings), game_begun,         game_mode,
-                 difficulty,          infinite_resources, host_occupies_player_slot}
+      admission_{std::move(settings), join_closed, game_mode, difficulty,
+                 infinite_resources, host_occupies_player_slot}
 {
 }
 
@@ -53,6 +53,12 @@ SessionPacketResult LoopbackSession::submit_from_peer(PeerId peer,
             return {SessionPacketError::delivery_mismatch, PacketError::none, PayloadError::none,
                     QueueError::none,
                     "Extension control frames require reliable ordered delivery."};
+        // (Network) In a session with server mods, mod channel and mod
+        // download frames go to the host's mod layer, never to admission.
+        // Without, they take the hello path exactly as before.
+        if (admission_.mod_channel_enabled() &&
+            (is_mod_channel_packet(packet) || is_mod_download_packet(packet)))
+            return submit_mod_frame(peer, true, packet);
         ExtensionAdmissionResult admission = admission_.receive_extension(peer, packet);
         if (admission.reply.empty())
             return {SessionPacketError::control_rejected, PacketError::none, PayloadError::none,
@@ -86,6 +92,15 @@ SessionPacketResult LoopbackSession::submit_from_host(PeerId peer,
                                                       MessageDeliveryPolicy delivery,
                                                       std::uint8_t channel)
 {
+    if (channel == openminerz_control_channel && admission_.mod_channel_enabled() &&
+        (is_mod_channel_packet(packet) || is_mod_download_packet(packet)))
+    {
+        if (delivery != MessageDeliveryPolicy::reliable_ordered)
+            return {SessionPacketError::delivery_mismatch, PacketError::none, PayloadError::none,
+                    QueueError::none,
+                    "Extension control frames require reliable ordered delivery."};
+        return submit_mod_frame(peer, false, packet);
+    }
     if (channel != stock_gameplay_channel)
         return {SessionPacketError::wrong_channel, PacketError::none, PayloadError::none,
                 QueueError::none, "Host control frames are emitted only by admission."};
@@ -132,6 +147,25 @@ SessionPacketResult LoopbackSession::submit_gameplay(PeerId sender, PeerId recip
     if (!destination.push(sender, recipient, packet, delivery, stock_gameplay_channel, queue_error))
         return {SessionPacketError::queue_rejected, PacketError::none, PayloadError::none,
                 queue_error, "Bounded gameplay queue rejected the frame."};
+    return {};
+}
+
+SessionPacketResult LoopbackSession::submit_mod_frame(PeerId peer, bool from_peer,
+                                                      std::span<const std::uint8_t> packet)
+{
+    const bool allowed = is_mod_channel_packet(packet) ? admission_.may_exchange_mod_frames(peer)
+                                                       : admission_.may_download_mods(peer);
+    if (!allowed)
+        return {SessionPacketError::peer_not_admitted, PacketError::none, PayloadError::none,
+                QueueError::none,
+                "Mod frames flow only with extension peers of a session with server mods."};
+    QueueError queue_error{};
+    BoundedDatagramQueue &destination = from_peer ? host_inbox_ : peer_inbox_;
+    if (!destination.push(from_peer ? peer : 0U, from_peer ? 0U : peer, packet,
+                          MessageDeliveryPolicy::reliable_ordered, openminerz_control_channel,
+                          queue_error))
+        return {SessionPacketError::queue_rejected, PacketError::none, PayloadError::none,
+                queue_error, "Bounded mod frame queue rejected the frame."};
     return {};
 }
 

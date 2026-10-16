@@ -530,7 +530,9 @@ bool BoundedReader::read_dotnet_string(std::string &value, std::size_t maximum_b
 
 BoundedWriter::BoundedWriter(std::size_t maximum_size) : maximum_size_{maximum_size}
 {
-    bytes_.reserve(std::min(maximum_size, maximum_packet_size));
+    // Most movement/action payloads are tiny. Large chunk support must not
+    // allocate the complete 256 KiB packet budget for every encoder invocation.
+    bytes_.reserve(std::min<std::size_t>(maximum_size, 4096U));
 }
 
 bool BoundedWriter::can_append(std::size_t count) const noexcept

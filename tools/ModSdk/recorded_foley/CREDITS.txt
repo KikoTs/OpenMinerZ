@@ -1,0 +1,14 @@
+# Recorded foley sources
+
+Original downloads are identified by SHA-256 in `sources.json`. The pack ships
+short mono excerpts, trimmed, faded, and gain-adjusted by `tactical_foley.py`.
+Each generated cue's source, trim and gain limit is in the pack's `AUDIO_SOURCES.json`.
+
+- **zer0_sol — Handgun Reload Sound Effect**, [source](https://opengameart.org/content/handgun-reload-sound-effect), [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
+- **SpringySpringo — Gun Reload Sounds**, [source](https://opengameart.org/content/gun-reload-sounds), [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/). Recorded airsoft handling.
+- **Brian MacIntosh (BMacZero) — Gun Reload Sound Effects**, [source](https://opengameart.org/content/gun-reload-sound-effects), [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
+- **Brian MacIntosh (BMacZero) — Mechanical Sounds**, [source](https://opengameart.org/content/mechanical-sounds), [CC0 1.0](https://creativecommons.org/publicdomain/zero/1.0/).
+- **Vinrax — Cloth swing sounds**, [source and creator](https://opengameart.org/content/cloth-swing-sounds), [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). Recorded cloth, edited into quieter movement and pouch cues. Attribution must travel with these edits.
+
+No endorsement by these creators is implied. The recordings retain their
+respective licenses. Animation code and pack meshes have separate authorship.

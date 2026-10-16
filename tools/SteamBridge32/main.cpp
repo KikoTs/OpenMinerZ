@@ -37,8 +37,20 @@ constexpr std::wstring_view pipe_prefix = LR"(\\.\pipe\OpenMinerZ-SteamBridge-)"
 constexpr std::size_t guid_text_length = 36U;
 constexpr std::uint32_t maximum_drain_size = 1024U * 1024U;
 constexpr std::size_t maximum_packets_per_poll = 256U;
+// How many queued parent commands one loop pass forwards. Handling a single
+// datagram per pass, then sleeping, capped the whole host's outbound traffic at
+// roughly one datagram per scheduler tick.
+constexpr std::size_t maximum_commands_per_poll = 256U;
 constexpr std::int32_t native_unreliable_send = 0;
 constexpr std::int32_t native_reliable_send = 2;
+// A hosted lobby that no longer lists its own creator is gone (Steam dropped
+// the connection); after this grace period the host is told instead of
+// silently serving a lobby nobody can find.
+constexpr std::chrono::seconds lobby_loss_grace{8};
+// Every send refused for this long, with none accepted, means Steam itself is
+// unusable; the host is told rather than left running a session nobody hears.
+constexpr std::chrono::seconds send_failure_grace{15};
+constexpr std::size_t send_failure_minimum = 100U;
 
 class Handle final
 {
@@ -83,6 +95,35 @@ class Handle final
   private:
     HANDLE value_{};
 };
+
+#if !defined(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+// `sleep_for(2ms)` costs a full ~15.6 ms scheduler tick at the default Windows
+// timer resolution, which is why one datagram per loop pass became a 64
+// datagram/second ceiling. A process-local high-resolution waitable timer waits
+// the requested time without raising the global timer resolution.
+void idle_wait(std::chrono::microseconds duration)
+{
+    static Handle timer{[] {
+        HANDLE created = CreateWaitableTimerExW(nullptr, nullptr,
+                                                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                TIMER_ALL_ACCESS);
+        if (created == nullptr)
+            created = CreateWaitableTimerExW(nullptr, nullptr, 0U, TIMER_ALL_ACCESS);
+        return created;
+    }()};
+    if (timer.valid())
+    {
+        LARGE_INTEGER due{};
+        due.QuadPart = -static_cast<LONGLONG>(duration.count() * 10);
+        if (SetWaitableTimer(timer.get(), &due, 0, nullptr, nullptr, FALSE) != FALSE &&
+            WaitForSingleObject(timer.get(), 1'000U) == WAIT_OBJECT_0)
+            return;
+    }
+    std::this_thread::sleep_for(duration);
+}
 
 struct Arguments final
 {
@@ -363,16 +404,33 @@ class PipeEndpoint final
 {
     switch (delivery)
     {
-    case SteamDeliveryMethod::unknown:
+    // The original's SteamWorks.SendPacket computes
+    // `(deliveryMethod - Unreliable <= 1)` as an unsigned comparison, so
+    // Unknown (zero, which is what SendDataOptions.Chat produces for chat and
+    // voice) underflows and takes the reliable path. Sending those
+    // unreliably loses chat lines and voice packets the original keeps.
     case SteamDeliveryMethod::unreliable:
     case SteamDeliveryMethod::unreliable_sequenced:
         return native_unreliable_send;
+    case SteamDeliveryMethod::unknown:
     case SteamDeliveryMethod::reliable_unordered:
     case SteamDeliveryMethod::reliable_sequenced:
     case SteamDeliveryMethod::reliable_ordered:
         return native_reliable_send;
     }
     throw std::runtime_error{"Invalid native delivery method"};
+}
+
+// Steam persona names are display text from another account. Keep only what the
+// bridge codec accepts so an odd name can never break the host's IPC stream.
+[[nodiscard]] std::string bridge_safe_name(std::string name)
+{
+    std::erase_if(name, [](unsigned char character) {
+        return character < 0x20U || character == 0x7FU;
+    });
+    if (name.size() > 128U)
+        name.resize(128U);
+    return name;
 }
 
 void require_metadata(SteamNative &native, std::uint64_t lobby_id, const char *key,
@@ -439,10 +497,40 @@ struct LobbyCandidate final
 enum class LobbyReadFailure : std::uint8_t
 {
     none,
+    // Steam has not delivered this lobby's data yet; reading again may succeed.
+    not_ready,
     native_shape,
     metadata,
     bridge_contract
 };
+
+// A lobby whose data arrived but cannot be listed stays unlistable; only a lobby
+// still waiting for its data is worth another read before the deadline.
+[[nodiscard]] constexpr bool final_lobby_failure(LobbyReadFailure failure) noexcept
+{
+    return failure == LobbyReadFailure::native_shape || failure == LobbyReadFailure::metadata ||
+           failure == LobbyReadFailure::bridge_contract;
+}
+
+// Steam's EChatRoomEnterResponse, reported with the names the stock client uses.
+[[nodiscard]] const char *lobby_enter_failure(std::uint32_t response) noexcept
+{
+    switch (response)
+    {
+    case 2U:
+        return "GameNoLongerExists";
+    case 3U:
+        return "YouLackTheNeededPermissions";
+    case 4U:
+        return "GameIsFull";
+    case 6U:
+        return "BannedBySteam";
+    case 7U:
+        return "YouAreALimitedUserAndCannotJoin";
+    default:
+        return "UnknownSteamErrorJoiningGame";
+    }
+}
 
 class BridgeRuntime final
 {
@@ -466,17 +554,28 @@ class BridgeRuntime final
         while (pipe_.parent_is_alive())
         {
             native_->run_callbacks();
+            bool worked{};
             if (mode_ == Mode::hosting || mode_ == Mode::joined)
             {
                 poll_members(false);
-                poll_packets();
+                worked = poll_packets();
             }
-            if (const auto frame = pipe_.receive(); frame.has_value())
+            // Forward everything the game has already queued before waiting
+            // again. One datagram per pass plus an unconditional sleep capped a
+            // host at about 64 datagrams a second, so relays and chunk replies
+            // backed up until the game's own pipe write blocked its main
+            // thread and every player felt it.
+            for (std::size_t drained{}; drained < maximum_commands_per_poll; ++drained)
             {
+                const auto frame = pipe_.receive();
+                if (!frame.has_value())
+                    break;
+                worked = true;
                 if (dispatch(*frame))
                     return;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            if (!worked)
+                idle_wait(std::chrono::milliseconds{1});
         }
         throw std::runtime_error{"The OpenMinerZ parent process exited"};
     }
@@ -621,7 +720,12 @@ class BridgeRuntime final
                 std::uint32_t response{};
                 std::uint64_t lobby{};
                 if (!native_->get_lobby_enter_result(api_call, lobby, response, result_failed) ||
-                    result_failed || response != 1U || lobby != expected_lobby)
+                    result_failed)
+                    throw std::runtime_error{"Steam lobby join returned an invalid result"};
+                // Tell the player why Steam refused: gone, full, or not permitted.
+                if (response != 1U)
+                    throw std::runtime_error{lobby_enter_failure(response)};
+                if (lobby != expected_lobby)
                     throw std::runtime_error{"Steam lobby join returned an invalid result"};
                 return;
             }
@@ -652,8 +756,12 @@ class BridgeRuntime final
                                          " host=" + std::to_string(lobby.host_peer) +
                                          " members=" + std::to_string(members) +
                                          " limit=" + std::to_string(limit);
+            // A zero member limit means the lobby's data has not arrived. Any
+            // other shape (for example a 32-slot modded lobby) will not change,
+            // so discovery must not keep waiting for it.
             if (failure != nullptr)
-                *failure = LobbyReadFailure::native_shape;
+                *failure = limit == 0 ? LobbyReadFailure::not_ready
+                                      : LobbyReadFailure::native_shape;
             return std::nullopt;
         }
         lobby.current_players = static_cast<std::uint8_t>(members);
@@ -730,6 +838,24 @@ class BridgeRuntime final
         return lobby;
     }
 
+    // One lobby with oversized or otherwise unreadable metadata is skipped. It
+    // must never end discovery for every other server in the list.
+    [[nodiscard]] std::optional<SteamBridgeDiscoveredLobby> read_listed_lobby(
+        const LobbyCandidate &candidate, LobbyReadFailure &failure)
+    {
+        try
+        {
+            return read_lobby(candidate, false, &failure);
+        }
+        catch (const std::exception &)
+        {
+            last_discovery_diagnostic_ =
+                "lobby=" + std::to_string(candidate.lobby_id) + " unreadable metadata";
+            failure = LobbyReadFailure::metadata;
+            return std::nullopt;
+        }
+    }
+
     [[nodiscard]] std::vector<LobbyCandidate> lobby_candidates(std::uint32_t public_count,
                                                                std::uint8_t maximum_results)
     {
@@ -780,6 +906,8 @@ class BridgeRuntime final
                 std::to_string(static_cast<std::uint8_t>(*request.protocol));
             native_->add_lobby_string_filter("0", protocol.c_str());
         }
+        // Both owned GetNetworkSessions methods require slot 1 == 0.
+        native_->add_lobby_string_filter("1", "0");
         native_->add_lobby_distance_filter(2);
         native_->add_lobby_result_count_filter(request.maximum_results);
         const std::uint64_t call = native_->request_lobby_list();
@@ -800,9 +928,10 @@ class BridgeRuntime final
             bool complete = true;
             for (std::size_t index{}; index < candidates.size(); ++index)
             {
-                if (!resolved[index].has_value())
-                    resolved[index] = read_lobby(candidates[index], false, &failures[index]);
-                complete = complete && resolved[index].has_value();
+                if (!resolved[index].has_value() && !final_lobby_failure(failures[index]))
+                    resolved[index] = read_listed_lobby(candidates[index], failures[index]);
+                complete = complete &&
+                           (resolved[index].has_value() || final_lobby_failure(failures[index]));
             }
             if (complete)
                 break;
@@ -816,8 +945,8 @@ class BridgeRuntime final
         last_discovered_lobbies_.clear();
         for (std::size_t index{}; index < candidates.size(); ++index)
         {
-            if (!resolved[index].has_value())
-                resolved[index] = read_lobby(candidates[index], false, &failures[index]);
+            if (!resolved[index].has_value() && !final_lobby_failure(failures[index]))
+                resolved[index] = read_listed_lobby(candidates[index], failures[index]);
             if (resolved[index].has_value())
             {
                 // Steam's public-lobby query applies the protocol filter, but friend-game
@@ -839,7 +968,8 @@ class BridgeRuntime final
         results.rejected_lobby_count =
             static_cast<std::uint16_t>(results.reported_lobby_count - results.lobbies.size());
         results.rejected_native_count = static_cast<std::uint16_t>(
-            std::count(failures.begin(), failures.end(), LobbyReadFailure::native_shape));
+            std::count(failures.begin(), failures.end(), LobbyReadFailure::native_shape) +
+            std::count(failures.begin(), failures.end(), LobbyReadFailure::not_ready));
         results.rejected_metadata_count = static_cast<std::uint16_t>(
             std::count(failures.begin(), failures.end(), LobbyReadFailure::metadata));
         results.rejected_contract_count = static_cast<std::uint16_t>(
@@ -918,12 +1048,29 @@ class BridgeRuntime final
             SteamBridgeOutboundWire datagram;
             if (!decode_steam_bridge_outbound_wire(frame.payload, datagram, error))
                 throw std::runtime_error{"The parent sent an invalid outbound datagram"};
+            // The game hears about a departure a frame after this helper does, so
+            // datagrams still queued for a member that has just left are normal.
+            // Drop them: treating one as fatal ended the hosted session for
+            // everybody each time a single player left or gave up joining.
             if (!members_.contains(datagram.peer))
-                throw std::runtime_error{"The parent targeted a peer outside the lobby"};
+                return false;
             const std::int32_t native_send = native_send_type(datagram.delivery);
-            if (!native_->send_packet(datagram.peer, datagram.wire, native_send,
-                                      datagram.p2p_channel))
-                throw std::runtime_error{"Steam rejected an outbound P2P packet"};
+            // The stock provider ignores SendP2PPacket's result. A refused packet
+            // is lost like any other datagram; only a sustained total failure is
+            // reported, because then nothing is reaching anyone.
+            if (native_->send_packet(datagram.peer, datagram.wire, native_send,
+                                     datagram.p2p_channel))
+            {
+                failed_sends_ = 0U;
+                return false;
+            }
+            const auto now = Clock::now();
+            if (failed_sends_++ == 0U)
+                first_failed_send_ = now;
+            if (failed_sends_ >= send_failure_minimum &&
+                now - first_failed_send_ > send_failure_grace)
+                throw std::runtime_error{
+                    "Steam has refused every outbound packet for 15 seconds"};
             return false;
         }
         case SteamBridgeMessageType::update_host: {
@@ -994,6 +1141,39 @@ class BridgeRuntime final
             if (member != local_steam_id_)
                 static_cast<void>(native_->accept_p2p_session(member));
         }
+        if (mode_ == Mode::hosting)
+        {
+            // A lobby that stops listing its own creator no longer exists for
+            // anyone else either. Say so instead of hosting an unreachable game.
+            if (current.contains(local_steam_id_))
+                lobby_lost_since_.reset();
+            else if (!lobby_lost_since_.has_value())
+                lobby_lost_since_ = now;
+            else if (now - *lobby_lost_since_ > lobby_loss_grace)
+                throw std::runtime_error{
+                    "The Steam lobby was lost. Check the Steam connection and host again"};
+            // Tell the host who is knocking before any packet arrives, so a join
+            // that never gets past Steam P2P is visible instead of silent.
+            for (const std::uint64_t member : current)
+            {
+                if (member == local_steam_id_ || members_.contains(member))
+                    continue;
+                SteamBridgeProtocolError error{};
+                std::string name;
+                try
+                {
+                    name = bridge_safe_name(native_->friend_persona_name(member));
+                }
+                catch (const std::exception &)
+                {
+                    name.clear();
+                }
+                const auto payload =
+                    encode_steam_bridge_member(SteamBridgeMember{member, std::move(name)}, error);
+                if (payload.has_value())
+                    pipe_.send(SteamBridgeMessageType::peer_entered, *payload);
+            }
+        }
         for (const std::uint64_t previous : members_)
         {
             if (previous == local_steam_id_ || current.contains(previous))
@@ -1008,7 +1188,9 @@ class BridgeRuntime final
         members_ = std::move(current);
     }
 
-    void poll_packets()
+    // True when at least one native packet was consumed, so the caller keeps
+    // working instead of waiting while traffic is arriving.
+    [[nodiscard]] bool poll_packets()
     {
         std::size_t count{};
         while (count < maximum_packets_per_poll)
@@ -1023,7 +1205,17 @@ class BridgeRuntime final
                 found_packet = true;
                 ++count;
                 if (available == 0U || available > maximum_drain_size)
-                    throw std::runtime_error{"Steam advertised an undrainable P2P packet length"};
+                {
+                    // The length is chosen by the remote account. Reading with a
+                    // short buffer consumes the packet; it must never be able to
+                    // stop the host for every other player.
+                    std::array<std::uint8_t, 1> discard{};
+                    std::uint32_t discarded{};
+                    std::uint64_t source{};
+                    if (!native_->read_packet(discard, discarded, source, channel))
+                        return true;
+                    continue;
+                }
                 std::vector<std::uint8_t> wire(available);
                 std::uint32_t received{};
                 std::uint64_t remote{};
@@ -1048,6 +1240,7 @@ class BridgeRuntime final
             if (!found_packet)
                 break;
         }
+        return count > 0U;
     }
 
     void cleanup() noexcept
@@ -1068,6 +1261,8 @@ class BridgeRuntime final
             lobby_id_ = 0U;
             local_steam_id_ = 0U;
             persona_name_.clear();
+            lobby_lost_since_.reset();
+            failed_sends_ = 0U;
             mode_ = Mode::initial;
             native_.reset();
         }
@@ -1084,6 +1279,9 @@ class BridgeRuntime final
     std::string last_discovery_diagnostic_;
     std::uint8_t initial_maximum_players_{};
     Clock::time_point next_membership_poll_{};
+    std::optional<Clock::time_point> lobby_lost_since_;
+    Clock::time_point first_failed_send_{};
+    std::size_t failed_sends_{};
     Mode mode_{Mode::initial};
 };
 
@@ -1114,14 +1312,17 @@ class BridgeRuntime final
     bool heartbeat_seen{};
     while (pipe.parent_is_alive() && Clock::now() < deadline)
     {
+        // Same drain-then-wait-only-when-idle shape as the gameplay loop, so
+        // the offline IPC probe measures the transport the game really uses.
         const auto frame = pipe.receive();
         if (!frame.has_value())
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            idle_wait(std::chrono::milliseconds{1});
             continue;
         }
-        if (frame->type == SteamBridgeMessageType::heartbeat && frame->payload.empty() &&
-            !heartbeat_seen)
+        // Any number of heartbeats may be echoed: the offline certificate sends
+        // one, and the IPC latency probe pipelines many.
+        if (frame->type == SteamBridgeMessageType::heartbeat && frame->payload.empty())
         {
             heartbeat_seen = true;
             pipe.send(SteamBridgeMessageType::heartbeat);

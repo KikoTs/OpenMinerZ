@@ -1,5 +1,7 @@
 #include "openminerz/net/combat_codec.hpp"
 
+#include "openminerz/net/stock_parity.hpp"
+
 #include "openminerz/net/bootstrap_codec.hpp"
 
 #include <cmath>
@@ -307,8 +309,8 @@ std::optional<std::vector<std::uint8_t>> encode_grenade_payload(const GrenadePay
         error = PayloadError::non_finite;
         return std::nullopt;
     }
-    if (!grenade_type(message.grenade_type, protocol) || message.seconds_left < 1.0F ||
-        message.seconds_left > 5.0F)
+    if (!grenade_type(message.grenade_type, protocol) ||
+        !stock_grenade_fuse_valid(message.seconds_left))
     {
         error = PayloadError::out_of_range;
         return std::nullopt;
@@ -339,8 +341,12 @@ bool decode_grenade_payload(std::span<const std::uint8_t> payload, ProtocolVersi
         error = PayloadError::non_finite;
         return false;
     }
-    if (!grenade_type(decoded.grenade_type, protocol) || decoded.seconds_left < 1.0F ||
-        decoded.seconds_left > 5.0F)
+    // Not "at least one second": Player.OnUpdate lets the cook time overshoot
+    // four seconds by a frame, so a held stock grenade arrives with 0.98 s or
+    // less. This reader gates the packet at the transport on BOTH roles, so
+    // the old bound dropped the throw before the host could even relay it.
+    if (!grenade_type(decoded.grenade_type, protocol) ||
+        !stock_grenade_fuse_valid(decoded.seconds_left))
     {
         error = PayloadError::out_of_range;
         return false;
@@ -642,7 +648,7 @@ bool decode_remove_blocks_payload(std::span<const std::uint8_t> payload,
         error = PayloadError::malformed;
         return false;
     }
-    if (count < 0 || static_cast<std::size_t>(count) > maximum_remove_blocks ||
+    if (count < 0 || static_cast<std::size_t>(count) > maximum_received_remove_blocks ||
         static_cast<std::size_t>(count) > reader.remaining() / 12U)
     {
         error = PayloadError::out_of_range;

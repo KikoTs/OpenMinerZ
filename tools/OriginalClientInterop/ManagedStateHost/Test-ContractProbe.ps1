@@ -49,6 +49,12 @@ function Test-GameContract(
         }
     }
     finally {
+        $resolvedStage = [System.IO.Path]::GetFullPath($stage)
+        $temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolvedStage.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            [System.IO.Path]::GetFileName($resolvedStage) -notmatch '^openminerz-contract-[0-9a-f]{32}$') {
+            throw 'Refusing to remove a contract stage outside the expected temporary directory.'
+        }
         Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

@@ -134,7 +134,16 @@ struct DoorModelTransform final
 };
 
 [[nodiscard]] bool is_solid(BlockType type) noexcept;
+// The shipped BlockType.BlockPlayer column: what stops players, enemies,
+// pickups and grenades. Surface lava IS solid in retail; deep lava is not.
 [[nodiscard]] bool blocks_player(BlockType type) noexcept;
+// The default-off "Sinking lava" enhancement makes surface lava pass-through
+// (the former behaviour of this client). It is process-wide because every
+// collision query in the simulation goes through blocks_player. Only the
+// application sets it, from enhancement_active() in retail_parity.hpp, which
+// never permits it in an online session; everything else leaves it false.
+void set_surface_lava_passable(bool passable) noexcept;
+[[nodiscard]] bool surface_lava_passable() noexcept;
 [[nodiscard]] bool occludes(BlockType type) noexcept;
 // Item-block entities (torches and doors) are rendered from their original
 // models and therefore contribute no terrain-atlas cube faces.
@@ -150,6 +159,9 @@ struct DoorModelTransform final
 [[nodiscard]] std::optional<FaceDirection> attached_face(BlockType type) noexcept;
 // Original BlockType.IsContainer. CrateSafe deliberately is not storage.
 [[nodiscard]] bool is_container(BlockType type) noexcept;
+// BlockType.IsStructure (1.9.9.8 only): glass, spawn points, teleport station.
+// Any held item digs these in two seconds.
+[[nodiscard]] bool is_structure(BlockType type) noexcept;
 [[nodiscard]] bool is_lower_door(BlockType type) noexcept;
 [[nodiscard]] bool is_upper_door(BlockType type) noexcept;
 [[nodiscard]] bool is_strong_door(BlockType type) noexcept;
@@ -180,6 +192,10 @@ struct DoorModelTransform final
                                                                    float v0, float u1,
                                                                    float v1) noexcept;
 [[nodiscard]] BlockColor fallback_color(BlockType type) noexcept;
+// BlockType.Name as shipped ("Gold Ore", "Diamonds", "Golden Wall", "Monster
+// Spawner (Right click to activate)"): the text of the original's aimed-block
+// label, and the name every block item takes. Mixed case, generated from the
+// owned installs; see block.cpp for the oddities it deliberately keeps.
 [[nodiscard]] std::string_view block_name(BlockType type) noexcept;
 
 } // namespace openminerz::world

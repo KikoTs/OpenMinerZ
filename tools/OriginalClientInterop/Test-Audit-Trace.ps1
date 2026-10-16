@@ -32,7 +32,10 @@ function Write-Fixture([string] $Destination, $Records) {
     $lines = foreach ($record in $Records) {
         $record | ConvertTo-Json -Compress
     }
-    Set-Content -LiteralPath $Destination -Value $lines -Encoding utf8NoBOM
+    # Not Set-Content -Encoding utf8NoBOM: Windows PowerShell 5.1 has no such
+    # encoding name, and CMake runs this with it when pwsh is not on PATH.
+    [System.IO.File]::WriteAllLines($Destination, [string[]] @($lines),
+        [System.Text.UTF8Encoding]::new($false))
 }
 
 function Invoke-Audit([string] $Trace) {

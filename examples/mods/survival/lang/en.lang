@@ -1,0 +1,16 @@
+# Survival: English strings (ui.text("key")).
+hud.hunger = Hunger
+hud.thirst = Thirst
+toast.low_hunger = You are getting hungry
+toast.low_thirst = You are getting thirsty
+toast.low_hint = Eat or drink before it runs out.
+toast.starving = Starving!
+toast.parched = Parched!
+toast.empty_hint = You lose health until you {action}.
+action.eat = eat something
+action.drink = drink something
+canteen.filled = You drink your fill and top up the canteen.
+canteen.no_water = No fresh water here. Stand next to a pond.
+drink.ok = You drink from the pond.
+drink.no_water = There is no fresh water within reach.
+welcome = Find fresh water and food: leaves hide berries, ponds hold water.

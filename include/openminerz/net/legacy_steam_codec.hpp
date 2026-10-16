@@ -58,7 +58,7 @@ enum class LegacySteamCodecError : std::uint8_t
 };
 
 inline constexpr std::size_t legacy_steam_wire_header_size = 4U;
-inline constexpr std::size_t legacy_steam_maximum_wire_size = 65'535U;
+inline constexpr std::size_t legacy_steam_maximum_wire_size = maximum_packet_size + 64U;
 inline constexpr std::string_view legacy_steam_game_name = "CastleMinerZSteam";
 inline constexpr std::size_t legacy_session_property_count = 8U;
 

@@ -8,6 +8,8 @@
     <Nullable>enable</Nullable>
     <AssemblyName>OpenMinerZ.ContentBridge</AssemblyName>
     <RootNamespace>OpenMinerZ.ContentBridge</RootNamespace>
+    <!-- RetailCharacter.cs is shared with RigParityProbe; only the importer writes character.omrc. -->
+    <DefineConstants>$(DefineConstants);OPENMINERZ_CONTENT_BRIDGE</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="Microsoft.Xna.Framework">
@@ -22,5 +24,7 @@
       <HintPath>$(WINDIR)\Microsoft.NET\assembly\GAC_32\Microsoft.Xna.Framework.Graphics\v4.0_4.0.0.0__842cf8be1de50553\Microsoft.Xna.Framework.Graphics.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- The retail-character pass owns a hidden window for its graphics device. -->
+    <Reference Include="System.Windows.Forms" />
   </ItemGroup>
 </Project>

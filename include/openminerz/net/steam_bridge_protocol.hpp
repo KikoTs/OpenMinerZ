@@ -15,9 +15,9 @@ namespace openminerz::net
 {
 
 inline constexpr std::uint32_t castle_miner_z_steam_app_id = 253'430U;
-inline constexpr std::uint16_t steam_bridge_protocol_version = 2U;
+inline constexpr std::uint16_t steam_bridge_protocol_version = 3U;
 inline constexpr std::size_t steam_bridge_header_size = 20U;
-inline constexpr std::size_t steam_bridge_maximum_payload_size = 128U * 1024U;
+inline constexpr std::size_t steam_bridge_maximum_payload_size = legacy_steam_maximum_wire_size + 1024U;
 inline constexpr std::size_t steam_bridge_maximum_frame_size =
     steam_bridge_header_size + steam_bridge_maximum_payload_size;
 inline constexpr std::size_t steam_bridge_maximum_discovery_results = 50U;
@@ -37,6 +37,9 @@ enum class SteamBridgeMessageType : std::uint16_t
     stopped = 9,
     failure = 10,
     heartbeat = 11,
+    // Host mode only: a Steam user entered the hosted lobby. It carries no
+    // authority; it lets the host report a join attempt that never progresses.
+    peer_entered = 12,
     discover_request = 20,
     discovery_results = 21,
     join_request = 22,
@@ -104,6 +107,14 @@ struct SteamBridgeInboundWire final
     PeerId peer{};
     std::uint8_t p2p_channel{};
     std::vector<std::uint8_t> wire;
+};
+
+// A lobby member as Steam reports it. The persona name is display-only and may
+// be empty while Steam is still resolving it.
+struct SteamBridgeMember final
+{
+    PeerId peer{};
+    std::string persona_name;
 };
 
 struct SteamBridgeOutboundWire final
@@ -205,6 +216,11 @@ struct SteamBridgeJoinReady final
     PeerId peer, SteamBridgeProtocolError &error);
 [[nodiscard]] bool decode_steam_bridge_peer(std::span<const std::uint8_t> payload, PeerId &peer,
                                             SteamBridgeProtocolError &error) noexcept;
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> encode_steam_bridge_member(
+    const SteamBridgeMember &member, SteamBridgeProtocolError &error);
+[[nodiscard]] bool decode_steam_bridge_member(std::span<const std::uint8_t> payload,
+                                              SteamBridgeMember &member,
+                                              SteamBridgeProtocolError &error);
 [[nodiscard]] std::optional<std::vector<std::uint8_t>> encode_steam_bridge_failure(
     const SteamBridgeFailure &failure, SteamBridgeProtocolError &error);
 [[nodiscard]] bool decode_steam_bridge_failure(std::span<const std::uint8_t> payload,

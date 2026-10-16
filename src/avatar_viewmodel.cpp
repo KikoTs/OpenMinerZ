@@ -1,14 +1,25 @@
 #include "avatar_viewmodel.hpp"
 #include "static_model_asset.hpp"
 
+#include "openminerz/asset_paths.hpp"
 #include "openminerz/inventory.hpp"
+#include "openminerz/modding/animation_authoring.hpp" // (GunFX) find_rig_bone
+#include "openminerz/modding/graphics.hpp"
+#include "openminerz/modding/held_item.hpp" // (Items)
+#include "openminerz/modding/icon_model.hpp" // Modding, visuals area
+#include "openminerz/retail_character_driver.hpp"
+#include "openminerz/retail_rig.hpp"
+#include "openminerz/world/player_animation.hpp"
+#include "openminerz/xbox_avatar.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <format>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <numbers>
@@ -30,6 +41,34 @@ namespace openminerz
 {
 namespace
 {
+
+// ===========================================================================
+// SEAM: Xbox-avatar skins.
+//
+// The character OpenMinerZ draws is the retail one: Character\SWATMale on the
+// game's own two skeletons, posed by rig::CharacterPose (openminerz/retail_rig.hpp)
+// and drawn by retail_character_view.inc. That path uses no retargeting at all.
+//
+// Everything else in this file - the .omavatar/.omhc loaders, the export-space
+// retargeting, the handedness mirror, the proxy-rotation and grip-centre fixes,
+// the hand-tuned item offsets - is the earlier Xbox-avatar character. It is kept
+// intact, and unreachable, behind this one function so skins can be brought
+// back later. The intended way back is NOT to return true here (that swaps the
+// whole character for the old pipeline, which is only useful for comparison):
+// it is to attach an avatar's meshes to rig::CharacterPose's attachment
+// skeleton - both use the same 71 Xbox avatar bones - and add them as extra
+// spans in build_retail_geometry().
+//
+// OPENMINERZ_XBOX_AVATAR=1 turns the old pipeline on for a side-by-side look.
+// ===========================================================================
+[[nodiscard]] bool xbox_avatar_skin_enabled() noexcept
+{
+    static const bool enabled = [] {
+        const char *value = SDL_getenv("OPENMINERZ_XBOX_AVATAR");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
 
 struct SourceVertex final
 {
@@ -750,6 +789,50 @@ struct WeaponClipNames final
     std::string_view reload;
 };
 
+// The file name a registered clip was exported under by content packs that
+// predate the registered-name export: the last component of the 1.6.3.8
+// content path. The 1.6.3.8 space-weapon clips share their file names with the
+// conventional ones (SpaceWeapons\Animations\AssaultShoot beside
+// AvatarAnimation\AssaultShoot), so those packs hold only the conventional
+// clip, and every Laser* lookup used to miss.
+std::string_view legacy_clip_file(std::string_view registered_name) noexcept
+{
+    const world::AnimationClip clip = world::animation_clip_from_name(registered_name);
+    if (clip == world::AnimationClip::none)
+        return {};
+    const std::string_view path = world::animation_clip_info(clip).classic_path;
+    // The conventional LMG's files are plain "Idle", "Walk", ...: no alias.
+    if (!path.starts_with("AvatarAnimation/") && !path.starts_with("SpaceWeapons/Animations/"))
+        return {};
+    return path.substr(path.rfind('/') + 1U);
+}
+
+// A missing clip is looked up once more under that file name before the
+// caller's fallback applies. A firearm whose own clip is absent therefore
+// shows the conventional clip of the same role (hold, shoulder, shoot, reload)
+// and never the pickaxe swing its trigger used to play.
+template <typename Library>
+auto find_clip(Library &library, std::string_view name) -> decltype(&library.begin()->second)
+{
+    if (const auto found = library.find(std::string{name});
+        found != library.end() && !found->second.frames.empty())
+        return &found->second;
+    const std::string_view legacy = legacy_clip_file(name);
+    if (legacy.empty() || legacy == name)
+        return nullptr;
+    const auto found = library.find(std::string{legacy});
+    if (found == library.end() || found->second.frames.empty())
+        return nullptr;
+    static std::vector<std::string> reported;
+    if (std::find(reported.begin(), reported.end(), name) == reported.end())
+    {
+        reported.emplace_back(name);
+        std::cerr << "Avatar animation '" << name << "' is not in this content pack; showing '"
+                  << legacy << "'. Re-import the game content to restore it.\n";
+    }
+    return &found->second;
+}
+
 WeaponClipNames weapon_clip_names(WeaponFamily family) noexcept
 {
     switch (family)
@@ -909,6 +992,26 @@ class AvatarViewmodel::Impl final
             if (white_texture_ != nullptr)
                 SDL_SetTextureScaleMode(white_texture_, SDL_SCALEMODE_LINEAR);
         }
+        // The retail character is the default. The Xbox-avatar loader below runs
+        // only behind xbox_avatar_skin_enabled() (see the seam at the top).
+        load_retail_character();
+        if (retail_active())
+        {
+            loaded_ = true;
+            load_held_item_models(derived_data_path());
+            triangle_count_ = retail_rig_->triangle_count();
+#if defined(_WIN32)
+            initialize_depth_pipeline();
+#endif
+            return;
+        }
+        // A content pack imported before the retail character existed has no
+        // character.omrc. Rather than leave the player without arms, such a pack
+        // degrades, loudly, to the Xbox-avatar character it was built with.
+        if (!xbox_avatar_skin_enabled())
+            std::cerr << "Character: this content pack has no retail character; drawing the legacy "
+                         "Xbox-avatar export instead. Re-import the pack (tools/ContentBridge "
+                         "<game folder> <pack>/DerivedData --character-only) to get the retail rig.\n";
         try
         {
             BinaryReader reader{path};
@@ -948,7 +1051,9 @@ class AvatarViewmodel::Impl final
                 for (int bone = 1; bone < bone_count; ++bone)
                 {
                     const auto absolute = inverse_matrix(inverse_bind_pose_[static_cast<std::size_t>(bone)]);
-                    const auto parent_absolute = inverse_matrix(inverse_bind_pose_[0]);
+                    const auto parent_absolute =
+                        inverse_matrix(inverse_bind_pose_[static_cast<std::size_t>(
+                            avatar_parents[static_cast<std::size_t>(bone)])]);
                     source_pose_local_[static_cast<std::size_t>(bone)] =
                         multiply_matrix(absolute, inverse_matrix(parent_absolute));
                 }
@@ -1089,43 +1194,8 @@ class AvatarViewmodel::Impl final
                                                    load_animation(entry.path()));
                 }
             }
-            pickaxe_ = std::make_unique<StaticModelAsset>(renderer_, derived / "pickaxe.omsm");
-            compass_ = std::make_unique<StaticModelAsset>(renderer_, derived / "compass.omsm");
-            pistol_ = std::make_unique<StaticModelAsset>(renderer_, derived / "pistol.omsm");
-            knife_ = std::make_unique<StaticModelAsset>(renderer_, derived / "knife.omsm");
-            ammo_ = std::make_unique<StaticModelAsset>(renderer_, derived / "ammo.omsm");
-            torch_ = std::make_unique<StaticModelAsset>(renderer_, derived / "torch.omsm");
-            // Every held weapon/tool family from the original inventory classes.
-            // StaticModelAsset tolerates a missing export by reporting !loaded().
-            spade_ = std::make_unique<StaticModelAsset>(renderer_, derived / "spade.omsm");
-            axe_ = std::make_unique<StaticModelAsset>(renderer_, derived / "axe.omsm");
-            ak_ = std::make_unique<StaticModelAsset>(renderer_, derived / "ak.omsm");
-            shotgun_ = std::make_unique<StaticModelAsset>(renderer_, derived / "shotgun.omsm");
-            rifle_ = std::make_unique<StaticModelAsset>(renderer_, derived / "rifle.omsm");
-            smg_ = std::make_unique<StaticModelAsset>(renderer_, derived / "smg.omsm");
-            lmg_ = std::make_unique<StaticModelAsset>(renderer_, derived / "lmg.omsm");
-            rpg_ = std::make_unique<StaticModelAsset>(renderer_, derived / "rpg.omsm");
-            grenade_ = std::make_unique<StaticModelAsset>(renderer_, derived / "grenade.omsm");
-            space_ak_ = std::make_unique<StaticModelAsset>(renderer_, derived / "space_ak.omsm");
-            space_pistol_ =
-                std::make_unique<StaticModelAsset>(renderer_, derived / "space_pistol.omsm");
-            space_shotgun_ =
-                std::make_unique<StaticModelAsset>(renderer_, derived / "space_shotgun.omsm");
-            space_rifle_ =
-                std::make_unique<StaticModelAsset>(renderer_, derived / "space_rifle.omsm");
-            space_smg_ = std::make_unique<StaticModelAsset>(renderer_, derived / "space_smg.omsm");
-            saber_ = std::make_unique<StaticModelAsset>(renderer_, derived / "saber.omsm");
-            // Palm-carried materials and instruments (ModelInventoryItemClass /
-            // Compass-style Hand transforms).
-            ore_ = std::make_unique<StaticModelAsset>(renderer_, derived / "ore.omsm");
-            gems_ = std::make_unique<StaticModelAsset>(renderer_, derived / "gems.omsm");
-            bars_ = std::make_unique<StaticModelAsset>(renderer_, derived / "bars.omsm");
-            clock_ = std::make_unique<StaticModelAsset>(renderer_, derived / "clock.omsm");
-            locator_ = std::make_unique<StaticModelAsset>(renderer_, derived / "locator.omsm");
-            teleporter_ =
-                std::make_unique<StaticModelAsset>(renderer_, derived / "teleporter.omsm");
-            gunpowder_ =
-                std::make_unique<StaticModelAsset>(renderer_, derived / "gunpowder.omsm");
+            // The held-item models are shared with the retail character.
+            load_held_item_models(derived);
             BinaryReader carrier_reader{derived / "proxy_hand.omhc"};
             if (carrier_reader.read<std::uint32_t>() != 0x43484D4FU)
                 throw std::runtime_error{"invalid proxy hand carrier"};
@@ -1301,15 +1371,33 @@ class AvatarViewmodel::Impl final
         {
             SDL_DestroyTexture(part.texture);
         }
+        destroy_player_skins();
+        destroy_retail_character();
         SDL_DestroyTexture(white_texture_);
         SDL_DestroyTexture(depth_target_texture_);
     }
 
+    // Xbox avatars worn as skins by the retail character below.
+#include "xbox_avatar_view.inc"
+    // The retail character in both views (the default path).
+#include "retail_character_view.inc"
+    // (GunFX) weapon parts, clip cues, viewmodel motion and dropped parts.
+#include "gunfx_view.inc"
+
     void draw(const ui::UiMetrics &metrics, const world::PlayerState &player, float elapsed_seconds,
               bool reduced_motion, float viewmodel_fov_degrees, SDL_Texture *block_atlas)
     {
+        // Valid for the frame being drawn only.
+        muzzle_.reset();
         if (!loaded_)
         {
+            return;
+        }
+        if (retail_active())
+        {
+            gunfx_reduced_motion_ = reduced_motion; // (GunFX)
+            draw_retail_first_person(metrics, player, elapsed_seconds, viewmodel_fov_degrees,
+                                     block_atlas);
             return;
         }
 
@@ -1337,8 +1425,8 @@ class AvatarViewmodel::Impl final
             use_animation = &generic_use_;
         }
         const auto clip_or = [&](std::string_view name, const NativeAnimation *fallback) {
-            const auto found = animation_library_.find(std::string{name});
-            return found == animation_library_.end() ? fallback : &found->second;
+            const NativeAnimation *found = find_clip(animation_library_, name);
+            return found == nullptr ? fallback : found;
         };
         const WeaponFamily family = weapon_family(player.selected_item_id);
         const WeaponClipNames weapon_names = weapon_clip_names(family);
@@ -1600,7 +1688,7 @@ class AvatarViewmodel::Impl final
         // The lower bound admits the shouldered zoom (half the configured FOV, down to
         // 27.5 degrees for the 55-degree minimum setting).
         const float viewmodel_fov =
-            std::clamp(viewmodel_fov_degrees, 25.0F, 110.0F) * pi / 180.0F;
+            view::sanitized_fov_degrees(viewmodel_fov_degrees) * pi / 180.0F;
         const float focal = 1.0F / std::tan(viewmodel_fov * 0.5F);
         struct ScreenProjection final
         {
@@ -1673,7 +1761,9 @@ class AvatarViewmodel::Impl final
         // original GunEyePoint render, so it keeps anything with one visible corner. The
         // painter fallback has no clipping and must drop those triangles entirely.
         const bool depth_pass = depth_ready_;
-        const auto wrap_uv = [](float coordinate) {
+        const auto wrap_uv = [depth_pass](float coordinate) {
+            if (depth_pass)
+                return coordinate;
             float wrapped = coordinate - std::floor(coordinate);
             if (coordinate > 0.0F && std::abs(wrapped) < 0.00001F)
                 wrapped = 1.0F;
@@ -2310,6 +2400,42 @@ class AvatarViewmodel::Impl final
                 }
             }
         }
+        if (env_rebirth_ &&
+            gun_stats(static_cast<InventoryItemId>(player.selected_item_id)) != nullptr)
+        {
+            // The muzzle of the held gun for this (legacy avatar) path too, by
+            // the same rule as the retail character's: a gun is held pointing
+            // away from the eye, so its muzzle is the centre of everything
+            // within two centimetres of the prop's furthest depth. Bolts and
+            // the Enhanced muzzle flash leave from here. Presentation only, and
+            // Enhanced only: the Original presentation keeps this path exactly
+            // as it was (no muzzle point, bolts from the retail offset).
+            float furthest = 0.0F;
+            for (const Triangle &triangle : triangles)
+                if (triangle.render_layer == 1)
+                    for (const std::array<float, 3> &corner : triangle.view)
+                        furthest = std::max(furthest, corner[2]);
+            std::array<double, 3> sum{};
+            std::size_t count{};
+            for (const Triangle &triangle : triangles)
+                if (triangle.render_layer == 1)
+                    for (const std::array<float, 3> &corner : triangle.view)
+                        if (corner[2] >= furthest - 0.02F)
+                        {
+                            sum[0] += corner[0];
+                            sum[1] += corner[1];
+                            sum[2] += corner[2];
+                            ++count;
+                        }
+            if (count > 0U && furthest > 0.011F)
+            {
+                const double scale = 1.0 / static_cast<double>(count);
+                muzzle_ = AvatarViewmodel::Muzzle{{static_cast<float>(sum[0] * scale),
+                                                   static_cast<float>(sum[1] * scale),
+                                                   static_cast<float>(sum[2] * scale)},
+                                                  viewmodel_fov * 180.0F / pi};
+            }
+        }
 #if defined(_WIN32)
         if (depth_pass)
         {
@@ -2347,34 +2473,54 @@ class AvatarViewmodel::Impl final
         flush_run();
     }
 
-    void append_world_player(EntityBatch &output, std::uint8_t gid,
-                             InventoryItemId carried_item, world::Vec3 feet, float yaw,
-                             float torso_pitch, float animation_seconds,
-                             float movement_x, float movement_y,
-                             PlayerAnimationMode animation_mode, bool using_tool,
-                             bool dead, bool shouldering, bool reloading,
-                             bool throwing_grenade, bool ready_to_throw_grenade,
-                             float sky_light, float torch_light, SDL_Texture *block_atlas)
+    void append_world_player(EntityBatch &output, std::uint16_t gid, InventoryItemId carried_item,
+                             world::Vec3 feet, float yaw, float torso_pitch,
+                             float animation_seconds, float movement_x, float movement_y,
+                             PlayerAnimationMode animation_mode, bool using_tool, bool dead,
+                             bool shouldering, bool reloading, bool throwing_grenade,
+                             bool ready_to_throw_grenade, float sky_light, float torch_light,
+                             SDL_Texture *block_atlas, const world::SkyState &sky,
+                             bool rebirth_presentation, bool underwater, bool hide_head,
+                             world::Vec3 *eye_position, world::Vec3 *eye_forward,
+                             const modding::graphics::HeldItemPose *mod_item)
     {
+        if (retail_active())
+        {
+            append_retail_world_player(output, gid, carried_item, feet, yaw, torso_pitch,
+                                       animation_seconds, movement_x, movement_y, animation_mode,
+                                       using_tool, dead, shouldering, reloading, throwing_grenade,
+                                       ready_to_throw_grenade, sky_light, torch_light, block_atlas,
+                                       sky, rebirth_presentation, underwater, hide_head,
+                                       eye_position, eye_forward, mod_item);
+            return;
+        }
         if (!loaded_ || batches_.empty() || inverse_bind_pose_.size() != 71U ||
             source_pose_local_.size() != 71U)
             return;
 
         const auto clip_or = [&](std::string_view name, const NativeAnimation *fallback) {
-            const auto found = animation_library_.find(std::string{name});
-            return found == animation_library_.end() || found->second.frames.empty()
-                       ? fallback
-                       : &found->second;
+            const NativeAnimation *found = find_clip(animation_library_, name);
+            return found == nullptr ? fallback : found;
         };
+        const std::size_t first_vertex = output.vertices.size();
+        // PlayerUpdateMessage.Apply feeds zero movement and tilt while dead.
+        if (dead)
+        {
+            movement_x = movement_y = torso_pitch = 0.0F;
+            using_tool = throwing_grenade = ready_to_throw_grenade = false;
+        }
         const float forward_amount = std::abs(movement_y);
         const float strafe_amount = std::abs(movement_x);
         const float movement_amount = std::max(forward_amount, strafe_amount);
         const bool moving = movement_amount >= 0.1F;
-        const bool running = movement_amount >= 0.8F;
+        const bool running =
+            forward_amount > strafe_amount ? forward_amount >= 0.8F : strafe_amount > 0.8F;
         const NativeAnimation *stand_animation = clip_or("Stand0", &generic_idle_);
         const NativeAnimation *base_animation = stand_animation;
         if (moving)
             base_animation = clip_or(running ? "Run" : "Walk", stand_animation);
+        if (underwater && !dead)
+            base_animation = clip_or("Swim", clip_or("Swim Underwater", base_animation));
 
         const NativeAnimation *item_idle = &generic_idle_;
         const NativeAnimation *item_walk = clip_or("GenericWalk", item_idle);
@@ -2417,10 +2563,6 @@ class AvatarViewmodel::Impl final
             case PlayerAnimationMode::grenade:
                 item_idle = clip_or("GrenadeIdle", &generic_idle_);
                 item_walk = clip_or("GrenadeWalk", item_idle);
-                if (throwing_grenade)
-                    action_animation = clip_or(ready_to_throw_grenade ? "GrenadeCook"
-                                                                      : "GrenadeThrow",
-                                               &generic_use_);
                 break;
             case PlayerAnimationMode::fist:
                 item_root = 5;
@@ -2442,9 +2584,7 @@ class AvatarViewmodel::Impl final
         // cross-fades. Sampling every layer from global time made swings loop,
         // aim/reload snap and every remote avatar move in lockstep.
         WorldPlayerAnimationState &animation = world_animation_states_[gid];
-        const bool identity_changed = !animation.initialized ||
-                                      animation.animation_mode != animation_mode ||
-                                      animation.carried_item != carried_item;
+        const bool identity_changed = !animation.initialized;
         if (identity_changed)
         {
             animation = {};
@@ -2453,6 +2593,10 @@ class AvatarViewmodel::Impl final
             animation.carried_item = carried_item;
             animation.head_seconds = static_cast<float>(gid) * 0.371F;
         }
+        // Equipping an item changes its stance channel, not the player's identity.
+        // Keep locomotion, action and death clocks alive across hotbar changes.
+        animation.animation_mode = animation_mode;
+        animation.carried_item = carried_item;
         const float delta_seconds =
             animation.last_animation_seconds < 0.0F ||
                     animation_seconds < animation.last_animation_seconds
@@ -2467,7 +2611,7 @@ class AvatarViewmodel::Impl final
             channel->advance(delta_seconds);
 
         float locomotion_speed = 1.0F;
-        if (moving)
+        if (moving && !underwater)
         {
             locomotion_speed =
                 forward_amount > strafe_amount
@@ -2475,7 +2619,7 @@ class AvatarViewmodel::Impl final
                                              : 0.8F + (forward_amount - 0.8F))
                     : strafe_amount;
         }
-        const bool locomotion_reversed = moving && movement_y < 0.0F;
+        const bool locomotion_reversed = moving && !underwater && movement_y < 0.0F;
         if (!animation.locomotion.has_current ||
             animation.locomotion.current.clip != base_animation)
         {
@@ -2619,7 +2763,31 @@ class AvatarViewmodel::Impl final
         animation.reloading = reloading;
 
         const bool action_active = using_tool || throwing_grenade;
-        if (action_active)
+        if (throwing_grenade && !using_tool)
+        {
+            const NativeAnimation *cook = clip_or("GrenadeCook", &generic_use_);
+            const NativeAnimation *release = clip_or("GrenadeThrow", &generic_use_);
+            // ReadyToThrowGrenade means release has been requested. The cook
+            // clip must finish first, then the throw plays once and holds.
+            if (!animation.action_active || !animation.action.has_current)
+            {
+                ChannelPlayer next{};
+                next.clip = cook;
+                next.influence_root = 5;
+                next.looping = false;
+                animation.action.play(next, 0.25F);
+            }
+            else if (animation.action.current.clip == cook && animation.action.current.finished() &&
+                     ready_to_throw_grenade)
+            {
+                ChannelPlayer next{};
+                next.clip = release;
+                next.influence_root = 5;
+                next.looping = false;
+                animation.action.play(next, 0.0F);
+            }
+        }
+        else if (using_tool)
         {
             const bool restart_action = !animation.action_active ||
                                         !animation.action.has_current ||
@@ -2672,6 +2840,13 @@ class AvatarViewmodel::Impl final
             animation.death.clear(0.25F);
         }
         animation.dead = dead;
+        if (gid == 256U && dead && animation.death.has_current)
+        {
+            // Local death has an exact simulation clock, including captures
+            // and frames where the body was outside the view frustum.
+            animation.death.current.time = animation_seconds;
+            animation.death.blend_elapsed = animation_seconds;
+        }
 
         std::array<BoneTransform, 71> pose{};
         animation.locomotion.apply(pose);
@@ -2712,9 +2887,11 @@ class AvatarViewmodel::Impl final
                 for (std::size_t column = 0U; column < 3U; ++column)
                     local[row * 4U + column] *= scale;
             }
-            local[12] = source[12];
-            local[13] = source[13];
-            local[14] = source[14];
+            // The root carries the authored body displacement (Faint falls
+            // about 0.65 m). Joint offsets retain the imported body proportions.
+            local[12] = source[12] + (bone == 0U ? animated[12] : 0.0F);
+            local[13] = source[13] + (bone == 0U ? animated[13] : 0.0F);
+            local[14] = source[14] + (bone == 0U ? animated[14] : 0.0F);
             local[15] = 1.0F;
 
             const int parent = avatar_parents[bone];
@@ -2724,11 +2901,10 @@ class AvatarViewmodel::Impl final
             skin[bone] = multiply_matrix(inverse_bind_pose_[bone], absolute[bone]);
         }
 
-        // Xbox avatar exports are authored facing +X, while CMZ network yaw
-        // and the playable camera use -Z as forward. Rotate that basis once so
-        // a remote avatar's chest, hands, and movement direction agree with the
-        // decoded PlayerUpdate yaw.
-        const float model_yaw = yaw + std::numbers::pi_v<float> * 0.5F;
+        // Export-space retargeting already includes the root basis conversion.
+        // RenderWorld applies only the Z mirror and the player's XNA rotation;
+        // an extra quarter-turn makes the player look sideways at their target.
+        const float model_yaw = -yaw;
         const float cosine = std::cos(model_yaw);
         const float sine = std::sin(model_yaw);
         const auto to_world = [&](std::array<float, 3> point) {
@@ -2738,6 +2914,24 @@ class AvatarViewmodel::Impl final
                                feet.y + point[1],
                                feet.z - point[0] * sine + point[2] * cosine};
         };
+        if (eye_position != nullptr)
+        {
+            // Use the very same retargeted head as the body, after the Faint
+            // layer and root motion. Normalize the head's up axis so the eye
+            // offset is independent of avatar body proportions.
+            const Matrix4 &head = absolute[19U];
+            const float up_length = std::max(
+                0.000001F, std::sqrt(head[4] * head[4] + head[5] * head[5] + head[6] * head[6]));
+            *eye_position = to_world({head[12] + 0.05F * head[4] / up_length,
+                                      head[13] + 0.05F * head[5] / up_length,
+                                      head[14] + 0.05F * head[6] / up_length});
+        }
+        if (eye_forward != nullptr)
+        {
+            const Matrix4 &head = absolute[19U];
+            const auto end = to_world({head[8], head[9], head[10]});
+            *eye_forward = {end.x-feet.x, end.y-feet.y, end.z-feet.z};
+        }
         const auto normal_to_world = [&](std::array<float, 3> normal) {
             normal[2] = -normal[2];
             const std::array<float, 3> result{
@@ -2786,10 +2980,6 @@ class AvatarViewmodel::Impl final
             return total > 0.0001F ? result : source.normal;
         };
 
-        const bool authored_death_pose = dead && animation.death.has_current &&
-                                         animation.death.current.clip != stand_animation;
-        const float lowered = dead && !authored_death_pose ? -0.72F : 0.0F;
-        feet.y += lowered;
         for (const AvatarBatch &avatar_batch : batches_)
         {
             // Neutral face frames are native CMZ's default expression. Rendering
@@ -2799,17 +2989,28 @@ class AvatarViewmodel::Impl final
                 continue;
             EntitySpan span;
             span.texture = avatar_batch.texture != nullptr ? avatar_batch.texture : white_texture_;
+            span.repeat_texture = true;
             span.first = static_cast<std::uint32_t>(output.vertices.size());
             span.blend = avatar_batch.material_overlay ||
                                  avatar_batch.face_texture_usage >= 0
                              ? EntityBlend::alpha_lit
                              : EntityBlend::opaque;
-            const bool base_body = avatar_batch.name.starts_with("00000002-") &&
-                                   avatar_batch.name.find(":body:") != std::string::npos;
+            const bool base_body = (avatar_batch.name.starts_with("00000002-") &&
+                                    avatar_batch.name.find(":body:") != std::string::npos) ||
+                                   ((avatar_batch.category_mask & 0x00000080U) != 0U &&
+                                    !avatar_batch.material_overlay);
             for (const std::uint16_t index : avatar_batch.indices)
             {
                 const SourceVertex &source = avatar_batch.vertices[index];
-                const world::Vec3 position = to_world(skin_position(source));
+                auto skinned = skin_position(source);
+                if (hide_head && branch_weight(source, 19) > 0.5F)
+                {
+                    for (std::size_t component = 0; component < 3; ++component)
+                        skinned[component] =
+                            absolute[19][12 + component] +
+                            (skinned[component] - absolute[19][12 + component]) * 0.001F;
+                }
+                const world::Vec3 position = to_world(skinned);
                 const auto normal = normal_to_world(skin_normal(source));
                 const float vertex_red = base_body ? 1.0F : source.color[0] / 255.0F;
                 const float vertex_green = base_body ? 1.0F : source.color[1] / 255.0F;
@@ -2819,8 +3020,8 @@ class AvatarViewmodel::Impl final
                 vertex.x = position.x;
                 vertex.y = position.y;
                 vertex.z = position.z;
-                vertex.u = source.uv[0] - std::floor(source.uv[0]);
-                vertex.v = source.uv[1] - std::floor(source.uv[1]);
+                vertex.u = source.uv[0];
+                vertex.v = source.uv[1];
                 vertex.red = avatar_batch.diffuse[0] * vertex_red;
                 vertex.green = avatar_batch.diffuse[1] * vertex_green;
                 vertex.blue = avatar_batch.diffuse[2] * vertex_blue;
@@ -2842,7 +3043,23 @@ class AvatarViewmodel::Impl final
         // proxy child at raw PropRight. It moves that anchor toward the average
         // of the five right-finger bases, capped at 0.22 m, so imported hand
         // proportions still wrap the stock item models correctly.
-        Matrix4 prop_anchor = absolute[48U];
+        // Avatar.GetBoneToAvatar retains the authored runtime rotation for held
+        // items. Only its translation follows the imported avatar's grip. The
+        // export-space mirrored rotation belongs to the body mesh, not the gun.
+        std::array<Matrix4, 71> runtime_absolute{};
+        for (std::size_t bone = 0; bone < runtime_absolute.size(); ++bone)
+        {
+            const Matrix4 local = compose_matrix(pose[bone]);
+            runtime_absolute[bone] =
+                bone == 0U
+                    ? multiply_matrix(local, rotation_y(pi))
+                    : multiply_matrix(
+                          local, runtime_absolute[static_cast<std::size_t>(avatar_parents[bone])]);
+        }
+        Matrix4 prop_anchor = multiply_matrix(runtime_absolute[48U], mirror);
+        prop_anchor[12] = absolute[48U][12];
+        prop_anchor[13] = absolute[48U][13];
+        prop_anchor[14] = absolute[48U][14];
         constexpr std::array<std::size_t, 5> right_grip_bones{44U, 45U, 46U, 47U, 50U};
         std::array<float, 3> grip_center{};
         for (const std::size_t bone : right_grip_bones)
@@ -3028,6 +3245,7 @@ class AvatarViewmodel::Impl final
                                       : std::array<float, 3>{1.0F, 1.0F, 1.0F}));
                 EntitySpan span;
                 span.texture = part.texture != nullptr ? part.texture : white_texture_;
+                span.repeat_texture = true;
                 span.first = static_cast<std::uint32_t>(output.vertices.size());
                 constexpr float color_scale = 1.0F / 255.0F;
                 for (const std::uint32_t index : part.indices)
@@ -3043,8 +3261,8 @@ class AvatarViewmodel::Impl final
                     vertex.x = position.x;
                     vertex.y = position.y;
                     vertex.z = position.z;
-                    vertex.u = source.uv[0] - std::floor(source.uv[0]);
-                    vertex.v = source.uv[1] - std::floor(source.uv[1]);
+                    vertex.u = source.uv[0];
+                    vertex.v = source.uv[1];
                     vertex.red = part.diffuse[0] * source.color[0] * color_scale * part_tint[0];
                     vertex.green = part.diffuse[1] * source.color[1] * color_scale * part_tint[1];
                     vertex.blue = part.diffuse[2] * source.color[2] * color_scale * part_tint[2];
@@ -3128,6 +3346,34 @@ class AvatarViewmodel::Impl final
                 }
                 span.count = static_cast<std::uint32_t>(output.vertices.size()) - span.first;
                 output.spans.push_back(span);
+            }
+        }
+        for (std::size_t index = first_vertex; index < output.vertices.size(); ++index)
+        {
+            EntityVertex &vertex = output.vertices[index];
+            if (rebirth_presentation)
+            {
+                // The shared HDR shader decodes texture albedo to linear light.
+                // Decode palette/vertex albedo too, before the one world tone map.
+                vertex.red *= vertex.red;
+                vertex.green *= vertex.green;
+                vertex.blue *= vertex.blue;
+            }
+            else
+            {
+                const float sun = std::clamp(sky_light, 0.0F, 1.0F);
+                const float torch =
+                    std::clamp(torch_light, 0.0F, 1.0F) * (1.0F - sun * sky.direct.green);
+                const float direct =
+                    std::pow(sun, 30.0F) *
+                    std::max(0.0F, vertex.normal_x * sky.sun_x + vertex.normal_y * sky.sun_y +
+                                       vertex.normal_z * sky.sun_z);
+                // BlockTerrain.GetAvatarColor: authored ambient, torch and sun.
+                vertex.red *= sky.ambient.red * sun + torch + sky.direct.red * direct;
+                vertex.green *=
+                    sky.ambient.green * sun + torch * (235.0F / 255.0F) + sky.direct.green * direct;
+                vertex.blue *=
+                    sky.ambient.blue * sun + torch * (190.0F / 255.0F) + sky.direct.blue * direct;
             }
         }
     }
@@ -3414,8 +3660,23 @@ float4 main(PixelInput input) : SV_TARGET
 {
     float4 texel = Diffuse.Sample(DiffuseSampler, input.uv);
     float4 color = texel * input.color;
+    if (input.normalMaterial.w > 1.0f)
+        color.a = 1.0f; // alpha stores emissive coverage, never transparency
     clip(color.a - 0.01f);
     bool modernMaterial = SpecularColor.w > 0.5f;
+    if (input.normalMaterial.w < -2.5f || input.normalMaterial.w > 1.0f)
+    {
+        bool blade = input.normalMaterial.w < -2.5f;
+        float edge = abs(input.uv.x - 0.5f) * 2.0f;
+        float core = pow(saturate(1.0f - edge), 4.0f);
+        float3 energy = blade ? input.color.rgb * input.color.rgb * (1.8f + core * 1.4f)
+            : texel.rgb * texel.rgb * 0.62f + input.color.rgb * texel.a * 3.2f;
+        float alpha = blade ? smoothstep(1.0f, 0.7f, edge) : 1.0f;
+        clip(alpha - 0.015f);
+        float3 glow = modernMaterial ? sqrt(apply_tonemap(energy * max(DisplayGrading.x, 0.55f)))
+                                    : saturate(energy);
+        return float4(glow, alpha);
+    }
     if (input.normalMaterial.w < -1.5f)
     {
         // Camera-facing held-torch flame. Its tapered alpha comes from UVs so
@@ -3952,7 +4213,7 @@ float4 main(PixelInput input) : SV_TARGET
     NativeAnimation block_idle_;
     NativeAnimation block_use_;
     std::unordered_map<std::string, NativeAnimation> animation_library_;
-    std::unordered_map<std::uint8_t, WorldPlayerAnimationState> world_animation_states_;
+    std::unordered_map<std::uint16_t, WorldPlayerAnimationState> world_animation_states_;
     AnimationChannel item_channel_;
     AnimationChannel action_channel_;
     // GetAvatarColor: ambient plus a directional sun term (Lambert against
@@ -3967,13 +4228,29 @@ float4 main(PixelInput input) : SV_TARGET
                                normal[2] * env_light_direction_[2]);
         const float shape =
             std::clamp(0.90F + normal[1] * 0.10F - normal[2] * 0.06F, 0.72F, 1.0F);
-        return {std::min(1.0F, (env_ambient_[0] + env_directional_[0] * lambert) * shape),
-                std::min(1.0F, (env_ambient_[1] + env_directional_[1] * lambert) * shape),
-                std::min(1.0F, (env_ambient_[2] + env_directional_[2] * lambert) * shape)};
+        std::array<float, 3> light{
+            std::clamp((env_ambient_[0] + env_directional_[0] * lambert) * shape, 0.0F, 1.0F),
+            std::clamp((env_ambient_[1] + env_directional_[1] * lambert) * shape, 0.0F, 1.0F),
+            std::clamp((env_ambient_[2] + env_directional_[2] * lambert) * shape, 0.0F, 1.0F)};
+        // Rebirth's shader combines light with decoded albedo and encodes the
+        // result. The Classic pass multiplies display-space textures directly,
+        // so encode the light here instead of crushing shade into black.
+        if (!env_rebirth_)
+            for (float &channel : light)
+                channel = std::sqrt(channel);
+        return light;
     }
 
     float last_elapsed_seconds_{-1.0F};
     float last_action_progress_{};
+    // Where the held gun's muzzle was drawn this frame (AvatarViewmodel::muzzle).
+    std::optional<AvatarViewmodel::Muzzle> muzzle_;
+    // Modding, visuals area: the held mod item's solid icon (set_held_mod_item).
+    // (Items) Now the whole held mod item, and the textures of mod models.
+    std::shared_ptr<const modding::graphics::HeldItemPose> held_mod_item_;
+    AvatarViewmodel::ModMaterialTextures mod_material_textures_;
+    std::vector<modding::graphics::PosedItemPart> held_item_parts_;
+    modding::graphics::ItemPoseScratch held_item_scratch_;
     // GetAvatarColor environment: ambient + directional sun (camera space).
     std::array<float, 3> env_ambient_{0.62F, 0.62F, 0.62F};
     std::array<float, 3> env_directional_{0.38F, 0.38F, 0.38F};
@@ -4032,20 +4309,26 @@ bool AvatarViewmodel::loaded() const noexcept
 
 bool AvatarViewmodel::world_animation_ready() const noexcept
 {
+    if (impl_->retail_active())
+        return impl_->retail_world_animation_ready();
     if (!impl_->loaded_ || impl_->inverse_bind_pose_.size() != 71U ||
         impl_->source_pose_local_.size() != 71U)
         return false;
-    for (const std::string_view required : {"Stand0", "Walk", "Run", "Faint"})
+    for (const std::string_view required :
+         {"Stand0", "Walk", "Run", "Faint", "Tilt", "MaleIdleLookAround"})
     {
         const auto found = impl_->animation_library_.find(std::string{required});
         if (found == impl_->animation_library_.end() || found->second.frames.empty())
             return false;
     }
-    return true;
+    return impl_->animation_library_.contains("Swim") ||
+           impl_->animation_library_.contains("Swim Underwater");
 }
 
 std::size_t AvatarViewmodel::animation_clip_count() const noexcept
 {
+    if (impl_->retail_active())
+        return impl_->retail_rig_->registrations.size();
     return std::ranges::count_if(impl_->animation_library_, [](const auto &entry) {
         return !entry.second.frames.empty();
     });
@@ -4083,22 +4366,137 @@ void AvatarViewmodel::draw(const ui::UiMetrics &metrics, const world::PlayerStat
                 block_atlas);
 }
 
-void AvatarViewmodel::append_world_player(EntityBatch &batch, std::uint8_t gid,
-                                          InventoryItemId carried_item,
-                                          world::Vec3 feet, float yaw,
-                                          float torso_pitch, float animation_seconds,
-                                          float movement_x, float movement_y,
-                                          PlayerAnimationMode animation_mode, bool using_tool,
-                                          bool dead, bool shouldering, bool reloading,
-                                          bool throwing_grenade, bool ready_to_throw_grenade,
-                                          float sky_light, float torch_light,
-                                          SDL_Texture *block_atlas)
+void AvatarViewmodel::set_held_mod_item(
+    std::shared_ptr<const modding::graphics::HeldItemPose> pose) noexcept
 {
-    impl_->append_world_player(batch, gid, carried_item, feet, yaw,
-                               torso_pitch, animation_seconds,
+    impl_->held_mod_item_ = std::move(pose);
+}
+
+void AvatarViewmodel::set_mod_material_textures(ModMaterialTextures textures)
+{
+    impl_->mod_material_textures_ = std::move(textures);
+}
+
+std::optional<AvatarViewmodel::Muzzle> AvatarViewmodel::muzzle() const noexcept
+{
+    return impl_->muzzle_;
+}
+
+void AvatarViewmodel::append_world_player(
+    EntityBatch &batch, std::uint16_t gid, InventoryItemId carried_item, world::Vec3 feet,
+    float yaw, float torso_pitch, float animation_seconds, float movement_x, float movement_y,
+    PlayerAnimationMode animation_mode, bool using_tool, bool dead, bool shouldering,
+    bool reloading, bool throwing_grenade, bool ready_to_throw_grenade, float sky_light,
+    float torch_light, SDL_Texture *block_atlas, const world::SkyState &sky,
+    bool rebirth_presentation, bool underwater, bool hide_head, world::Vec3 *eye_position,
+    world::Vec3 *eye_forward, const modding::graphics::HeldItemPose *mod_item)
+{
+    impl_->append_world_player(batch, gid, carried_item, feet, yaw, torso_pitch, animation_seconds,
                                movement_x, movement_y, animation_mode, using_tool, dead,
-                               shouldering, reloading, throwing_grenade,
-                               ready_to_throw_grenade, sky_light, torch_light, block_atlas);
+                               shouldering, reloading, throwing_grenade, ready_to_throw_grenade,
+                               sky_light, torch_light, block_atlas, sky, rebirth_presentation,
+                               underwater, hide_head, eye_position, eye_forward, mod_item);
+}
+
+void AvatarViewmodel::forget_world_player(std::uint16_t gid) noexcept
+{
+    impl_->world_animation_states_.erase(gid);
+    impl_->retail_world_players_.erase(gid);
+    impl_->gunfx_others_.erase(gid); // (GunFX)
+}
+
+void AvatarViewmodel::clear_world_players() noexcept
+{
+    impl_->world_animation_states_.clear();
+    impl_->retail_world_players_.clear();
+    impl_->gunfx_others_.clear(); // (GunFX)
+}
+
+void AvatarViewmodel::set_first_person_animation(const world::PlayerAnimationPose &pose)
+{
+    impl_->retail_first_person_animation_ = pose;
+}
+
+void AvatarViewmodel::set_world_player_animation(std::uint16_t gid,
+                                                 const world::PlayerAnimationPose &pose)
+{
+    if (impl_->retail_active())
+        impl_->retail_world_players_[gid].animation = pose;
+}
+
+bool AvatarViewmodel::retail_character() const noexcept
+{
+    return impl_->retail_active();
+}
+
+void AvatarViewmodel::reload_animation_pack()
+{
+    impl_->reload_retail_animation_pack();
+}
+
+void AvatarViewmodel::set_gunfx(modding::graphics::GraphicsService *service) noexcept
+{
+    impl_->gunfx_service_ = service;
+}
+
+void AvatarViewmodel::set_gunfx_frame(bool reload_empty, float world_fov_degrees) noexcept
+{
+    impl_->gunfx_reload_empty_ = reload_empty;
+    impl_->gunfx_world_fov_ = world_fov_degrees;
+}
+
+bool AvatarViewmodel::gunfx_props_pending() const noexcept
+{
+    return !impl_->gunfx_props_.empty();
+}
+
+void AvatarViewmodel::append_gunfx_props(EntityBatch &batch, float elapsed_seconds, const GunfxSolid &solid,
+                                         const GunfxLight &light, const world::SkyState &sky,
+                                         bool rebirth_presentation)
+{
+    if (impl_->retail_active())
+        impl_->append_gunfx_props(batch, elapsed_seconds, solid, light, sky, rebirth_presentation);
+}
+
+void AvatarViewmodel::set_player_skin(std::uint16_t gid,
+                                      std::shared_ptr<const xbox_avatar::Skin> skin)
+{
+    // A skin is a mesh for the retail rig; the legacy character has none.
+    if (impl_->retail_active())
+        impl_->set_player_skin(gid, std::move(skin));
+}
+
+bool AvatarViewmodel::player_skin_applied(std::uint16_t gid) const noexcept
+{
+    return impl_->player_skin_applied(gid);
+}
+
+void AvatarViewmodel::pump_skin_uploads(bool everything)
+{
+    impl_->pump_skin_uploads(everything);
+}
+
+void AvatarViewmodel::set_skin_texture_release_hook(std::function<void(SDL_Texture *)> hook)
+{
+    impl_->skin_texture_release_hook_ = std::move(hook);
+}
+
+std::filesystem::path default_character_rig_path()
+{
+    const std::filesystem::path own = derived_data_path() / "character.omrc";
+    std::error_code error;
+    if (std::filesystem::exists(own, error))
+        return own;
+    // An upscaled pack restyles textures only: Classic HD draws the plain
+    // Classic pack's character unless it carries one of its own.
+    if (active_asset_style() == AssetStyle::classic_hd)
+    {
+        const std::filesystem::path plain =
+            content_pack_path(AssetStyle::classic) / "DerivedData" / "character.omrc";
+        if (std::filesystem::exists(plain, error))
+            return plain;
+    }
+    return own;
 }
 
 std::filesystem::path default_avatar_path()

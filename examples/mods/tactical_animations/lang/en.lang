@@ -1,0 +1,5 @@
+# Tactical Animations: English strings.
+setting.motion = Weapon sway and bob
+setting.motion_hint = The gun lags behind your view, bobs as you walk, breathes when still and kicks with each shot.
+setting.motion_strength = Weapon motion strength
+setting.motion_strength_hint = How strong the sway, bob and recoil are (the reload animations are not affected).

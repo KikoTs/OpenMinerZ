@@ -118,13 +118,61 @@ SteamDeliveryMethod routed_native_delivery(SteamDeliveryMethod delivery) noexcep
 
 } // namespace
 
+std::string distinct_gamer_tag(std::string_view base_tag, std::uint8_t attempt)
+{
+    constexpr std::size_t maximum_tag_bytes = 128U;
+    if (attempt <= 1U)
+        return std::string{base_tag.substr(0U, maximum_tag_bytes)};
+    const std::string suffix = std::format(" ({})", static_cast<unsigned>(attempt));
+    std::size_t keep = std::min(base_tag.size(), maximum_tag_bytes - suffix.size());
+    // Never cut a UTF-8 sequence: back up over continuation bytes.
+    while (keep > 0U && keep < base_tag.size() &&
+           (static_cast<unsigned char>(base_tag[keep]) & 0xC0U) == 0x80U)
+        --keep;
+    return std::string{base_tag.substr(0U, keep)} + suffix;
+}
+
 LegacySteamClientSession::LegacySteamClientSession(LegacySteamClientSessionOptions options)
-    : options_{std::move(options)}, properties_{options_.session_properties}
+    : options_{std::move(options)}, requested_gamer_tag_{options_.local_gamer.gamer_tag},
+      properties_{options_.session_properties}
 {
     if (options_.host_peer == 0U || !printable(options_.expected_host_name) ||
         !valid_properties(properties_, options_.protocol) || options_.password.size() > 256U ||
         !printable(options_.password, true) || !valid_gamer(options_.local_gamer, true))
         throw std::invalid_argument{"invalid legacy Steam client session options"};
+}
+
+std::optional<LegacySteamNativeSend> LegacySteamClientSession::retry_with_distinct_gamer_tag(
+    std::string &error)
+{
+    if (state_ != State::rejected || last_denial_ != legacy_duplicate_gamer_denial)
+    {
+        error = "The last admission result does not allow a display-tag retry.";
+        return std::nullopt;
+    }
+    if (admission_attempts_ >= legacy_maximum_admission_attempts)
+    {
+        error = "Every distinct display tag was refused by the host.";
+        return std::nullopt;
+    }
+    const std::string previous_tag = options_.local_gamer.gamer_tag;
+    options_.local_gamer.gamer_tag = distinct_gamer_tag(
+        requested_gamer_tag_, static_cast<std::uint8_t>(admission_attempts_ + 1U));
+    state_ = State::idle;
+    last_denial_.clear();
+    auto request = begin(error);
+    if (!request.has_value())
+    {
+        options_.local_gamer.gamer_tag = previous_tag;
+        state_ = State::rejected;
+        last_denial_ = legacy_duplicate_gamer_denial;
+    }
+    return request;
+}
+
+std::uint8_t LegacySteamClientSession::admission_attempts() const noexcept
+{
+    return admission_attempts_;
 }
 
 std::optional<LegacySteamNativeSend> LegacySteamClientSession::begin(std::string &error)
@@ -153,6 +201,7 @@ std::optional<LegacySteamNativeSend> LegacySteamClientSession::begin(std::string
         return std::nullopt;
     }
     state_ = State::awaiting_status;
+    ++admission_attempts_;
     error.clear();
     return LegacySteamNativeSend{options_.host_peer, *wire, SteamDeliveryMethod::reliable_ordered,
                                  0U};
@@ -186,6 +235,11 @@ LegacySteamClientSessionResult LegacySteamClientSession::process_denial(
                       wire.size());
     std::string reason{wire.begin() + 1, wire.end() - 1};
     state_ = State::rejected;
+    last_denial_ = reason;
+    // Anything queued for the refused request belongs to no admitted identity.
+    pending_connected_response_.reset();
+    pending_application_.clear();
+    pending_application_bytes_ = 0U;
     LegacySteamClientSessionResult result;
     result.rejection_reason = reason;
     result.audit = LegacySteamAuditEvent{++next_audit_sequence_, options_.host_peer,
@@ -305,6 +359,8 @@ LegacySteamClientSessionResult LegacySteamClientSession::process_connected_respo
                                 "ConnectedPeerTableMissingHost", input_length);
     local_gid_ = response.player_gid;
     remote_gamers_ = std::move(peers);
+    // A new session: nobody in it has announced the avatar add-on yet.
+    avatar_capabilities_.clear();
     state_ = State::connected;
     LegacySteamClientSessionResult result;
     result.inbound.push_back({LegacySteamClientInboundKind::connected,
@@ -376,6 +432,9 @@ LegacySteamClientSessionResult LegacySteamClientSession::process_internal(
             gid == local_gid_ || !valid_gamer(gamer, false) || find_gid(gid) != nullptr)
             return reject(LegacySteamRejectionStage::session, "InvalidNewPeer", input_length);
         remote_gamers_.push_back({gid, gamer});
+        // Gamer ids are reused: a newcomer must not inherit the previous
+        // occupant's add-on capability.
+        avatar_capabilities_.forget(gid);
         LegacySteamClientSessionResult result;
         result.inbound.push_back({LegacySteamClientInboundKind::peer_joined,
                                   gid,
@@ -393,6 +452,7 @@ LegacySteamClientSessionResult LegacySteamClientSession::process_internal(
                                         [gid](const RemoteGamer &peer) { return peer.gid == gid; });
         // SteamNetworkSessionProvider.TryGetValue ignores stale or duplicate
         // departures. They are common around reconnects and are not a session fault.
+        avatar_capabilities_.forget(gid);
         if (found == remote_gamers_.end())
             return {};
         remote_gamers_.erase(found);
@@ -435,13 +495,50 @@ LegacySteamClientSessionResult LegacySteamClientSession::process_direct(
     DecodedPacket decoded;
     if (!local_gid_.has_value() || !decode_legacy_direct_frame(payload, frame, codec_error) ||
         frame.recipient_gid != *local_gid_ ||
-        (frame.sender_gid != *local_gid_ && find_gid(frame.sender_gid) == nullptr) ||
-        !validate_application(options_.protocol, frame.application_packet,
+        (frame.sender_gid != *local_gid_ && find_gid(frame.sender_gid) == nullptr))
+        return reject(LegacySteamRejectionStage::application, "InvalidDirectApplicationPacket",
+                      input_length);
+    if (!frame.application_packet.empty() &&
+        message_by_id(options_.protocol, frame.application_packet.front()) == nullptr)
+    {
+        // An id outside the stock table is the avatar add-on's message, and
+        // only from a gamer who announced the add-on under that very id.
+        const std::uint8_t id = frame.application_packet.front();
+        const std::optional<std::uint8_t> sender_id =
+            frame.sender_gid == *local_gid_ ? std::nullopt
+                                            : avatar_capabilities_.message_id(frame.sender_gid);
+        if (!sender_id.has_value() || id != *sender_id ||
+            !is_avatar_sync_packet(frame.application_packet, id))
+            return reject(LegacySteamRejectionStage::application, "UnannouncedAvatarPacket",
+                          input_length);
+        LegacySteamClientSessionResult avatar;
+        avatar.inbound.push_back({LegacySteamClientInboundKind::avatar_sync,
+                                  frame.sender_gid,
+                                  {},
+                                  std::move(frame.application_packet),
+                                  MessageDeliveryPolicy::reliable_ordered});
+        return avatar;
+    }
+    if (!validate_application(options_.protocol, frame.application_packet,
                               MessageDeliveryPolicy::reliable_ordered, false, decoded) ||
         (frame.sender_gid == *local_gid_ && !decoded.message->transport.echo))
         return reject(LegacySteamRejectionStage::application, "InvalidDirectApplicationPacket",
                       input_length);
     LegacySteamClientSessionResult result;
+    if (frame.sender_gid != *local_gid_ && decoded.message->name == "PlayerExistsMessage")
+    {
+        const AvatarCapabilityAnnouncement announcement =
+            read_avatar_capability_announcement(options_.protocol, frame.application_packet);
+        if (announcement.present)
+        {
+            avatar_capabilities_.announce(frame.sender_gid, announcement.message_id);
+            result.inbound.push_back({LegacySteamClientInboundKind::avatar_capability,
+                                      frame.sender_gid,
+                                      {},
+                                      {announcement.message_id},
+                                      MessageDeliveryPolicy::reliable_ordered});
+        }
+    }
     result.inbound.push_back({LegacySteamClientInboundKind::gameplay,
                               frame.sender_gid,
                               {},
@@ -510,6 +607,71 @@ std::optional<LegacySteamNativeSend> LegacySteamClientSession::create_outbound(
     }
     error.clear();
     return LegacySteamNativeSend{options_.host_peer, *wire, native_delivery, 0U};
+}
+
+std::optional<LegacySteamNativeSend> LegacySteamClientSession::create_avatar_outbound(
+    std::uint8_t recipient_gid, std::span<const std::uint8_t> avatar_packet,
+    std::string &error) const
+{
+    if (state_ != State::connected || !local_gid_.has_value())
+    {
+        error = "The legacy Steam client is not admitted.";
+        return std::nullopt;
+    }
+    const std::optional<std::uint8_t> recipient_id =
+        recipient_gid == *local_gid_ || find_gid(recipient_gid) == nullptr
+            ? std::nullopt
+            : avatar_capabilities_.message_id(recipient_gid);
+    if (!recipient_id.has_value())
+    {
+        error = "The recipient has not announced the Xbox Avatar add-on.";
+        return std::nullopt;
+    }
+    if (avatar_packet.empty() || avatar_packet.front() != *recipient_id ||
+        !valid_avatar_message_id(options_.protocol, *recipient_id) ||
+        !is_avatar_sync_packet(avatar_packet, *recipient_id))
+    {
+        error = "Not an avatar message under the id the recipient reported.";
+        return std::nullopt;
+    }
+    LegacySteamCodecError codec_error{};
+    std::optional<std::vector<std::uint8_t>> route;
+    std::uint8_t envelope_channel{};
+    if (recipient_gid == 0U)
+        route = encode_legacy_direct_frame(
+            LegacyDirectDataFrame{0U, *local_gid_, {avatar_packet.begin(), avatar_packet.end()}},
+            codec_error);
+    else
+    {
+        // ZZAvatarSyncMessage is ReliableInOrder and addressed to one gamer.
+        envelope_channel = 1U;
+        route = encode_legacy_client_proxy_direct(recipient_gid, *local_gid_,
+                                                  SteamDeliveryMethod::reliable_ordered,
+                                                  avatar_packet, codec_error);
+    }
+    const auto wire = route.has_value()
+                          ? encode_legacy_steam_wire(SteamIncomingMessageType::data,
+                                                     envelope_channel, *route, codec_error)
+                          : std::nullopt;
+    if (!wire.has_value())
+    {
+        error = "The avatar message could not be encoded.";
+        return std::nullopt;
+    }
+    error.clear();
+    return LegacySteamNativeSend{options_.host_peer, *wire, SteamDeliveryMethod::reliable_ordered,
+                                 0U};
+}
+
+bool LegacySteamClientSession::avatar_capable(std::uint8_t gid) const noexcept
+{
+    return find_gid(gid) != nullptr && avatar_capabilities_.capable(gid);
+}
+
+std::optional<std::uint8_t> LegacySteamClientSession::avatar_message_id(
+    std::uint8_t gid) const noexcept
+{
+    return find_gid(gid) == nullptr ? std::nullopt : avatar_capabilities_.message_id(gid);
 }
 
 bool LegacySteamClientSession::connected() const noexcept

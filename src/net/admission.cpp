@@ -26,11 +26,11 @@ bool constant_time_equal(std::string_view expected, std::string_view actual) noe
 
 } // namespace
 
-HostAdmissionGate::HostAdmissionGate(HostSessionSettings settings, bool game_begun,
+HostAdmissionGate::HostAdmissionGate(HostSessionSettings settings, bool join_closed,
                                      std::int32_t game_mode, std::int32_t difficulty,
                                      bool infinite_resources, bool host_occupies_player_slot)
     : settings_{std::move(settings)},
-      properties_{make_session_properties(settings_, game_begun, game_mode, difficulty,
+      properties_{make_session_properties(settings_, join_closed, game_mode, difficulty,
                                           infinite_resources)},
       host_occupies_player_slot_{host_occupies_player_slot}
 {
@@ -120,6 +120,7 @@ ExtensionAdmissionResult HostAdmissionGate::receive_extension(PeerId peer,
                                 compatibility.detail);
 
     found->second.status = AdmissionStatus::admitted;
+    found->second.extension = true;
     ExtensionMessage acceptance;
     acceptance.kind = ExtensionMessageKind::server_accept;
     acceptance.nonce = hello.nonce;
@@ -132,6 +133,26 @@ bool HostAdmissionGate::may_forward_gameplay(PeerId peer) const noexcept
 {
     const auto found = peers_.find(peer);
     return found != peers_.end() && found->second.status == AdmissionStatus::admitted;
+}
+
+bool HostAdmissionGate::mod_channel_enabled() const noexcept
+{
+    return requires_extension(settings_.mod_manifest);
+}
+
+bool HostAdmissionGate::may_exchange_mod_frames(PeerId peer) const noexcept
+{
+    const auto found = peers_.find(peer);
+    return mod_channel_enabled() && found != peers_.end() &&
+           found->second.status == AdmissionStatus::admitted && found->second.extension;
+}
+
+bool HostAdmissionGate::may_download_mods(PeerId peer) const noexcept
+{
+    const auto found = peers_.find(peer);
+    return mod_channel_enabled() && found != peers_.end() &&
+           (found->second.status == AdmissionStatus::awaiting_extension ||
+            (found->second.status == AdmissionStatus::admitted && found->second.extension));
 }
 
 AdmissionStatus HostAdmissionGate::status(PeerId peer) const noexcept

@@ -49,9 +49,9 @@ std::filesystem::path local_pack_root()
     return std::filesystem::current_path() / "content-packs";
 }
 
-std::string_view style_directory() noexcept
+std::string_view style_directory(AssetStyle style) noexcept
 {
-    switch (selected_style)
+    switch (style)
     {
     case AssetStyle::classic:
         return "classic";
@@ -84,11 +84,35 @@ AssetStyle active_asset_style() noexcept
 
 std::filesystem::path active_content_pack_path()
 {
+    return content_pack_path(selected_style);
+}
+
+std::filesystem::path content_pack_path(AssetStyle style)
+{
+    // Test and capture override: OPENMINERZ_CONTENT_PACKS names a directory that
+    // holds classic/, classic-hd/ and modern/ packs. A style found there wins, so
+    // a privately imported pack can be exercised without touching installed ones.
+#if defined(_WIN32)
+    {
+        wchar_t *override_root{};
+        std::size_t override_size{};
+        if (_wdupenv_s(&override_root, &override_size, L"OPENMINERZ_CONTENT_PACKS") == 0 &&
+            override_root != nullptr)
+        {
+            const std::filesystem::path candidate =
+                std::filesystem::path{override_root} / style_directory(style);
+            std::free(override_root);
+            std::error_code error;
+            if (std::filesystem::is_directory(candidate / "DerivedData", error))
+                return candidate;
+        }
+    }
+#endif
     const auto executable = application_directory();
     const std::array candidates{
-        executable / "ContentPacks" / style_directory(),
-        executable.parent_path() / "content-packs" / style_directory(),
-        local_pack_root() / style_directory(),
+        executable / "ContentPacks" / style_directory(style),
+        executable.parent_path() / "content-packs" / style_directory(style),
+        local_pack_root() / style_directory(style),
     };
     for (const auto &candidate : candidates)
     {
@@ -98,6 +122,40 @@ std::filesystem::path active_content_pack_path()
     // Return the canonical build-tree location even when import has not run so
     // diagnostics identify the missing pack rather than silently mixing styles.
     return candidates[1];
+}
+
+std::filesystem::path interface_data_path(AssetStyle style)
+{
+    const auto has_art = [](const std::filesystem::path &derived) {
+        std::error_code error;
+        return std::filesystem::exists(derived / "font_SmallFont.omfnt", error) ||
+               std::filesystem::exists(derived / "hud_HudGrid.bmp", error) ||
+               std::filesystem::exists(derived / "screen_BlockUIBack.bmp", error);
+    };
+    const std::filesystem::path preferred = content_pack_path(style) / "DerivedData";
+    if (has_art(preferred))
+        return preferred;
+    // content_pack_path insists on a complete pack and otherwise names the
+    // build tree. The interface art needs neither terrain nor sounds, so take
+    // it from wherever that build's import put it; Classic HD is a Classic
+    // pack and may carry the Classic art too.
+    const auto executable = application_directory();
+    std::array<std::string_view, 2> names{style_directory(style), std::string_view{}};
+    if (style == AssetStyle::classic)
+        names[1] = style_directory(AssetStyle::classic_hd);
+    else if (style == AssetStyle::classic_hd)
+        names[1] = style_directory(AssetStyle::classic);
+    for (const std::string_view name : names)
+    {
+        if (name.empty())
+            continue;
+        for (const auto &candidate : {executable / "ContentPacks" / name,
+                                      executable.parent_path() / "content-packs" / name,
+                                      local_pack_root() / name})
+            if (has_art(candidate / "DerivedData"))
+                return candidate / "DerivedData";
+    }
+    return preferred;
 }
 
 std::filesystem::path active_derived_data_path()
@@ -132,6 +190,41 @@ std::filesystem::path application_directory()
     return find_executable_directory();
 }
 
+std::filesystem::path menu_background_directory()
+{
+    // Beside the installed content packs: %LOCALAPPDATA%\OpenMinerZ.
+    return local_pack_root().parent_path() / "MenuBackground";
+}
+
+std::filesystem::path menu_background_path(bool wide)
+{
+    std::vector<std::filesystem::path> candidates;
+#if defined(_WIN32)
+    wchar_t *override_path{};
+    std::size_t override_size{};
+    if (_wdupenv_s(&override_path, &override_size, L"OPENMINERZ_MENU_BACKGROUND") == 0 &&
+        override_path != nullptr)
+    {
+        candidates.emplace_back(override_path);
+        std::free(override_path);
+    }
+#endif
+    const std::array<std::filesystem::path, 2> directories{
+        menu_background_directory(), find_executable_directory() / "MenuBackground"};
+    if (wide)
+        for (const std::filesystem::path &directory : directories)
+            for (const char *name : {"menu-background-wide.png", "menu-background-wide.bmp"})
+                candidates.push_back(directory / name);
+    for (const std::filesystem::path &directory : directories)
+        for (const char *name : {"menu-background.png", "menu-background.bmp"})
+            candidates.push_back(directory / name);
+    std::error_code error;
+    for (const std::filesystem::path &candidate : candidates)
+        if (std::filesystem::is_regular_file(candidate, error))
+            return candidate;
+    return {};
+}
+
 std::filesystem::path installed_steam_api_path()
 {
     std::vector<std::filesystem::path> candidates;
@@ -146,6 +239,9 @@ std::filesystem::path installed_steam_api_path()
     }
 #endif
     candidates.push_back(application_directory() / "steam_api.dll");
+    // The public build contains no Valve runtime. The local asset importer
+    // installs the user's owned copy beside their private content packs.
+    candidates.push_back(local_pack_root().parent_path() / "Runtime" / "steam_api.dll");
 #if defined(OPENMINERZ_OWNED_GAME_DIR)
     candidates.push_back(std::filesystem::path{OPENMINERZ_OWNED_GAME_DIR} / "steam_api.dll");
 #endif
