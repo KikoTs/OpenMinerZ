@@ -3,7 +3,7 @@
 [![Source and asset audit](https://github.com/KikoTs/OpenMinerZ/actions/workflows/source-audit.yml/badge.svg?branch=main)](https://github.com/KikoTs/OpenMinerZ/actions/workflows/source-audit.yml)
 [![License: AGPL v3+](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D4.svg)](docs/building.md)
-[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg?logo=cplusplus&logoColor=white)](CMakeLists.txt)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg?logo=cplusplus&logoColor=white)](docs/building.md)
 [![Add-ons: Luau](https://img.shields.io/badge/add--ons-Luau-00A2FF.svg?logo=luau&logoColor=white)](docs/modding/README.md)
 [![Status: development preview](https://img.shields.io/badge/status-development%20preview-orange.svg)](docs/releasing.md)
 
